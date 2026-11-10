@@ -1,5 +1,4 @@
-
-<div align="center">
+ <div align="center">
 
 # AERLOG
 
@@ -7,85 +6,160 @@
 
 **Record. Reconstruct. Replay. Improve.**
 
-A local-first observability, debugging, and reliability toolkit for MCP-powered AI agents.
+A local-first observability, debugging, and reliability workbench for MCP-powered AI agents.
 
 [![Status](https://img.shields.io/badge/status-early%20development-blue)](#project-status)
 [![Protocol](https://img.shields.io/badge/protocol-MCP-7c3aed)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-TBD-lightgrey)](#license)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-*An execution-level flight recorder for AI agents — capture what happened, understand where it failed, and reproduce the failure without blindly running the same actions again.*
+*An execution-level flight recorder for AI agents. Capture observable interactions, reconstruct execution histories, investigate failures, and turn real-world failures into repeatable tests.*
 
 </div>
 
 ---
 
+## Table of Contents
+
+- [Overview](#overview)
+- [The Problem](#the-problem)
+- [What is AERLOG?](#what-is-aerlog)
+- [Design Principles](#design-principles)
+- [Core Capabilities](#core-capabilities)
+- [System Architecture](#system-architecture)
+  - [Architecture Diagram](#1-high-level-system-architecture)
+  - [Execution Capture Sequence](#2-execution-capture-sequence)
+  - [Replay and Regression Lifecycle](#3-replay-and-regression-lifecycle)
+  - [Architectural Boundaries](#4-architectural-dependency-boundaries)
+  - [Subsystem Responsibilities](#5-subsystem-responsibilities)
+- [Internal System Design](#internal-system-design)
+  - [Transparent Stdio Proxy](#1-transparent-stdio-proxy)
+  - [Capture Pipeline](#2-capture-pipeline)
+  - [Event Model](#3-event-model)
+  - [Request and Response Correlation](#4-request-and-response-correlation)
+  - [Storage Architecture](#5-storage-architecture)
+  - [Diagnostics Engine](#6-diagnostics-engine)
+  - [Replay Architecture and Safety](#7-replay-architecture-and-safety)
+  - [Privacy and Data Handling](#8-privacy-and-data-handling)
+- [Repository Structure](#repository-structure)
+- [Technology Stack](#technology-stack)
+- [MVP Scope and Milestones](#mvp-scope-and-milestones)
+- [CLI Experience](#cli-experience)
+- [Testing Strategy](#testing-strategy)
+- [Security and Trust Boundaries](#security-and-trust-boundaries)
+- [Compatibility and Limitations](#compatibility-and-limitations)
+- [Competitive Landscape and Positioning](#competitive-landscape-and-positioning)
+- [Development Setup](#development-setup)
+- [Contributing](#contributing)
+- [Future Directions](#future-directions)
+- [Project Status](#project-status)
+- [License](#license)
+
+---
+
+## Overview
+
+AI agents increasingly depend on external tools, services, and execution environments to accomplish complex tasks.
+
+The Model Context Protocol (MCP) provides a standardized way for applications to communicate with external tools and context providers. However, observing an agent's tool interactions is not the same as understanding the complete execution that produced them.
+
+When an agent fails, developers need to understand the sequence of observable events that led to the failure, identify where the interaction stopped behaving as expected, and reproduce the relevant behavior without blindly repeating potentially destructive operations.
+
+**AERLOG aims to provide that missing execution-level reliability workflow.**
+
+It introduces a local-first recording layer around MCP communication, converting protocol interactions and process lifecycle events into structured, inspectable execution records.
+
+Its intended workflow is:
+
+**Capture → Inspect → Diagnose → Replay → Regression-test**
+
+AERLOG is designed as a developer tool rather than another agent runtime. It does not make decisions on behalf of the agent or attempt to reconstruct private model reasoning. It focuses on collecting and analyzing the evidence available at the execution boundary.
+
 ## The Problem
 
-AI agents are not single requests.
+An agent task is rarely a single request.
 
-A seemingly simple task can involve a sequence of model decisions, MCP tool calls, server responses, retries, timeouts, and state transitions.
+A seemingly simple operation may involve:
 
-When an agent fails, developers often have to reconstruct the execution from scattered terminal output or application logs.
+- Multiple model interactions.
+- Tool discovery and selection.
+- MCP requests and responses.
+- Notifications and asynchronous events.
+- Retries and repeated tool calls.
+- Timeouts, cancellations, and server failures.
+- External operations with potentially irreversible side effects.
 
-The result is a frustrating debugging loop:
+When something goes wrong, the available evidence is often scattered across application logs, terminal output, server logs, and provider-specific observability tools.
 
-- **What actually happened?** Which tools were called, in what order, and with what observable inputs and outputs?
-- **Where did it go wrong?** Was it a timeout, protocol error, malformed response, repeated call, or a failure that was incorrectly treated as success?
-- **Can the failure be reproduced?** Can the same interaction be tested again without depending on a live external service?
-- **Did a change fix it?** Can a captured failure become a repeatable regression test?
+This creates several debugging problems.
 
-Traditional logs are useful, but they do not necessarily provide a coherent execution timeline. General-purpose LLM observability platforms can provide broader traces and model-level analytics, but developers may still need a focused way to capture and replay protocol interactions between an MCP client and its servers.
+| Question | What developers need |
+|---|---|
+| What happened? | A chronological record of observable execution events. |
+| Which tool was called? | Request details, arguments, responses, and correlation. |
+| Where did execution stop? | Failure localization using protocol and process evidence. |
+| Was the failure recoverable? | Visibility into retries, subsequent responses, and execution state. |
+| Can it be reproduced? | A controlled replay of the captured interaction. |
+| Did the fix work? | A repeatable regression test based on the original failure. |
+
+Traditional logging provides individual records, but does not necessarily reconstruct a coherent execution history.
+
+General-purpose LLM observability platforms can provide model-level traces, metrics, and evaluation workflows, but they do not eliminate the need for protocol-level inspection and controlled replay.
+
+AERLOG focuses on this narrower engineering problem.
 
 ## What is AERLOG?
 
 AERLOG is a proposed **local-first MCP execution recorder and reliability workbench**.
 
-It is designed to sit between an MCP client and an MCP server, observe their protocol traffic, and persist a structured record of an execution.
+In its initial architecture, AERLOG operates as a transparent stdio proxy between an MCP client and an MCP server process.
+
+It observes communication passing through this boundary, records relevant process and transport events, and converts protocol messages into a structured execution history.
 
 Developers can then:
 
-1. Inspect the execution timeline.
-2. Investigate failures.
-3. Replay recorded interactions in a controlled environment.
-4. Export regression tests from captured failures.
+1. Inspect individual executions and their event timelines.
+2. Correlate MCP requests with their responses.
+3. Investigate observable failures and suspicious behavior.
+4. Replay captured interactions through controlled cassettes.
+5. Export captured scenarios as regression tests.
 
-The core idea:
-
-> Turn an opaque agent execution into an inspectable, reproducible, testable artifact.
+> Turn an opaque agent-tool interaction into an inspectable, reproducible, and testable engineering artifact.
 
 ### Design Goals
 
-| Goal | What it means |
+| Principle | Engineering objective |
 |---|---|
-| Protocol transparency | Observe and forward MCP traffic without changing its meaning |
-| Execution visibility | Reconstruct requests, responses, notifications, timing, and errors |
-| Failure localization | Highlight the earliest observable failure and subsequent recovery behavior |
-| Reproducibility | Replay captured interactions without requiring the original live service |
-| Safe by default | Never repeat potentially destructive operations automatically |
-| Local-first | Keep recordings and indexes on the developer's machine by default |
-| Extensible | Preserve unknown protocol data and allow future protocol-aware analysis |
+| Protocol transparency | Forward supported transport traffic without changing its meaning. |
+| Execution visibility | Preserve observable requests, responses, notifications, timing, and lifecycle events. |
+| Evidence-based diagnosis | Explain failures using identifiable events rather than speculative root causes. |
+| Reproducibility | Convert recorded interactions into reusable test material. |
+| Safe by default | Never automatically repeat potentially consequential operations. |
+| Local-first | Keep recordings and indexes on the developer's machine by default. |
+| Extensibility | Support additional transports, instrumentation, and diagnostics through explicit interfaces. |
+| Inspectability | Keep event records, configuration, and system behavior understandable to developers. |
 
-### Non-Goals for the Initial Release
+### Non-Goals
 
-AERLOG is not intended to be:
+The initial release is not intended to be:
 
-- A replacement for an MCP client, MCP server, or MCP SDK.
-- A model reasoning debugger or a tool for extracting private chain-of-thought.
-- A general-purpose LLM analytics platform.
-- An autonomous agent that silently fixes code or reruns production actions.
+- A replacement for MCP clients, MCP servers, or MCP SDKs.
+- A complete agent runtime or orchestration framework.
+- A model reasoning debugger or private chain-of-thought extractor.
+- A general-purpose LLM observability platform.
+- An autonomous agent that modifies code or executes recovery actions.
 - A distributed observability backend requiring Kubernetes, Kafka, or cloud infrastructure.
-- A guarantee that every agent failure can be inferred from protocol traffic alone.
+- A guarantee that all agent failures can be identified from protocol traffic alone.
 
 ---
 
 ## Core Capabilities
 
-The following describes the intended product. Features should be marked as implemented only when they exist and have tests.
+The following capabilities describe the intended product. They are not claims that the features have already been implemented.
 
-### 1. Capture MCP Executions
+### 1. MCP Execution Capture
 
-Run an MCP-capable client/server process through a local stdio proxy. The proxy observes protocol messages while forwarding them between the two sides.
+Observe communication between an MCP client and a configured server through a local stdio proxy.
 
 Capture candidates include:
 
@@ -93,170 +167,496 @@ Capture candidates include:
 - Notifications and protocol lifecycle messages.
 - Tool calls and their observable results.
 - Request IDs and message relationships.
-- Timestamps, durations, process lifecycle, and transport errors.
-- Timeouts, cancellations, malformed messages, and process exits.
+- Wall-clock and monotonic timestamps.
+- Request durations and timeout information.
+- Server process lifecycle.
+- Standard error output.
+- Transport failures and capture warnings.
 
-AERLOG should preserve original message content where possible and avoid making assumptions about methods it does not understand.
+Unknown JSON-RPC methods and fields should be preserved wherever possible. AERLOG should not silently discard information simply because a particular protocol method is not yet understood by its analysis layer.
 
-### 2. Reconstruct an Execution Timeline
+### 2. Execution Timeline Reconstruction
 
-Convert captured events into a readable execution timeline.
+Convert captured events into a correlated execution timeline.
 
-For each execution, developers should be able to inspect:
+An execution inspector should eventually provide:
 
-- Event order and timestamps.
-- Request/response correlation.
-- Tool name and call arguments, subject to redaction settings.
+- Chronological event ordering.
+- Request/response relationships.
+- Tool names and observable arguments.
 - Response payloads and protocol errors.
-- Duration and timeout information.
-- Process and session lifecycle.
-- Gaps, missing responses, and suspicious repeated calls.
+- Request durations.
+- Process startup and shutdown events.
+- Timeouts and cancellation signals.
+- Unmatched messages and incomplete interactions.
+- Diagnostic annotations linked to supporting evidence.
 
-The timeline is based on **observable protocol events**, not guesses about what the model privately thought.
+The timeline must distinguish observed events from inferred interpretations.
 
-### 3. Investigate Failures
+### 3. Evidence-Based Failure Diagnostics
 
-AERLOG should provide evidence-backed diagnostics rather than pretending to know the agent's hidden intent.
+AERLOG should identify observable failure patterns through deterministic, explainable rules.
 
-Initial detection rules may include:
-
-| Signal | Possible interpretation |
+| Diagnostic signal | Possible interpretation |
 |---|---|
-| Request without a matching response | Timeout, disconnect, or incomplete capture |
-| JSON-RPC error response | Explicit protocol or server-side error |
-| Server process exits unexpectedly | Server crash or shutdown |
-| Repeated equivalent calls | Possible retry loop or lack of progress |
-| Repeated timeout pattern | Unavailable or unresponsive dependency |
-| Tool error followed by apparent completion | Potential false-success condition requiring inspection |
+| Request without a matching response | Timeout, disconnect, or incomplete capture. |
+| JSON-RPC error response | Explicit protocol or server-reported error. |
+| Unexpected server process exit | Server crash or premature shutdown. |
+| Repeated equivalent tool calls | Possible retry loop or lack of progress. |
+| Repeated timeout pattern | Potentially unavailable or unresponsive dependency. |
+| Tool error followed by apparent task completion | Potential false-success condition requiring investigation. |
+| Response without a matching request | Unmatched response or incomplete recording. |
 
-A diagnostic should include the events that support it, its confidence or severity, and what remains unknown.
+Every diagnostic should include its evidence, severity, explanation, and limitations.
 
-### 4. Replay Recorded Interactions
+A repeated request is not automatically a loop. A timeout is not automatically a server bug. Diagnostics should identify suspicious behavior without pretending to know the agent's private intent.
 
-A recording can become a deterministic test fixture.
+### 4. Controlled Replay
+
+Captured interactions should become reusable test material.
 
 Planned replay modes:
 
-| Mode | Behavior | Risk |
+| Mode | Description | Execution risk |
 |---|---|---|
-| Inspect | View captured interactions without executing anything | Low |
-| Cassette | Return recorded responses to a client or test harness | Low |
-| Mocked replay | Run a controlled test against mocked dependencies | Controlled |
-| Live replay | Re-contact real MCP servers | High; opt-in only |
+| Inspect | Read and analyze recorded interactions. | None |
+| Cassette | Return recorded responses without contacting the original server. | Low |
+| Mocked replay | Run a controlled test using mocked dependencies. | Controlled |
+| Live replay | Execute interactions against a real target server. | High; explicit opt-in only |
 
-**Live replay must never be the default.**
+Cassette replay is the initial priority.
 
-Recorded tool calls may have side effects. A replay engine must not assume that repeating a request is safe merely because it was safe to record.
+Live replay must never be the default. Recorded requests may represent payments, file modifications, deployments, messages, or other operations with external side effects.
 
-### 5. Turn Failures into Regression Tests
+### 5. Regression Test Generation
 
-Developers should be able to export a captured interaction into a portable test fixture containing:
+A captured execution should be exportable into a portable test fixture.
 
-- The relevant request/response sequence.
-- Expected protocol behavior.
-- Timing or timeout expectations where meaningful.
-- Assertions for response shape and error handling.
-- Redaction metadata and fixture provenance.
+Potential exported material:
 
-The goal is to make a once-manual debugging session repeatable in CI.
+- Selected request/response sequences.
+- Expected JSON-RPC behavior.
+- Relevant notification sequences.
+- Response-shape assertions.
+- Error-handling assertions.
+- Timing expectations where meaningful.
+- Fixture provenance and redaction metadata.
 
-### 6. Developer Cockpit
+The goal is to turn a debugging session into a repeatable test that can be executed locally or in CI.
 
-The initial interface should be a CLI. A lightweight local web UI can follow once the recording and replay foundations are reliable.
+### 6. Local Developer Cockpit
 
-The planned cockpit may include:
+The first interface is a CLI.
 
-- Execution list and search.
-- Chronological event timeline.
-- Request/response detail inspector.
-- Failure markers and diagnostic evidence.
-- Replay controls and safety warnings.
-- Regression fixture export.
+A local web cockpit is a later milestone, intended to provide:
+
+- Execution discovery and search.
+- Chronological event timelines.
+- Request and response inspection.
+- Diagnostic evidence.
+- Replay configuration and safety warnings.
+- Regression test export.
+- Execution comparison.
+
+The interface should be built on top of the same core application workflows as the CLI rather than introducing a separate implementation of the recording logic.
 
 ---
 
-## How It Works
+# System Architecture
 
-### High-Level Architecture
+AERLOG follows a modular architecture with clearly separated transport, capture, domain, persistence, and application layers.
+
+The central design principle is that **the proxy observes and forwards; the capture pipeline records; the analysis layer interprets; and the replay subsystem controls reproduction.**
+
+The initial implementation is a modular Python application, not a collection of distributed services.
+
+## 1. High-Level System Architecture
+
+The following diagram illustrates the major components and their relationships, including the external MCP environment, AERLOG runtime, capture pipeline, execution analysis, and persistent storage.
 
 ```mermaid
-flowchart LR
-    A["MCP Client"] <-->|"JSON-RPC over stdio"| P["AERLOG Proxy"]
-    P <-->|"JSON-RPC over stdio"| S["MCP Server"]
+flowchart TB
+    subgraph ENV["External MCP Environment"]
+        CLIENT["MCP Client<br/>Agent / IDE / Application"]
+        SERVER["MCP Server<br/>Configured Subprocess"]
+    end
 
-    P --> C["Capture Pipeline"]
-    C --> N["Normalize & Correlate"]
-    N --> E["Append-only Event Log"]
-    N --> D["SQLite Index"]
+    subgraph AERLOG["AERLOG Runtime"]
 
-    E --> T["Timeline & Diagnostics"]
-    D --> T
-    T --> R["Replay Engine"]
-    R --> X["Regression Test Export"]
+        CLI["CLI Interface<br/>Typer + Rich"]
 
-    T --> CLI["CLI"]
-    T --> UI["Local Web Cockpit"]
+        subgraph TRANSPORT["Transport & Process Layer"]
+            MANAGER["Proxy Manager"]
+            PROCESS["Subprocess Lifecycle"]
+            FORWARD["Bidirectional Forwarder"]
+            FRAMING["Stdio Framing Handler"]
+        end
+
+        subgraph CAPTURE["Capture & Event Processing"]
+            READER["Message Reader"]
+            NORMALIZER["Event Normalizer"]
+            CORRELATOR["Request Correlator"]
+            REDACTOR["Redaction Engine"]
+            PIPELINE["Capture Pipeline"]
+        end
+
+        subgraph ANALYSIS["Execution Analysis"]
+            TIMELINE["Timeline Builder"]
+            DIAGNOSTICS["Diagnostics Engine"]
+            RULES["Deterministic Rules"]
+        end
+
+        subgraph REPLAY["Replay & Export"]
+            CASSETTE["Cassette Loader"]
+            RUNNER["Replay Runner"]
+            SAFETY["Replay Safety Policy"]
+            EXPORTER["Regression Exporter"]
+        end
+
+        subgraph PERSISTENCE["Persistence Layer"]
+            JSONL["Append-Only Event Log<br/>JSONL"]
+            SQLITE["SQLite Metadata & Indexes"]
+            REPOSITORIES["Storage Repositories"]
+        end
+
+    end
+
+    CLIENT <-->|"MCP / JSON-RPC over stdio"| FORWARD
+    FORWARD <-->|"Forwarded protocol traffic"| SERVER
+
+    CLI --> MANAGER
+    MANAGER --> PROCESS
+    PROCESS --> SERVER
+    MANAGER --> FORWARD
+    FORWARD --> FRAMING
+    FRAMING --> READER
+
+    READER --> NORMALIZER
+    NORMALIZER --> CORRELATOR
+    CORRELATOR --> REDACTOR
+    REDACTOR --> PIPELINE
+
+    PIPELINE --> JSONL
+    PIPELINE --> SQLITE
+
+    JSONL --> REPOSITORIES
+    SQLITE --> REPOSITORIES
+
+    REPOSITORIES --> TIMELINE
+    REPOSITORIES --> DIAGNOSTICS
+    DIAGNOSTICS --> RULES
+
+    REPOSITORIES --> CASSETTE
+    CASSETTE --> SAFETY
+    SAFETY --> RUNNER
+    RUNNER --> EXPORTER
+
+    TIMELINE --> CLI
+    DIAGNOSTICS --> CLI
+    EXPORTER --> CLI
+
+    classDef external fill:#263445,stroke:#64748b,color:#ffffff
+    classDef transport fill:#43351e,stroke:#d6a84b,color:#ffffff
+    classDef capture fill:#253c35,stroke:#65a88a,color:#ffffff
+    classDef analysis fill:#352d4b,stroke:#a78bfa,color:#ffffff
+    classDef persistence fill:#263c49,stroke:#67b7d1,color:#ffffff
+    classDef replay fill:#44313b,stroke:#d78a9b,color:#ffffff
+
+    class CLIENT,SERVER external
+    class MANAGER,PROCESS,FORWARD,FRAMING transport
+    class READER,NORMALIZER,CORRELATOR,REDACTOR,PIPELINE capture
+    class TIMELINE,DIAGNOSTICS,RULES analysis
+    class JSONL,SQLITE,REPOSITORIES persistence
+    class CASSETTE,RUNNER,SAFETY,EXPORTER replay
 ```
 
-The proxy is the observation point. The capture pipeline turns observed traffic into structured events. Storage preserves the evidence. Analysis builds an execution view. Replay and test export consume the stored recording.
+### Architecture Overview
 
-### Component Responsibilities
-
-| Component | Responsibility |
+| Layer | Responsibility |
 |---|---|
-| MCP client | The application or agent initiating MCP communication |
-| stdio proxy | Launches/communicates with the server and transparently forwards traffic |
-| Capture pipeline | Reads protocol messages and records transport/process events |
-| Normalizer | Converts observed messages into a consistent internal event representation |
-| Correlator | Associates requests and responses using protocol/session identifiers |
-| Event store | Persists the append-only event stream |
-| Metadata index | Supports execution lookup, filtering, and event navigation |
-| Timeline builder | Produces a chronological, correlated execution view |
-| Diagnostics engine | Applies deterministic rules to identify suspicious or failed behavior |
-| Replay engine | Replays recordings against controlled fixtures or mocks |
-| Exporter | Produces portable regression fixtures and tests |
-| CLI / cockpit | Developer-facing inspection and control surfaces |
+| External MCP environment | Client and configured MCP server process. |
+| Transport and process | Starts the server, manages subprocess streams, and forwards traffic. |
+| Capture and events | Observes messages, normalizes events, correlates requests, and redacts data. |
+| Persistence | Stores the event stream and queryable execution metadata. |
+| Execution analysis | Reconstructs timelines and generates evidence-backed diagnostics. |
+| Replay and export | Loads recordings, controls replay behavior, and generates regression fixtures. |
+| Application interface | Coordinates user workflows through the CLI and future cockpit. |
 
-### Capture Flow
+The proxy and capture pipeline are deliberately separated. Analysis should not be responsible for maintaining a live transport connection, and storage should not contain protocol-forwarding logic.
+
+## 2. Execution Capture Sequence
+
+This sequence illustrates how an MCP request moves through the initial stdio architecture.
+
+AERLOG launches the configured server subprocess. The MCP client communicates with that process through the proxy, while the proxy observes both directions of communication.
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant C as MCP Client
+    participant P as AERLOG Proxy
+    participant S as MCP Server
+    participant N as Normalizer
+    participant R as Correlator
+    participant D as Redaction
+    participant DB as Event Storage
+
+    C->>P: JSON-RPC Request
+    Note over P: Observe client-to-server message
+
+    P->>S: Forward original message
+
+    par Protocol Forwarding
+        S-->>P: JSON-RPC Response
+        P-->>C: Forward original response
+    and Event Processing
+        P->>N: Submit observed request
+        N->>R: Normalized request event
+        R->>D: Correlated event
+        D->>DB: Persist sanitized event
+    end
+
+    P->>N: Submit observed response
+    N->>R: Normalized response event
+    R->>R: Match request ID
+    R->>D: Correlated response event
+    D->>DB: Persist sanitized event
+
+    Note over C,S: Original protocol communication is forwarded
+    Note over N,DB: Capture processing maintains a separate event record
+```
+
+### Capture Lifecycle
 
 1. The developer starts an execution through AERLOG.
-2. AERLOG launches or connects to the configured MCP server process.
-3. The client communicates through the proxy.
-4. The proxy reads each message, records the observable event, and forwards the message.
-5. Responses and notifications are captured in the same execution context.
-6. Events are normalized, correlated, and persisted.
-7. The execution becomes available for inspection.
-8. The developer can inspect diagnostics, replay a cassette, or export a regression test.
+2. The proxy launches the configured MCP server subprocess.
+3. The MCP client sends a message to the proxy.
+4. The proxy observes and forwards the message.
+5. The server processes the request and sends its response.
+6. The proxy forwards the response to the client.
+7. Observations are normalized and associated with the execution.
+8. Events are correlated and passed through configured redaction.
+9. Events and metadata are persisted.
+10. The completed or interrupted execution becomes available for inspection.
 
-The proxy should prioritize **correct forwarding** over analysis.
+**Correctness requirement:** Capture must not silently corrupt the original protocol stream. Buffering, bounded queues, backpressure, and storage failures require explicit policies. If capture becomes incomplete, AERLOG must expose that fact rather than presenting the recording as complete.
 
-If a message cannot be understood by the current parser, AERLOG should preserve it as an unknown/raw event where safe rather than silently dropping or rewriting it.
+## 3. Replay and Regression Lifecycle
+
+Recording an execution is only the beginning. The captured evidence should become useful beyond the original debugging session.
+
+The replay subsystem consumes stored recordings and reconstructs selected interactions in a controlled environment.
+
+```mermaid
+flowchart TD
+    A["Recorded Execution"] --> B["Load Selected Events"]
+    B --> C["Validate Recording"]
+    C --> D["Reconstruct Interaction Sequence"]
+
+    D --> E{"Replay Mode"}
+
+    E -->|"Cassette"| F["Return Recorded Responses"]
+    E -->|"Mocked"| G["Run Against Mock Dependencies"]
+    E -->|"Live - Explicit Opt-in"| H["Connect to Real Target"]
+
+    F --> I["Collect Replay Observations"]
+    G --> I
+    H --> I
+
+    I --> J["Compare Expected and Observed Behavior"]
+    J --> K["Replay Report"]
+    K --> L["Regression Test Export"]
+    L --> M["Automated Test Suite / CI"]
+
+    classDef safe fill:#253c35,stroke:#65a88a,color:#ffffff
+    classDef controlled fill:#263c49,stroke:#67b7d1,color:#ffffff
+    classDef risky fill:#43351e,stroke:#d6a84b,color:#ffffff
+
+    class F,I,J,K,L,M safe
+    class G controlled
+    class H risky
+```
+
+### Replay Design Rules
+
+- Inspect mode must not execute recorded operations.
+- Cassette mode must not contact the original server.
+- Mocked replay must make dependency boundaries explicit.
+- Live replay requires explicit user authorization and a visible target.
+- Potentially consequential operations must never be automatically repeated.
+- Replay results must be stored separately from original capture records.
+- A replay mismatch should identify the relevant expected and observed events.
+
+A recording is evidence of what happened. It is not authorization to repeat the operation.
+
+## 4. Architectural Dependency Boundaries
+
+AERLOG should keep its core domain independent of transport implementations, storage backends, and user interfaces.
+
+The intended dependency direction is:
+
+```mermaid
+flowchart TB
+    UI["User Interfaces<br/>CLI / Future Web Cockpit"]
+
+    APP["Application Layer<br/>Execution Workflows"]
+
+    DOMAIN["Core Domain<br/>Events / Correlation / Diagnostics"]
+
+    PORTS["Interfaces<br/>Storage / Transport / Replay Contracts"]
+
+    ADAPTERS["Infrastructure Adapters<br/>Stdio / SQLite / JSONL / Filesystem"]
+
+    SYSTEMS["External Systems<br/>MCP Servers / OS / Local Files"]
+
+    UI --> APP
+    APP --> DOMAIN
+    APP --> PORTS
+    ADAPTERS -.->|"Implements"| PORTS
+    ADAPTERS --> SYSTEMS
+
+    classDef core fill:#352d4b,stroke:#a78bfa,color:#ffffff
+    classDef infra fill:#263c49,stroke:#67b7d1,color:#ffffff
+
+    class DOMAIN,PORTS core
+    class ADAPTERS,SYSTEMS infra
+```
+
+### Architectural Rules
+
+1. **Transport independence:** Diagnostic rules must not depend on stdio implementation details.
+2. **Domain independence:** Event models and correlation logic must not depend on SQLite or the CLI.
+3. **Storage isolation:** Persistence adapters must not own diagnostic or replay policies.
+4. **Replay isolation:** Replay must consume recorded data through explicit interfaces.
+5. **Interface consistency:** CLI and future UI workflows should use the same application services.
+6. **Replaceable infrastructure:** Storage and transport implementations should be replaceable without rewriting the core domain.
+7. **Explicit side effects:** Any component that can execute an external action must have a clearly defined safety boundary.
+
+This is a modular application architecture. It does not require a microservice for every subsystem.
+
+## 5. Subsystem Responsibilities
+
+| Subsystem | Proposed location | Responsibilities |
+|---|---|---|
+| CLI | `cli/` | User commands and workflow orchestration. |
+| Application | `application/` | Coordinates execution, inspection, replay, and export workflows. |
+| Proxy | `proxy/` | Subprocess management and bidirectional forwarding. |
+| Protocol | `protocol/` | Framing, JSON-RPC parsing, and compatibility. |
+| Capture | `capture/` | Message observation, normalization, and redaction. |
+| Events | `events/` | Event contracts, execution identity, and correlation. |
+| Storage | `storage/` | Event logs, metadata, indexes, and repositories. |
+| Analysis | `analysis/` | Timeline reconstruction and diagnostics. |
+| Replay | `replay/` | Cassette loading, controlled replay, and safety policies. |
+| Export | `export/` | Regression fixture and test generation. |
+| Configuration | `config/` | Runtime settings, server definitions, and redaction policies. |
 
 ---
 
-## System Design
+# Internal System Design
 
-### 1. Transparent Stdio Proxy
+## 1. Transparent Stdio Proxy
 
-The first implementation should focus on the stdio transport because it offers a practical, bounded starting point.
+The first implementation targets the MCP stdio transport.
 
-The proxy is responsible for:
+The proxy acts as a subprocess intermediary:
 
-- Starting the configured MCP server as a subprocess.
-- Managing stdin/stdout pipes and stderr separately.
-- Forwarding messages in both directions.
-- Recording messages without corrupting framing or ordering.
-- Handling process termination, broken pipes, and cancellation.
-- Applying backpressure so recording does not cause unbounded memory growth.
-- Shutting down child processes cleanly.
+- The MCP client communicates with AERLOG through stdin/stdout.
+- AERLOG launches the configured MCP server process.
+- AERLOG forwards client input to the server's stdin.
+- AERLOG forwards server stdout to the client's stdout.
+- Server stderr is captured separately.
 
-**Important:** stdout is protocol traffic for stdio MCP servers. Debug logs must not be written into the protocol stream. AERLOG's own diagnostics should go to stderr or a separate log destination.
+### Responsibilities
 
-The proxy must not assume that one read from a pipe equals one complete protocol message. Framing and buffering must follow the relevant MCP transport specification and SDK behavior.
+- Start and manage the configured server subprocess.
+- Maintain independent client-to-server and server-to-client forwarding paths.
+- Preserve message boundaries, framing, and ordering.
+- Observe protocol messages in both directions.
+- Capture process startup, stderr, termination, and exit status.
+- Handle broken pipes and subprocess failures.
+- Support cancellation and graceful shutdown.
+- Apply bounded buffering and explicit backpressure policies.
 
-### 2. Event Model
+### Protocol Integrity
 
-An execution is represented as a sequence of immutable events.
+For MCP stdio communication:
+
+- Messages use the framing defined by the MCP stdio transport specification.
+- Each message is encoded as a UTF-8 JSON-RPC message followed by a newline.
+- Server stdout is reserved for protocol messages.
+- Server diagnostics and logging belong on stderr.
+- The proxy must not assume that one operating-system read corresponds to one complete protocol message.
+
+AERLOG must parse and forward messages without injecting diagnostic output into the protocol stream.
+
+Where possible, unknown methods and fields should remain intact. Parsing failures should be surfaced as capture warnings rather than silently discarded.
+
+### Failure Handling
+
+The proxy must account for:
+
+| Failure | Required behavior |
+|---|---|
+| Server fails to start | Report startup failure and clean up resources. |
+| Client disconnects | Terminate or clean up the child process according to the lifecycle policy. |
+| Server exits early | Preserve exit information and close forwarding paths safely. |
+| Broken pipe | Record transport failure and stop invalid forwarding. |
+| Malformed message | Preserve available evidence and report a parsing warning. |
+| Capture queue saturation | Apply an explicit backpressure or incomplete-capture policy. |
+| Cancellation | Propagate cancellation and release subprocess resources. |
+| Shutdown timeout | Escalate cleanup according to the configured process policy. |
+
+The proxy's primary responsibility is protocol correctness, not diagnosis.
+
+## 2. Capture Pipeline
+
+The capture pipeline converts transport observations into durable execution events.
+
+Its stages are:
+
+```text
+Transport Observation
+        |
+        v
+Message Reader
+        |
+        v
+Protocol Normalization
+        |
+        v
+Request / Response Correlation
+        |
+        v
+Sensitive Data Redaction
+        |
+        v
+Event Validation
+        |
+        v
+Persistence
+```
+
+### Pipeline Responsibilities
+
+| Stage | Responsibility |
+|---|---|
+| Message reader | Receives complete framed messages from forwarding paths. |
+| Normalizer | Creates a consistent internal representation. |
+| Correlator | Associates requests and responses. |
+| Redaction | Applies configured sensitive-data handling. |
+| Validator | Checks event structure and schema compatibility. |
+| Persistence | Appends event records and updates metadata. |
+
+The capture pipeline should use bounded buffering rather than unbounded in-memory queues.
+
+A critical trade-off must be documented: if the storage system cannot keep up, AERLOG must decide whether to apply backpressure, stop capture, or mark the execution incomplete. It must never silently drop events while claiming to have a complete recording.
+
+The initial implementation should favor correctness and explicit failure reporting over premature throughput optimization.
+
+## 3. Event Model
+
+An execution is represented by an ordered sequence of structured events.
 
 A conceptual event envelope:
 
@@ -266,11 +666,12 @@ A conceptual event envelope:
   "event_id": "evt_01...",
   "execution_id": "exec_01...",
   "sequence": 12,
-  "timestamp": "2026-01-01T12:00:00.000Z",
+  "timestamp": "2026-11-11T10:30:00.000Z",
+  "monotonic_time_ns": 123456789000,
   "direction": "client_to_server",
   "kind": "jsonrpc_request",
-  "method": "tools/call",
   "request_id": "42",
+  "method": "tools/call",
   "payload": {
     "name": "example_tool",
     "arguments": {}
@@ -281,167 +682,254 @@ A conceptual event envelope:
 
 This is an illustrative schema, not a finalized wire format.
 
-Potential event kinds:
+### Event Categories
 
-- `process_started`
-- `process_stderr`
-- `jsonrpc_request`
-- `jsonrpc_response`
-- `jsonrpc_notification`
-- `transport_error`
-- `timeout`
-- `process_exited`
-- `capture_warning`
+| Event kind | Description |
+|---|---|
+| `process_started` | Server subprocess successfully started. |
+| `process_stderr` | Server emitted diagnostic output. |
+| `jsonrpc_request` | A JSON-RPC request was observed. |
+| `jsonrpc_response` | A JSON-RPC response was observed. |
+| `jsonrpc_notification` | A notification was observed. |
+| `transport_error` | A forwarding or transport error occurred. |
+| `timeout` | A timeout was observed or declared by AERLOG. |
+| `process_exited` | Server subprocess terminated. |
+| `capture_warning` | A limitation or recording issue occurred. |
+| `capture_gap` | A known gap exists in the recorded event sequence. |
 
-Core event fields:
+### Core Fields
 
 | Field | Purpose |
 |---|---|
-| `schema_version` | Allows the stored event format to evolve |
-| `event_id` | Unique event identity |
-| `execution_id` | Groups events into one execution |
-| `sequence` | Preserves observed order within an execution |
-| `timestamp` | Wall-clock time for human inspection |
-| `monotonic_time` | Optional monotonic clock value for duration calculations |
-| `direction` | Client-to-server, server-to-client, or internal |
-| `kind` | Event category |
-| `request_id` | Correlation key where applicable |
-| `method` | JSON-RPC method, when present |
-| `payload` | Structured or raw protocol content |
-| `transport` | Transport used to observe the event |
+| `schema_version` | Supports event-format evolution. |
+| `event_id` | Identifies an individual event. |
+| `execution_id` | Groups events into an execution. |
+| `sequence` | Defines observed event order within an execution. |
+| `timestamp` | Human-readable wall-clock timestamp. |
+| `monotonic_time_ns` | Supports reliable duration calculations. |
+| `direction` | Identifies the observation direction. |
+| `kind` | Identifies the event category. |
+| `request_id` | Correlation key where applicable. |
+| `method` | JSON-RPC method where applicable. |
+| `payload` | Structured or raw protocol content. |
+| `transport` | Identifies the transport implementation. |
 
-Store both wall-clock and monotonic timing where possible. Wall-clock timestamps are useful to humans; monotonic time is safer for measuring durations.
+### Timing Semantics
 
-### 3. Request/Response Correlation
+Both wall-clock and monotonic timing should be recorded where possible.
 
-JSON-RPC request IDs provide a natural correlation mechanism for request/response pairs within the relevant session.
+- Wall-clock timestamps are useful for human inspection and cross-system context.
+- Monotonic timestamps are more reliable for calculating durations within one process execution.
+- Sequence numbers preserve the order in which observations are recorded.
+- AERLOG should distinguish observed timestamps from derived duration measurements.
+
+## 4. Request and Response Correlation
+
+JSON-RPC request IDs provide the primary mechanism for associating requests with their corresponding responses.
 
 The correlator should:
 
 - Track outstanding requests.
 - Match responses to their request IDs.
+- Scope request tracking to the relevant connection or session.
+- Preserve original request IDs and their JSON types.
+- Handle out-of-order responses.
 - Record unmatched responses.
-- Identify requests with no observed response when an execution ends or a timeout is reached.
-- Avoid assuming that events always arrive in a simple request-then-response sequence.
-- Preserve notifications, which do not expect a response.
-- Scope correlation to the appropriate connection/session.
+- Identify requests without observed responses.
+- Preserve notifications, which do not expect responses.
+- Handle identifier reuse without confusing separate outstanding requests.
 
-A missing response is evidence of an incomplete interaction, not automatic proof of a server bug. The diagnostic layer should retain that distinction.
+A missing response is evidence of an incomplete interaction. It does not prove that the server failed to process the request.
 
-### 4. Storage Strategy
+The correlation layer must retain that distinction so that diagnostics do not overstate what the capture establishes.
 
-Use two complementary storage layers.
+## 5. Storage Architecture
 
-**Append-only JSONL event log**
+AERLOG uses two complementary local persistence mechanisms.
 
-- The durable record of observed events.
-- Easy to inspect, stream, export, and process.
-- Suitable for preserving the event sequence.
-- Each line represents one event.
-- Execution metadata should identify the file and its integrity information.
+### A. Append-Only JSONL Event Log
 
-**SQLite metadata and indexes**
+The event log is the durable record of captured execution events.
 
-- Execution summaries and timestamps.
+Responsibilities:
+
+- Store structured events in sequence.
+- Preserve the original observation history subject to redaction.
+- Support streaming and offline inspection.
+- Allow export and fixture processing.
+- Make event data accessible without requiring a database server.
+
+Each execution should have a clearly defined recording boundary and manifest.
+
+### B. SQLite Metadata and Indexes
+
+SQLite provides queryable execution metadata and indexes.
+
+Responsibilities:
+
+- Execution identifiers and summaries.
+- Start and end timestamps.
+- Event counts and recording status.
 - Event offsets or references.
 - Request/response relationships.
-- Searchable metadata and diagnostic results.
-- Replay fixture metadata.
+- Diagnostic summaries.
+- Replay metadata.
+- Search and filtering.
 
-This separation keeps the raw evidence simple while making queries efficient.
+SQLite should be treated as an index and metadata store, not as an independent source of truth that can silently contradict the event log.
 
-Example conceptual layout:
+### C. Conceptual Storage Layout
 
 ```text
 ~/.local/share/aerlog/
+│
 ├── config.toml
+│
 ├── executions/
+│   ├── <execution-id>/
+│   │   ├── events.jsonl
+│   │   ├── execution.json
+│   │   └── manifest.json
+│   │
 │   └── <execution-id>/
 │       ├── events.jsonl
 │       ├── execution.json
 │       └── manifest.json
+│
 ├── aerlog.db
+│
 └── logs/
     └── aerlog.log
 ```
 
-The actual storage location should follow platform conventions and be configurable.
+The final location should follow operating-system conventions and remain configurable.
 
-### 5. Diagnostics Engine
+### D. Storage Integrity
 
-Start with deterministic, explainable rules. Do not introduce an LLM-based failure classifier into the MVP.
+The implementation should consider:
 
-Each diagnostic should include:
+- Atomic metadata updates.
+- Partial recordings after crashes.
+- Incomplete final JSONL records.
+- SQLite transactions and migrations.
+- Event schema versioning.
+- Recording manifests.
+- Checksums or integrity metadata where useful.
+- Recovery of incomplete executions.
+
+A partially written execution must not be presented as a fully successful recording.
+
+## 6. Diagnostics Engine
+
+The first diagnostics implementation should be deterministic and explainable.
+
+No LLM-based failure classifier is required for the MVP.
+
+Every diagnostic should contain:
 
 - A stable diagnostic code.
 - Severity.
 - A concise explanation.
-- The event IDs that support it.
-- Confidence or certainty where appropriate.
-- A statement of what cannot be inferred.
+- Supporting event IDs.
+- Confidence or certainty semantics.
+- Known limitations.
 - A suggested investigation step.
 
-Example:
+### Example Diagnostic
 
 ```json
 {
   "code": "REQUEST_WITHOUT_RESPONSE",
   "severity": "warning",
   "message": "A request was observed without a matching response.",
-  "evidence": ["evt_11", "evt_18"],
+  "evidence": [
+    "evt_11",
+    "evt_18"
+  ],
   "confidence": "observed",
-  "limitations": "The capture cannot determine whether the server processed the request before the connection ended."
+  "limitations": "The capture cannot determine whether the server completed the operation before the connection ended."
 }
 ```
 
-The initial rules should be conservative. A repeated call may be intentional; a timeout may be caused by the client, server, or transport. Diagnostics should describe evidence, not invent root causes.
+The diagnostics engine should distinguish:
 
-### 6. Replay Architecture and Safety
+- Directly observed protocol errors.
+- Observed transport failures.
+- Inferred execution patterns.
+- Potential behavioral problems.
 
-Replay is one of the most sensitive parts of the system.
+AERLOG should not turn a plausible explanation into a factual root-cause claim.
 
-The default replay path should use captured responses as a cassette or run against mocks. It should not call real tools.
+## 7. Replay Architecture and Safety
+
+Replay consumes stored recordings and reconstructs selected protocol interactions.
+
+The initial implementation should focus on cassette-based replay.
+
+### Cassette Replay
+
+In cassette mode:
+
+1. Load the selected recording.
+2. Validate the event sequence and schema version.
+3. Select the relevant interaction sequence.
+4. Match incoming requests against recorded requests.
+5. Return the corresponding recorded responses.
+6. Record mismatches and replay outcomes.
+7. Generate a replay report.
+
+Cassette replay must not connect to the original MCP server.
+
+### Live Replay
+
+Live replay is a separate, higher-risk capability.
+
+It may eventually support controlled re-execution against a real server, but must require explicit user authorization.
 
 Safety requirements:
 
-- Inspect-only mode must never execute a request.
-- Cassette replay must not contact the original server.
-- Live replay must require an explicit user action.
-- Potentially side-effecting calls must be clearly identified where possible.
-- Never automatically replay a write, delete, payment, deployment, message-send, or other consequential action.
-- Do not treat a method name allowlist as a complete safety guarantee.
-- Make the target, mode, and execution boundary visible before live replay.
-- Preserve a record of replay activity separately from the original capture.
+- Never automatically replay destructive operations.
+- Clearly display the target and replay mode.
+- Do not assume read-like method names guarantee safe behavior.
+- Do not execute embedded commands from recordings.
+- Keep original recordings immutable.
+- Record replay activity separately.
+- Make external side effects explicit.
+- Provide clear warnings before live execution.
 
-A recorded request is evidence of what happened, not authorization to do it again.
+AERLOG should not claim that it can guarantee safe replay of arbitrary MCP tools.
 
-### 7. Privacy and Data Handling
+## 8. Privacy and Data Handling
 
-MCP traffic can contain credentials, personal information, file contents, internal prompts, and business data.
+MCP traffic may contain credentials, private file contents, internal prompts, personal information, and business data.
 
-AERLOG should therefore:
+AERLOG should therefore use a local-first privacy model.
 
-- Run locally by default.
-- Provide configurable redaction before persistence and export.
-- Support sensitive-field patterns and user-defined redaction rules.
-- Avoid logging environment variables or secrets from subprocess configuration.
-- Warn before exporting raw recordings.
-- Keep permissions restrictive for local recordings.
-- Make it clear that payload capture can expose sensitive data.
-- Avoid sending recordings to a remote service by default.
+### Privacy Requirements
 
-Redaction must be explicit and testable. If a field is redacted, the stored event should make that fact visible rather than silently presenting incomplete data as the original payload.
+1. **Local-first recording:** No remote upload by default.
+2. **Pre-persistence redaction:** Configured sensitive data should be removed or masked before durable storage.
+3. **Configurable policies:** Support sensitive-field patterns and user-defined redaction rules.
+4. **Secret handling:** Avoid capturing environment variables and secrets from subprocess configuration.
+5. **Restricted permissions:** Protect local execution recordings using appropriate filesystem permissions.
+6. **Export awareness:** Warn before sharing raw recordings.
+7. **Redaction visibility:** Indicate when content has been redacted.
+8. **Explicit limitations:** Explain that payload capture may expose sensitive information.
+
+Redaction must be testable and predictable. AERLOG must not silently present a modified payload as if it were the complete original message.
 
 ---
 
-## Proposed Repository Structure
+# Repository Structure
 
-The following is the intended modular layout. It is a design target, not a claim that these files already exist.
+The following is the proposed modular repository layout. It describes the intended architecture, not a claim that all modules currently exist.
 
 ```text
 aerlog/
+│
 ├── README.md
 ├── LICENSE
+├── NOTICE
 ├── pyproject.toml
 ├── .gitignore
 ├── .python-version
@@ -457,10 +945,13 @@ aerlog/
 │   │       ├── 0001-python-core.md
 │   │       ├── 0002-stdio-proxy-first.md
 │   │       └── 0003-jsonl-and-sqlite.md
+│   │
 │   ├── protocol/
 │   │   └── compatibility.md
+│   │
 │   ├── security/
 │   │   └── threat-model.md
+│   │
 │   └── development/
 │       └── testing.md
 │
@@ -468,14 +959,22 @@ aerlog/
 │   └── aerlog/
 │       ├── __init__.py
 │       ├── __main__.py
+│       │
 │       ├── cli/
 │       │   ├── app.py
 │       │   └── commands/
 │       │       ├── run.py
 │       │       ├── list.py
 │       │       ├── inspect.py
+│       │       ├── timeline.py
 │       │       ├── replay.py
 │       │       └── export.py
+│       │
+│       ├── application/
+│       │   ├── execution.py
+│       │   ├── inspection.py
+│       │   ├── replay.py
+│       │   └── export.py
 │       │
 │       ├── proxy/
 │       │   ├── manager.py
@@ -528,14 +1027,19 @@ aerlog/
 │   │   ├── test_framing.py
 │   │   ├── test_correlation.py
 │   │   ├── test_redaction.py
-│   │   └── test_diagnostics.py
+│   │   ├── test_diagnostics.py
+│   │   └── test_event_models.py
+│   │
 │   ├── integration/
 │   │   ├── test_stdio_proxy.py
 │   │   ├── test_capture_pipeline.py
+│   │   ├── test_storage_recovery.py
 │   │   └── test_cassette_replay.py
+│   │
 │   ├── fixtures/
 │   │   ├── servers/
 │   │   └── recordings/
+│   │
 │   └── conftest.py
 │
 ├── examples/
@@ -543,7 +1047,7 @@ aerlog/
 │   ├── timeout_scenario.py
 │   └── repeated_call_scenario.py
 │
-└── web/                         # Later milestone
+└── web/                         # Future local cockpit
     ├── package.json
     ├── src/
     └── README.md
@@ -551,371 +1055,488 @@ aerlog/
 
 ### Module Boundaries
 
-- `proxy` handles process and transport forwarding. It should not contain diagnostic rules.
-- `protocol` understands framing and JSON-RPC structure. It should preserve unknown methods and fields.
-- `capture` turns transport observations into events and applies configured redaction.
-- `events` defines the stable internal event contract and correlation primitives.
-- `storage` persists and retrieves events without owning protocol behavior.
-- `analysis` builds timelines and diagnostics from stored events.
-- `replay` consumes recordings and enforces replay safety.
-- `export` turns selected recordings into portable tests.
-- `cli` coordinates user-facing workflows; it should not become the home for core business logic.
+| Module | Ownership |
+|---|---|
+| `cli/` | Parses commands and presents results. |
+| `application/` | Coordinates complete user-facing workflows. |
+| `proxy/` | Owns subprocess and stream lifecycle. |
+| `protocol/` | Owns message framing and JSON-RPC interpretation. |
+| `capture/` | Owns observation, normalization, and redaction. |
+| `events/` | Owns event contracts and correlation primitives. |
+| `storage/` | Owns persistence and retrieval. |
+| `analysis/` | Owns timelines and diagnostic rules. |
+| `replay/` | Owns cassette behavior and replay safety. |
+| `export/` | Owns portable regression test generation. |
+| `config/` | Owns runtime configuration and validation. |
 
-Avoid premature microservices. The first version should be a modular Python application with clear internal interfaces.
+Keep the application modular. Introduce additional processes or services only when a demonstrated requirement justifies them.
 
 ---
 
-## Technology Choices
+# Technology Stack
 
-The initial stack favors a small, inspectable system over infrastructure for its own sake.
+The initial stack prioritizes correctness, maintainability, and local execution.
 
-| Area | Proposed choice | Why |
+| Area | Proposed technology | Reason |
 |---|---|---|
-| Core language | Python 3.11+ | Fast iteration, strong async ecosystem, accessible protocol tooling |
-| Async/processes | `asyncio` | Subprocess streams, concurrent forwarding, cancellation |
-| MCP integration | Official MCP Python SDK where appropriate | Protocol types and interoperability |
-| Protocol handling | Explicit JSON-RPC/framing layer where needed | Transparent forwarding and unknown-message preservation |
-| Validation | Pydantic | Typed event and configuration models |
-| Event persistence | JSONL | Simple append-only event record |
-| Metadata/index | SQLite | Local queries without a separate database service |
-| CLI | Typer + Rich | Ergonomic commands and readable terminal output |
-| API (later) | FastAPI | Local API for the cockpit |
-| Web UI (later) | React + TypeScript + Vite | Familiar, maintainable developer interface |
-| Tests | pytest | Unit, integration, and fixture-based testing |
-| Telemetry (optional) | OpenTelemetry | Potential interoperability with existing observability tools |
+| Core language | Python 3.11+ | Product iteration and mature tooling ecosystem. |
+| Async runtime | `asyncio` | Concurrent subprocess streams and cancellation. |
+| Process management | `asyncio.subprocess` | Child process lifecycle and pipe handling. |
+| MCP integration | Official MCP Python SDK where appropriate | Protocol compatibility and interoperability. |
+| Protocol layer | Explicit JSON-RPC/framing implementation where required | Transparent observation and preservation. |
+| Data validation | Pydantic | Typed event and configuration models. |
+| Event persistence | JSONL | Simple, inspectable, append-oriented records. |
+| Metadata database | SQLite | Local indexing and queries without a separate service. |
+| CLI | Typer + Rich | Readable terminal interface. |
+| Local API (later) | FastAPI | Backend for the future cockpit. |
+| Web UI (later) | React + TypeScript + Vite | Familiar developer-facing interface. |
+| Testing | pytest | Unit, integration, and fixture-based tests. |
+| Code quality | Ruff | Linting and formatting. |
+| Optional telemetry | OpenTelemetry | Future trace-context interoperability. |
 
 ### Why Not Start With...?
 
-| Technology / approach | Why it is not in the MVP |
+| Technology / approach | Reason for exclusion from the MVP |
 |---|---|
-| Kafka / message brokers | Adds distributed infrastructure before there is a demonstrated need |
-| Redis | No initial requirement for a shared cache or queue |
-| Kubernetes | A local developer tool does not need orchestration |
-| Vector database | The first problem is structured protocol evidence, not semantic retrieval |
-| LLM failure classifier | Deterministic diagnostics are easier to test and explain |
-| Cloud dashboard | Local CLI and storage should prove the core workflow first |
-| Microservices | Separate processes would increase operational complexity without clear benefit |
+| Kafka | Distributed event infrastructure is unnecessary for an initial local recorder. |
+| Redis | No demonstrated requirement for a shared cache or queue. |
+| Kubernetes | The initial product is a local developer tool. |
+| Vector database | The core problem is structured protocol evidence, not semantic retrieval. |
+| LLM-based diagnostics | Deterministic rules are easier to test and explain. |
+| Hosted dashboard | The local capture and replay workflow must prove its value first. |
+| Microservices | Additional deployment and operational complexity without an established need. |
 
-These are not universally bad choices. They may become useful if real usage demonstrates a need.
+These technologies are not inherently unsuitable. They should be considered when actual requirements justify them.
 
 ---
 
-## MVP Scope
+# MVP Scope and Milestones
 
-The MVP should prove one complete workflow:
+The MVP should prove one complete, useful engineering workflow:
 
 > Capture one real MCP execution, persist its observable events, reconstruct its timeline, and correctly identify a simulated timeout.
 
-### Milestones
+### Milestone Plan
 
-- [ ] **M0 — Protocol spike:** Understand the MCP stdio transport and build a minimal test server/client pair.
-- [ ] **M1 — Transparent proxy:** Launch a child MCP server and forward traffic in both directions without corrupting messages.
-- [ ] **M2 — Event capture:** Persist requests, responses, notifications, timestamps, and process events.
-- [ ] **M3 — Correlation and timeline:** Match requests/responses and display an ordered execution.
-- [ ] **M4 — Failure diagnostics:** Detect a missing response, timeout, explicit protocol error, and unexpected process exit.
-- [ ] **M5 — Cassette replay:** Serve recorded responses in a controlled test without contacting the original server.
-- [ ] **M6 — Regression export:** Convert a captured scenario into a repeatable automated test.
-- [ ] **M7 — Local cockpit:** Add a minimal web interface after the CLI workflow is dependable.
+- [ ] **M0 — Protocol spike**
+  - Study MCP stdio transport behavior.
+  - Build a minimal test MCP server and client.
+  - Verify message framing and process lifecycle.
+
+- [ ] **M1 — Transparent proxy**
+  - Launch a configured server subprocess.
+  - Forward traffic in both directions.
+  - Preserve stdout protocol integrity.
+  - Handle cancellation and subprocess cleanup.
+
+- [ ] **M2 — Event capture**
+  - Capture requests, responses, and notifications.
+  - Record process and transport events.
+  - Normalize events and persist them.
+
+- [ ] **M3 — Correlation and timeline**
+  - Match requests and responses.
+  - Preserve event ordering.
+  - Build a readable execution timeline.
+
+- [ ] **M4 — Deterministic diagnostics**
+  - Detect missing responses.
+  - Identify observed timeouts.
+  - Capture explicit protocol errors.
+  - Detect unexpected process termination.
+
+- [ ] **M5 — Cassette replay**
+  - Load stored executions.
+  - Validate recording integrity.
+  - Replay recorded responses without contacting the original server.
+
+- [ ] **M6 — Regression export**
+  - Generate portable fixtures.
+  - Produce repeatable protocol tests.
+  - Verify exported tests against deterministic scenarios.
+
+- [ ] **M7 — Local cockpit**
+  - Add execution discovery.
+  - Visualize event timelines.
+  - Inspect diagnostics and payloads.
+  - Provide replay and export controls.
 
 ### MVP Acceptance Criteria
 
 The first usable milestone is complete only when:
 
-1. AERLOG can launch a test MCP server as a subprocess.
-2. A client can communicate through AERLOG successfully.
-3. AERLOG captures both directions of protocol traffic.
-4. Captured messages are persisted and can be read after the process exits.
-5. Request/response pairs are correlated correctly.
+1. AERLOG launches a test MCP server as a subprocess.
+2. An MCP client communicates through the proxy successfully.
+3. Both directions of protocol traffic are captured.
+4. Captured events remain accessible after process termination.
+5. Request/response relationships are correctly reconstructed.
 6. A deliberately delayed or missing response is identified with supporting evidence.
 7. Capture does not corrupt the protocol stream.
-8. Tests cover normal operation, timeout, malformed input, process exit, and cancellation.
+8. Incomplete recordings are distinguishable from complete ones.
+9. Tests cover normal operation, timeouts, malformed input, process exits, and cancellation.
 
-A dashboard is not required to satisfy this milestone.
+A web dashboard is not required to meet these criteria.
 
 ---
 
-## Example Developer Experience
+# CLI Experience
 
-The following commands describe the intended CLI. They are illustrative until implemented.
+The following commands describe the intended developer experience. They are illustrative until implemented.
 
 ```bash
-# Run a server through the recorder
+# Start a server through AERLOG
 aerlog run -- python examples/demo_mcp_server.py
 
-# List captured executions
+# List recorded executions
 aerlog executions list
 
-# Inspect one execution
+# Inspect a specific execution
 aerlog inspect <execution-id>
 
-# Show the event timeline
+# View its chronological timeline
 aerlog timeline <execution-id>
 
-# Replay recorded responses without contacting the original server
+# Replay recorded interactions without contacting the original server
 aerlog replay <execution-id> --mode cassette
 
-# Export a regression fixture
+# Export a regression test
 aerlog export test <execution-id> --output tests/generated/
 ```
 
-A possible inspection view:
+### Example Inspection Output
 
 ```text
-Execution: exec_01J...
-Status:    COMPLETED_WITH_WARNINGS
-Duration:  2.41s
-Events:    12
+AERLOG EXECUTION INSPECTOR
 
-TIME       DIRECTION       EVENT
-00.000s    client -> server initialize
-00.031s    server -> client initialize result
-00.044s    client -> server tools/list
-00.062s    server -> client tools/list result
-00.081s    client -> server tools/call
-02.081s    internal         request timeout
+Execution:  exec_01J...
+Status:     COMPLETED_WITH_WARNINGS
+Duration:   2.41s
+Events:     12
+Transport:  stdio
+
+TIMELINE
+
+TIME       DIRECTION         EVENT
+------------------------------------------------
+00.000s    client -> server  initialize
+00.031s    server -> client  initialize result
+00.044s    client -> server  tools/list
+00.062s    server -> client  tools/list result
+00.081s    client -> server  tools/call
+02.081s    internal          request timeout
 
 DIAGNOSTICS
+
 [WARN] REQUEST_WITHOUT_RESPONSE
-       Request ID: 42
-       Method:     tools/call
-       Evidence:   events 9, 12
-       Note:       The capture cannot establish whether the server
-                   completed the operation before the timeout.
+
+Request ID: 42
+Method:     tools/call
+Evidence:   evt_09, evt_12
+
+The request was observed without a matching response
+before the configured timeout.
+
+Limitation:
+The recording cannot establish whether the server
+completed the operation before the connection ended.
 ```
 
 ---
 
-## Testing Strategy
+# Testing Strategy
 
-Reliability tooling must itself be reliable. Tests should verify both the captured evidence and the behavior of the proxy.
+A reliability tool must itself be reliable.
 
-### Unit Tests
+Tests should validate both the behavior of the proxy and the correctness of the evidence it produces.
+
+## 1. Unit Tests
 
 - Message framing and parsing.
-- Event schema validation and version handling.
+- JSON-RPC message classification.
+- Event schema validation.
+- Event version compatibility.
 - Request/response correlation.
-- Timestamp and duration calculations.
-- Redaction rules.
+- Sequence and timestamp handling.
+- Duration calculations.
+- Redaction policies.
 - Diagnostic rule behavior.
-- Replay safety policy.
+- Replay safety policies.
 
-### Integration Tests
+## 2. Integration Tests
 
-Use small deterministic MCP test servers that simulate:
+Use small deterministic MCP test servers to simulate:
 
-- Successful initialization and tool calls.
+- Successful initialization.
+- Tool discovery and tool calls.
 - Delayed responses and timeouts.
-- Malformed protocol messages.
-- Unmatched and out-of-order responses where the transport permits them.
+- Explicit JSON-RPC errors.
+- Malformed messages.
 - Notifications.
-- Server crash and early exit.
+- Unmatched and out-of-order responses where valid.
+- Server crashes and early termination.
 - Large payloads and backpressure.
-- Client cancellation and graceful shutdown.
+- Client cancellation.
+- Graceful shutdown.
+- Partial recordings and storage recovery.
 
-### Compatibility Tests
+## 3. Compatibility Tests
 
-- Verify behavior against supported MCP SDK versions.
+- Validate against supported MCP SDK versions.
+- Verify stdio framing behavior.
 - Preserve unknown JSON-RPC methods and fields.
-- Test protocol edge cases and transport framing.
-- Keep representative recordings as fixtures.
-- Avoid relying on a live third-party MCP server in the core test suite.
+- Test protocol edge cases.
+- Maintain representative execution fixtures.
+- Avoid depending on live third-party MCP servers in the core test suite.
 
-### Performance Checks
+## 4. Performance Checks
 
-Measure rather than assume:
+Measure actual behavior instead of assuming the proxy is lightweight.
 
-- Proxy forwarding overhead.
+Relevant metrics include:
+
+- Message forwarding overhead.
 - Capture throughput.
-- Memory usage under large payloads.
+- Memory consumption.
+- Queue saturation behavior.
 - Storage growth.
 - Timeline reconstruction time.
+- Large-payload handling.
 
-Performance targets should be set after a baseline exists. Do not publish benchmark claims without reproducible measurements and documented hardware/test conditions.
+Performance targets should be established after reproducible baselines exist. No benchmark claims should be published without documented hardware, test conditions, and methodology.
 
 ---
 
-## Security and Trust Boundaries
+# Security and Trust Boundaries
 
-AERLOG observes data that may be sensitive and interacts with processes that may have access to a developer's machine.
+AERLOG observes potentially sensitive data and interacts with processes that may have access to a developer's machine.
 
-### Threats to Consider
+Security must therefore be considered part of the architecture, not a feature added after the recorder works.
+
+## Threat Model
 
 | Threat | Mitigation direction |
 |---|---|
-| Secrets captured in payloads | Redaction rules, warnings, restricted file permissions |
-| Malicious or malformed protocol input | Strict framing limits, bounded buffers, defensive parsing |
-| Proxy deadlock or resource exhaustion | Backpressure, timeouts, cancellation, process limits |
-| Unsafe replay | Cassette-first design, explicit live replay confirmation |
-| Untrusted exported fixtures | Treat fixtures as data; never execute embedded commands automatically |
-| Sensitive recordings shared accidentally | Export warnings and redaction preview |
-| Child process leakage | Process-group management and reliable cleanup |
+| Secrets captured in payloads | Pre-persistence redaction and export warnings. |
+| Malformed protocol input | Defensive parsing and bounded resource usage. |
+| Unbounded memory growth | Bounded queues and backpressure. |
+| Child process leakage | Process-group management and reliable cleanup. |
+| Unsafe live replay | Explicit authorization and visible target boundaries. |
+| Malicious exported fixtures | Treat recordings as data, never as executable commands. |
+| Sensitive recordings shared accidentally | Redaction preview and export warnings. |
+| Partial or corrupted recordings | Recovery handling and integrity metadata. |
 
-### Trust Model
+## Trust Model
 
-- The local developer controls the machine and chooses which processes to run.
-- MCP servers and their outputs should be treated as potentially untrusted.
-- Captured payloads should be treated as sensitive.
+- The local developer controls the machine and selects the processes to run.
+- MCP servers and their outputs are potentially untrusted.
+- Captured payloads are potentially sensitive.
 - Recordings are evidence, not executable instructions.
 - AERLOG should not silently modify requests or responses.
-- A successful capture does not prove that an external operation succeeded in the real world.
+- A successful capture does not prove that an external operation succeeded.
+- Diagnostics are limited to observable evidence and explicitly supplied instrumentation.
 
-A dedicated threat model should be maintained as the implementation evolves.
+A dedicated threat model should evolve alongside the implementation.
 
 ---
 
-## Compatibility and Limitations
+# Compatibility and Limitations
 
-### What AERLOG Can Observe
+## What AERLOG Can Observe
 
-When traffic passes through the proxy, AERLOG can observe protocol messages, transport behavior, process lifecycle, and timing available at that boundary.
+When communication passes through its configured proxy, AERLOG can observe:
 
-### What AERLOG Cannot Observe by Default
+- Protocol messages.
+- Request/response relationships.
+- Notifications.
+- Transport behavior.
+- Available process lifecycle information.
+- Observable timing and errors.
+- Server stderr output.
+
+## What AERLOG Cannot Observe by Default
 
 - Private model reasoning or hidden chain-of-thought.
-- Internal agent state that is never sent over the observed connection.
-- Model prompts/responses exchanged outside the proxied path.
-- Tool-side effects that are not reflected in protocol responses.
-- Whether a server actually completed an external operation after a connection was lost.
+- Internal agent state never exposed through the observed boundary.
+- Model prompts and responses exchanged through unrelated connections.
+- Tool-side effects not represented in observable responses.
+- Whether an external operation completed after a connection was lost.
+- The actual intent behind a tool call.
 
-Optional instrumentation in an agent application could add explicit task IDs, model-call metadata, or other context. Such instrumentation should be opt-in and must not be presented as information obtained by the transparent proxy.
+Optional agent-side instrumentation may eventually supply explicit task IDs, model-call metadata, or application-level context.
 
-### Initial Transport Scope
+Such metadata must be clearly distinguished from information observed by the proxy.
 
-The first milestone targets **stdio**. Other transports should be considered only after the stdio capture path is stable and compatibility requirements are understood.
+## Initial Transport Scope
 
----
+The first implementation targets **MCP stdio transport**.
 
-## Competitive Landscape and Positioning
+Additional transports should be considered after the stdio capture pipeline is reliable and their protocol and lifecycle requirements have been evaluated.
 
-AERLOG sits in an ecosystem that already includes MCP inspection tools, record/replay utilities, and general LLM observability platforms. It should not claim to be the first tool to record MCP traffic or replay interactions.
-
-The intended differentiation is a focused reliability workflow:
-
-1. Execution-centric capture rather than only server inspection.
-2. A correlated timeline of protocol events and process lifecycle.
-3. Evidence-backed failure localization.
-4. Safe cassette replay with side-effect awareness.
-5. Regression-test generation from real failures.
-6. A local-first workflow that can work without a hosted observability account.
-
-These are product hypotheses to validate, not proof of an uncontested market. The project should compare its workflow against existing tools and narrow its scope if another tool already solves the same problem well.
+Compatibility claims should be tied to tested MCP SDK and protocol versions.
 
 ---
 
-## Development Setup
+# Competitive Landscape and Positioning
 
-The commands below are the planned development workflow.
+AERLOG enters an ecosystem that already includes MCP inspection tools, record/replay utilities, and general-purpose LLM observability platforms.
 
-### Requirements
+It should not claim to be the first tool to record MCP traffic or replay interactions.
+
+Its intended focus is an execution-centric reliability workflow:
+
+1. Capture protocol interactions and process lifecycle.
+2. Reconstruct correlated execution timelines.
+3. Localize observable failures using evidence.
+4. Replay captured interactions safely.
+5. Generate regression tests from real failures.
+6. Provide a local-first workflow without requiring a hosted observability account.
+
+These are product hypotheses, not proof of an uncontested market.
+
+The project should continuously compare its workflow against existing tools and narrow its scope if a simpler existing solution already addresses the same problem.
+
+---
+
+# Development Setup
+
+The following describes the intended development workflow. Update commands and dependencies when the initial implementation is established.
+
+## Requirements
 
 - Python 3.11 or newer.
 - Git.
 - `uv` (recommended) or `pip`.
-- A Unix-like environment for the initial stdio/subprocess development path; cross-platform behavior should be tested before being claimed.
+- A Unix-like environment for the initial subprocess development path.
+- An MCP-compatible test client and server for integration testing.
 
-### Install for Development
+## Clone the Repository
 
 ```bash
 git clone https://github.com/<your-username>/aerlog.git
 cd aerlog
+```
 
+## Install Development Dependencies
+
+Once the project configuration is implemented:
+
+```bash
 uv sync --all-extras
 ```
 
-The exact dependency groups and commands should be updated when `pyproject.toml` is created.
-
-### Run Checks
+## Run Tests and Checks
 
 ```bash
 uv run pytest
+
 uv run ruff check .
+
 uv run ruff format --check .
 ```
 
-### Suggested Development Loop
+The exact dependency groups and commands should remain synchronized with `pyproject.toml`.
 
-1. Read the relevant protocol and architecture documentation.
-2. Reproduce the behavior with a minimal test server.
-3. Add or update a focused test.
-4. Implement the smallest change that satisfies the test.
-5. Run unit and integration tests.
-6. Inspect the captured event stream and verify no protocol data was lost.
-7. Document compatibility or safety implications.
+## Suggested Development Workflow
+
+1. Read the relevant MCP protocol and architecture documentation.
+2. Identify the subsystem responsible for the behavior.
+3. Reproduce the scenario using a minimal test server.
+4. Define expected behavior and acceptance criteria.
+5. Add or update a focused test.
+6. Implement the smallest appropriate change.
+7. Run relevant unit and integration tests.
+8. Inspect the resulting event stream.
+9. Verify protocol integrity and failure handling.
+10. Document design decisions, compatibility changes, and limitations.
 
 ---
 
-## Contributing
+# Contributing
 
-Contributions are welcome once the initial repository and contribution guidelines are in place.
+Contributions are welcome as the initial repository and implementation take shape.
 
-High-value areas include:
+Potential contribution areas include:
 
-- MCP stdio transport compatibility.
-- Robust subprocess and stream lifecycle handling.
-- Event schema and correlation design.
-- Privacy-preserving capture and redaction.
-- Deterministic replay and fixture design.
-- Failure diagnostics with clear evidence.
-- Cross-platform testing.
+- MCP stdio compatibility.
+- Robust subprocess and stream lifecycle management.
+- Event schema design.
+- Request/response correlation.
+- Privacy-preserving recording and redaction.
+- Storage integrity and recovery.
+- Deterministic diagnostics.
+- Cassette replay and regression testing.
+- Cross-platform compatibility.
 - Documentation and reproducible test scenarios.
 
-Before proposing a major feature, open an issue describing the problem, expected behavior, design options, and safety implications.
+Before proposing a substantial feature, open an issue describing:
+
+- The problem being addressed.
+- Expected behavior.
+- Relevant architectural boundaries.
+- Alternative implementation approaches.
+- Testing requirements.
+- Security and replay implications.
 
 ### Contribution Principles
 
 - Correctness before features.
 - Evidence before diagnosis.
 - Safe defaults before convenience.
-- Small modules with explicit responsibilities.
+- Explicit interfaces and modular responsibilities.
 - Tests for protocol and replay behavior.
-- No fabricated benchmarks or unsupported compatibility claims.
+- No unsupported compatibility or benchmark claims.
+- Documentation for meaningful architectural changes.
 
 ---
 
-## Roadmap Beyond the MVP
+# Future Directions
 
-Potential future directions — not commitments:
+Potential directions beyond the initial release include:
 
-- Additional MCP transports.
-- Agent-side instrumentation for explicit model/task metadata.
-- OpenTelemetry export and trace-context interoperability.
-- More advanced loop and non-progress detection.
-- Side-by-side comparison of two executions.
-- Fixture minimization and selective replay.
-- CI integrations and machine-readable reports.
-- Plugin points for custom diagnostics and redaction.
-- A richer local web cockpit.
+| Area | Possible extension |
+|---|---|
+| Transport support | Additional MCP transport adapters. |
+| Agent instrumentation | Explicit task and model-call context. |
+| Observability | OpenTelemetry export and trace-context interoperability. |
+| Diagnostics | More advanced retry-loop and non-progress detection. |
+| Comparison | Side-by-side execution comparison. |
+| Replay | Selective replay and fixture minimization. |
+| Testing | CI integrations and machine-readable reports. |
+| Extensibility | Custom diagnostic and redaction plugins. |
+| Interface | Richer local web cockpit. |
 
-Prioritize these only after the core capture → inspect → replay → regression workflow is dependable.
-
----
-
-## Project Status
-
-> **Early design / implementation planning.** The architecture and milestones in this README describe the intended direction. They should not be interpreted as a statement that the listed features, CLI commands, UI, or compatibility guarantees are already implemented.
-
-The first engineering objective is the transparent stdio proxy and a trustworthy event capture pipeline. The project should earn more ambitious features through tested foundations.
+These are exploratory directions, not commitments. Prioritize them only after the core capture, inspection, replay, and regression workflow is dependable.
 
 ---
 
-## Naming
+# Project Status
 
-**AERLOG** stands for **Agent Execution Recorder & Log**.
+> **Early design and implementation planning.**
 
-The name reflects the project's focus on capturing and investigating agent execution histories. Before publishing a stable release, check repository/package-name availability, existing trademarks, and discoverability.
+The architecture, repository structure, CLI commands, and milestones in this README describe the intended direction of AERLOG. They should not be interpreted as evidence that the listed features, interfaces, compatibility guarantees, or performance characteristics are already implemented.
+
+The first engineering objective is to build a transparent stdio proxy and a trustworthy event capture pipeline.
+
+More ambitious functionality should be earned through tested, observable foundations.
 
 ---
 
-## License
+# License
 
-License: **to be decided**.
+AERLOG is intended to be released under the **Apache License 2.0**.
 
-Choose and add a license before accepting external contributions or presenting the project as open source. Until a license is added, normal copyright restrictions apply.
+Apache-2.0 permits use, modification, distribution, and commercial adoption while providing an explicit patent grant and requiring preservation of applicable license and attribution notices.
+
+See [LICENSE](LICENSE) for the complete license text.
 
 ---
 
 <div align="center">
 
-**Make agent executions inspectable. Make failures reproducible. Make reliability testable.**
+**Make agent executions inspectable.**
+
+**Make failures reproducible.**
+
+**Make reliability testable.**
 
 </div>
