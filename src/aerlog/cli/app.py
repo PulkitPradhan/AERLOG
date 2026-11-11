@@ -561,6 +561,7 @@ def run_mcp_proxy(
         redaction_mode=effective_redaction,
         max_queue_events=cfg.capture.max_queue_events,
         max_queue_bytes=cfg.capture.max_queue_bytes,
+        spill_dir=resolved_dir / "spool",
         spill_write_timeout_s=cfg.capture.spill_write_timeout_s,
         drain_timeout_s=cfg.capture.drain_timeout_s,
     )

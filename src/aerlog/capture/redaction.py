@@ -31,7 +31,7 @@ _ESCAPED_PEM_PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[^\"]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----"
 )
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
-_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^/\s:@?#]+:[^/\s@?#]*)@")
+_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]{0,31}+://)([^/\s:@?#]+:[^/\s@?#]*)@")
 
 _SAFE_COMPACT_KEYS = frozenset(
     {
@@ -192,11 +192,17 @@ class EventRedactor:
         for regex, replacement in (
             (_PEM_PRIVATE_KEY_RE, REDACTED_KEY_BLOCK_MARKER),
             (_ESCAPED_PEM_PRIVATE_KEY_RE, REDACTED_KEY_BLOCK_MARKER),
-            (_URL_USERINFO_RE, rf"\1{REDACTED_MARKER}@"),
-            (_JWT_RE, REDACTED_MARKER),
         ):
             current, count = regex.subn(replacement, current)
             findings += count
+
+        # Pre-check literal delimiters before running URL regex on multi-MiB strings.
+        if "://" in current and "@" in current:
+            current, count = _URL_USERINFO_RE.subn(rf"\1{REDACTED_MARKER}@", current)
+            findings += count
+
+        current, count = _JWT_RE.subn(REDACTED_MARKER, current)
+        findings += count
 
         after_protocol = _protocol_redact_text(current)
         if after_protocol != current:

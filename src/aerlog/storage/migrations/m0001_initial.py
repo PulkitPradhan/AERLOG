@@ -107,5 +107,8 @@ CREATE INDEX IF NOT EXISTS idx_corruptions_exec
 
 
 def apply(conn: sqlite3.Connection) -> None:
-    """Create initial tables and targeted query indexes."""
-    conn.executescript(SCHEMA_SQL)
+    """Create initial tables and targeted query indexes inside the caller's transaction."""
+    for statement in SCHEMA_SQL.split(";"):
+        stmt = statement.strip()
+        if stmt:
+            conn.execute(stmt)
