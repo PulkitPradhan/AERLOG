@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from aerlog.proxy.diagnostics import (
     DiagnosticWritePolicy,
 )
 from aerlog.proxy.forwarding import (
+    ProxyObserver,
     StreamForwardResult,
     forward_protocol_stream,
     forward_stderr_stream,
@@ -121,6 +123,7 @@ class StdioProxy:
         stdout_writer: asyncio.StreamWriter | None = None,
         diag_stream: TextIO | None = None,
         fallback_stderr: TextIO | None = None,
+        observer: ProxyObserver | None = None,
     ) -> ProxyResult:
         """Launch the MCP server subprocess and proxy stdio until completion."""
         cfg = self._config
@@ -163,6 +166,13 @@ class StdioProxy:
                 stdout_writer = pipe_writer
 
         managed: ManagedProcess | None = None
+        if observer is not None:
+            await observer.on_execution_started(
+                command=cfg.command,
+                cwd=cfg.cwd,
+                env_overrides=cfg.env,
+                monotonic_time_ns=time.monotonic_ns(),
+            )
         try:
             managed = await spawn_mcp_server(
                 cfg.command,
@@ -172,6 +182,15 @@ class StdioProxy:
             )
         except SpawnError as exc:
             await sink.emit("server_spawn_failed", command=redacted_cmd, error=str(exc))
+            if observer is not None:
+                await observer.on_transport_error(
+                    None, "spawn_failed", str(exc), time.monotonic_ns()
+                )
+                await observer.on_execution_finished(
+                    termination_reason="spawn_failed",
+                    exit_code=exc.exit_code,
+                    returncode=None,
+                )
             await sink.close()
             if owns_stdout:
                 with suppress(OSError, BrokenPipeError, ConnectionResetError):
@@ -218,6 +237,7 @@ class StdioProxy:
                 max_frame_bytes=cfg.max_frame_bytes,
                 chunk_size=cfg.chunk_size,
                 close_writer_on_eof=True,
+                observer=observer,
             )
         )
         s2c_task = asyncio.create_task(
@@ -229,10 +249,16 @@ class StdioProxy:
                 max_frame_bytes=cfg.max_frame_bytes,
                 chunk_size=cfg.chunk_size,
                 close_writer_on_eof=False,
+                observer=observer,
             )
         )
         err_task = asyncio.create_task(
-            forward_stderr_stream(proc.stderr, sink, chunk_size=cfg.chunk_size)
+            forward_stderr_stream(
+                proc.stderr,
+                sink,
+                chunk_size=cfg.chunk_size,
+                observer=observer,
+            )
         )
         exit_task = asyncio.create_task(wait_for_process_exit(proc))
         sig_task = asyncio.create_task(signal_event.wait())
@@ -260,8 +286,11 @@ class StdioProxy:
 
                 if sig_task in done:
                     sig_num = signal.SIGTERM.value if received_signal is None else received_signal
+                    sig_name = signal.Signals(sig_num).name
                     exit_code = 128 + sig_num
                     termination_reason = "signal"
+                    if observer is not None:
+                        await observer.on_proxy_signal(sig_name, time.monotonic_ns())
                     break
 
                 if fatal_diag_task in done:
@@ -302,12 +331,15 @@ class StdioProxy:
                         sink,
                         grace_before_term=cfg.grace_before_term,
                         grace_before_kill=cfg.grace_before_kill,
+                        observer=observer,
                     )
                     already_terminated = True
                     termination_reason = "server_stdout_eof"
                     await sink.emit(
                         "server_stdout_eof", returncode=proc.returncode, exit_code=exit_code
                     )
+                    if observer is not None:
+                        await observer.on_process_exited(proc.returncode, time.monotonic_ns())
                     break
 
                 if exit_task in done:
@@ -329,6 +361,8 @@ class StdioProxy:
                     exit_code = normalize_returncode(server_rc)
                     termination_reason = "server_exited"
                     await sink.emit("server_exited", returncode=server_rc, exit_code=exit_code)
+                    if observer is not None:
+                        await observer.on_process_exited(server_rc, time.monotonic_ns())
                     break
         except asyncio.CancelledError:
             was_cancelled = True
@@ -379,9 +413,19 @@ class StdioProxy:
                     grace_before_kill=(
                         _FAST_SIGNAL_GRACE_KILL if fast_teardown else cfg.grace_before_kill
                     ),
+                    observer=observer,
                 )
                 if termination_reason == "completed":
                     exit_code = reaped_code
+
+            if observer is not None:
+                if was_cancelled:
+                    await observer.on_proxy_signal("CANCELLED", time.monotonic_ns())
+                await observer.on_execution_finished(
+                    termination_reason=termination_reason,
+                    exit_code=exit_code,
+                    returncode=proc.returncode,
+                )
 
             if owns_stdout:
                 with suppress(OSError, BrokenPipeError, ConnectionResetError):
@@ -406,9 +450,13 @@ class StdioProxy:
         )
 
 
-async def run_stdio_proxy(config: ProxyConfig) -> ProxyResult:
+async def run_stdio_proxy(
+    config: ProxyConfig,
+    *,
+    observer: ProxyObserver | None = None,
+) -> ProxyResult:
     """Convenience coroutine to execute :class:`StdioProxy` with ``config``."""
-    return await StdioProxy(config).run()
+    return await StdioProxy(config).run(observer=observer)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> ProxyConfig:

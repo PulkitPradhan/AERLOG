@@ -12,6 +12,8 @@ from aerlog.proxy.diagnostics import (
     DiagnosticWritePolicy,
 )
 from aerlog.proxy.forwarding import (
+    ProxyObserver,
+    StreamDirection,
     StreamForwardResult,
     forward_protocol_stream,
     forward_stderr_stream,
@@ -75,9 +77,11 @@ __all__ = [
     "DiagnosticWritePolicy",
     "ManagedProcess",
     "ProxyConfig",
+    "ProxyObserver",
     "ProxyResult",
     "SpawnError",
     "StdioProxy",
+    "StreamDirection",
     "StreamForwardResult",
     "forward_protocol_stream",
     "forward_stderr_stream",

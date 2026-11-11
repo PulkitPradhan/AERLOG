@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aerlog.proxy.diagnostics import DiagnosticSink
+
+if TYPE_CHECKING:
+    from aerlog.proxy.forwarding import ProxyObserver
 
 EXIT_SPAWN_PERMISSION = 126
 EXIT_SPAWN_NOT_FOUND = 127
@@ -152,6 +157,7 @@ async def terminate_process_group(
     *,
     grace_before_term: float = 2.0,
     grace_before_kill: float = 2.0,
+    observer: ProxyObserver | None = None,
 ) -> int:
     """Close server ``stdin`` and escalate ``SIGTERM`` -> ``SIGKILL`` on ``pgid``."""
     proc = managed.process
@@ -165,22 +171,37 @@ async def terminate_process_group(
     grace = _POST_EXIT_GROUP_GRACE if proc.returncode is not None else grace_before_term
     if not await _wait_group_settled(proc, pgid, grace):
         await sink.emit("child_shutdown_escalate", signal="SIGTERM", pgid=pgid)
+        term_err: str | None = None
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         except PermissionError as exc:
+            term_err = repr(exc)
             await sink.emit(
                 "child_signal_permission_error",
                 signal="SIGTERM",
                 pgid=pgid,
-                error=repr(exc),
+                error=term_err,
+            )
+        if observer is not None:
+            await observer.on_child_shutdown_escalate(
+                "SIGTERM", pgid, term_err, time.monotonic_ns()
             )
 
         if not await _wait_group_settled(proc, pgid, grace_before_kill):
             await sink.emit("child_shutdown_escalate", signal="SIGKILL", pgid=pgid)
-            with suppress(ProcessLookupError, PermissionError):
+            kill_err: str | None = None
+            try:
                 os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                kill_err = repr(exc)
+            if observer is not None:
+                await observer.on_child_shutdown_escalate(
+                    "SIGKILL", pgid, kill_err, time.monotonic_ns()
+                )
             loop = asyncio.get_running_loop()
             reap_deadline = loop.time() + _KILL_REAP_TIMEOUT
             while proc.returncode is None and loop.time() < reap_deadline:

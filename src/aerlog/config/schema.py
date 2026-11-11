@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from aerlog.events.types import CaptureBackpressurePolicy, RedactionMode
+
 APP_DIR_NAME = "aerlog"
 CONFIG_FILE_NAME = "config.toml"
 
@@ -60,6 +62,51 @@ def default_data_dir(env: Mapping[str, str] | None = None) -> Path:
     return _resolve_xdg_dir("XDG_DATA_HOME", Path(".local") / "share", env)
 
 
+class CaptureSettings(BaseModel):
+    """Capture pipeline durability and redaction configuration settings.
+
+    Note:
+        The default ``backpressure_policy="block"`` guarantees lossless, bounded-memory
+        capture and may delay MCP forwarding when a capture sink sustains low throughput.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    backpressure_policy: CaptureBackpressurePolicy = Field(
+        default="block",
+        description="Backpressure strategy under slow/full capture buffers (never silent drop).",
+    )
+    redaction_mode: RedactionMode = Field(
+        default="standard",
+        description=(
+            "Pre-persistence redaction policy ('standard', 'strict_hash_only', "
+            "or explicit opt-in 'explicit_unredacted')."
+        ),
+    )
+    max_queue_events: int = Field(
+        default=2048,
+        gt=0,
+        description="Maximum buffered raw capture events in memory before backpressure engages.",
+    )
+    max_queue_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        gt=0,
+        description="Maximum estimated buffered capture bytes in memory.",
+    )
+    spill_write_timeout_s: float = Field(
+        default=0.5,
+        gt=0.0,
+        description=(
+            "Seconds before a stalled primary sink triggers recovery spooling under 'spill'."
+        ),
+    )
+    drain_timeout_s: float = Field(
+        default=10.0,
+        gt=0.0,
+        description="Seconds allowed to flush buffered capture events on proxy shutdown.",
+    )
+
+
 class AerlogConfig(BaseModel):
     """Validated runtime configuration for AERLOG.
 
@@ -76,6 +123,10 @@ class AerlogConfig(BaseModel):
     log_level: LogLevel = Field(
         default="INFO",
         description="Diagnostic verbosity for off-stdout logs.",
+    )
+    capture: CaptureSettings = Field(
+        default_factory=CaptureSettings,
+        description="Phase 4 capture pipeline redaction and durability defaults.",
     )
 
     @field_validator("data_dir", mode="before")
