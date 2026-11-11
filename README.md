@@ -8,7 +8,7 @@
 
 A local-first observability, debugging, and reliability workbench for MCP-powered AI agents.
 
-[![Status](https://img.shields.io/badge/status-cli%20workbench-blue)](#project-status)
+[![Status](https://img.shields.io/badge/status-v0.1.0-blue)](#project-status)
 [![Protocol](https://img.shields.io/badge/protocol-MCP-7c3aed)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -24,7 +24,7 @@ A local-first observability, debugging, and reliability workbench for MCP-powere
 - [Overview](#overview)
 - [The Problem](#the-problem)
 - [What is AERLOG?](#what-is-aerlog)
-- [Design Principles](#design-principles)
+- [Design Goals](#design-goals)
 - [Core Capabilities](#core-capabilities)
 - [System Architecture](#system-architecture)
   - [Architecture Diagram](#1-high-level-system-architecture)
@@ -45,14 +45,22 @@ A local-first observability, debugging, and reliability workbench for MCP-powere
 - [Technology Stack](#technology-stack)
 - [MVP Scope and Milestones](#mvp-scope-and-milestones)
 - [CLI Experience](#cli-experience)
+  - [60-Second Quickstart](#60-second-quickstart)
+  - [Configuration Reference](#configuration-reference)
+  - [Example Inspection Output](#example-inspection-output)
 - [Testing Strategy](#testing-strategy)
 - [Security and Trust Boundaries](#security-and-trust-boundaries)
 - [Compatibility and Limitations](#compatibility-and-limitations)
+  - [Verified Compatibility Matrix](#initial-transport--verified-compatibility-matrix)
+  - [Known Limitations](#known-limitations)
 - [Competitive Landscape and Positioning](#competitive-landscape-and-positioning)
 - [Development Setup](#development-setup)
+  - [Installation](#installation)
 - [Contributing](#contributing)
+  - [Reporting Issues Safely](#reporting-issues-safely)
 - [Future Directions](#future-directions)
 - [Project Status](#project-status)
+  - [v0.1.0 Release Checklist](#v010-release-checklist)
 - [License](#license)
 
 ---
@@ -65,11 +73,11 @@ The Model Context Protocol (MCP) provides a standardized way for applications to
 
 When an agent fails, developers need to understand the sequence of observable events that led to the failure, identify where the interaction stopped behaving as expected, and reproduce the relevant behavior without blindly repeating potentially destructive operations.
 
-**AERLOG aims to provide that missing execution-level reliability workflow.**
+**AERLOG provides an execution-level reliability workflow around MCP tool calls.**
 
 It introduces a local-first recording layer around MCP communication, converting protocol interactions and process lifecycle events into structured, inspectable execution records.
 
-Its intended workflow is:
+Its workflow is:
 
 **Capture → Inspect → Diagnose → Replay → Regression-test**
 
@@ -110,9 +118,9 @@ AERLOG focuses on this narrower engineering problem.
 
 ## What is AERLOG?
 
-AERLOG is a proposed **local-first MCP execution recorder and reliability workbench**.
+AERLOG is a **local-first MCP execution recorder and reliability workbench**.
 
-In its initial architecture, AERLOG operates as a transparent stdio proxy between an MCP client and an MCP server process.
+In v0.1.0, AERLOG operates as a transparent stdio proxy between an MCP client and an MCP server process.
 
 It observes communication passing through this boundary, records relevant process and transport events, and converts protocol messages into a structured execution history.
 
@@ -141,7 +149,7 @@ Developers can then:
 
 ### Non-Goals
 
-The initial release is not intended to be:
+By design, AERLOG v0.1.0 is **not**:
 
 - A replacement for MCP clients, MCP servers, or MCP SDKs.
 - A complete agent runtime or orchestration framework.
@@ -248,7 +256,7 @@ The goal is to turn a debugging session into a repeatable test that can be execu
 
 The current interface is a full terminal **CLI**.
 
-A local web cockpit (FastAPI + browser UI) is a deferred milestone intended to eventually expose:
+A local web cockpit (FastAPI + browser UI) is a deferred milestone planned to expose:
 
 - Execution discovery and search.
 - Chronological event timelines.
@@ -492,9 +500,9 @@ A recording is evidence of what happened. It is not authorization to repeat the 
 
 ## 4. Architectural Dependency Boundaries
 
-AERLOG should keep its core domain independent of transport implementations, storage backends, and user interfaces.
+AERLOG keeps its core domain independent of transport implementations, storage backends, and user interfaces.
 
-The intended dependency direction is:
+The dependency direction across modules is:
 
 ```mermaid
 flowchart TB
@@ -537,7 +545,7 @@ This is a modular application architecture. It does not require a microservice f
 
 ## 5. Subsystem Responsibilities
 
-| Subsystem | Proposed location | Responsibilities |
+| Subsystem | Location | Responsibilities |
 |---|---|---|
 | CLI | `cli/` | User commands and workflow orchestration. |
 | Application | `application/` | Coordinates execution, inspection, replay, and export workflows. |
@@ -830,37 +838,72 @@ A partially written execution must not be presented as a fully successful record
 
 ## 6. Diagnostics Engine
 
-The first diagnostics implementation should be deterministic and explainable.
+AERLOG's diagnostics engine is deterministic, evidence-backed, and requires no LLM calls.
 
-No LLM-based failure classifier is required for the MVP.
+Every [`DiagnosticItem`](src/aerlog/analysis/diagnostics.py) emitted in `--json` or text output includes:
 
-Every diagnostic should contain:
-
-- A stable diagnostic code.
-- Severity.
-- A concise explanation.
-- Supporting event IDs.
-- Confidence or certainty semantics.
-- Known limitations.
-- A suggested investigation step.
+- A stable diagnostic `code` (for example `JSONRPC_ERROR_RESPONSE`, `REQUEST_WITHOUT_RESPONSE`, `CONFIGURED_REQUEST_TIMEOUT_EXCEEDED`, `INVALID_ARGUMENTS_OBSERVED`, `MCP_TOOL_EXECUTION_ERROR`, `UNEXPECTED_PROCESS_EXIT`, `REPEATED_IDENTICAL_CALLS`, `CORRUPT_RECORDING_DETECTED`, `CAPTURE_GAP_DETECTED`).
+- Severity (`info`, `warning`, `error`, `critical`), category, and certainty (`observed`, `threshold`, `inferred`).
+- `what_was_observed`, concrete `evidence` entries citing event IDs and sequences, `reasonable_conclusions`, `cannot_be_concluded`, `additional_evidence_needed`, and actionable CLI `next_steps`.
 
 ### Example Diagnostic
 
 ```json
 {
-  "code": "REQUEST_WITHOUT_RESPONSE",
-  "severity": "warning",
-  "message": "A request was observed without a matching response.",
+  "diagnostic_id": "diag_0001",
+  "code": "JSONRPC_ERROR_RESPONSE",
+  "category": "observed_protocol_error",
+  "severity": "error",
+  "certainty": "observed",
+  "title": "JSON-RPC error response observed (code=-32603)",
+  "what_was_observed": "Observed JSON-RPC error response code=-32603 at seq #7 for tools/call (tool=echo_message) (Simulated tool failure triggered by --error mode).",
   "evidence": [
-    "evt_11",
-    "evt_18"
+    {
+      "source_kind": "event",
+      "execution_id": "22222222-2222-4222-8222-222222222222",
+      "event_id": "e6befd8d-d6d8-4147-97fd-42731b646a21",
+      "sequence": 4,
+      "direction": "client_to_server",
+      "kind": "jsonrpc_request",
+      "span_id": "span_seq_4",
+      "role": "request",
+      "observed_summary": "tools/call [tool=echo_message]"
+    },
+    {
+      "source_kind": "event",
+      "execution_id": "22222222-2222-4222-8222-222222222222",
+      "event_id": "c68cbd82-7633-482c-8e7d-5c1e4b53b491",
+      "sequence": 7,
+      "direction": "server_to_client",
+      "kind": "jsonrpc_error",
+      "span_id": "span_seq_4",
+      "role": "error_response",
+      "observed_summary": "JSON-RPC error code=-32603 message='Simulated tool failure triggered by --error mode'"
+    }
   ],
-  "confidence": "observed",
-  "limitations": "The capture cannot determine whether the server completed the operation before the connection ended."
+  "event_ids": [
+    "e6befd8d-d6d8-4147-97fd-42731b646a21",
+    "c68cbd82-7633-482c-8e7d-5c1e4b53b491"
+  ],
+  "sequence_numbers": [4, 7],
+  "span_ids": ["span_seq_4"],
+  "reasonable_conclusions": [
+    "The peer emitted an explicit JSON-RPC error response (code=-32603) rather than a success result."
+  ],
+  "cannot_be_concluded": [
+    "Cannot verify internal server exception details, upstream API states, or whether transient retry would succeed without server logs."
+  ],
+  "additional_evidence_needed": [
+    "Server stderr/application logs and upstream dependency diagnostics corresponding to the same timestamp window."
+  ],
+  "next_steps": [
+    "aerlog inspect 22222222-2222-4222-8222-222222222222 --sequence 4",
+    "aerlog timeline 22222222-2222-4222-8222-222222222222 --offset 0 --limit 25"
+  ]
 }
 ```
 
-The diagnostics engine should distinguish:
+The diagnostics engine distinguishes:
 
 - Directly observed protocol errors.
 - Observed transport failures.
@@ -1009,6 +1052,7 @@ aerlog/
 │   └── conftest.py                      # XDG isolation fixtures
 │
 └── examples/
+    ├── quickstart_server.py             # Stdlib-only MCP demo server for the quickstart
     └── protocol-spike/                  # Local protocol verification spike scripts
 ```
 
@@ -1035,7 +1079,7 @@ Keep the application modular. Introduce additional processes or services only wh
 
 The initial stack prioritizes correctness, maintainability, and local execution.
 
-| Area | Proposed technology | Reason |
+| Area | Technology | Reason |
 |---|---|---|
 | Core language | Python 3.11+ | Product iteration and mature tooling ecosystem. |
 | Async runtime | `asyncio` | Concurrent subprocess streams and cancellation. |
@@ -1154,42 +1198,129 @@ aerlog export verify tests/generated/exec_<execution-id>.fixture.json --cassette
 
 **Exit codes:** `0` success (clean run, empty list, passing verify); `1` operational/validation/integrity error (invalid options, missing storage/execution, `--strict` JSONL corruption, tampered fixture/cassette, blocked `--mode live`, or unredacted opt-in refusal); `2` CLI syntax error or automated gate failure (`diagnose --fail-on`, `replay --fail-on-divergence`, `export verify` drift); `aerlog run` forwards wrapped server/proxy exit codes (`128 + sig`, `126` permission denied, `127` command not found, `65` oversized frame, `74` diagnostic log failure).
 
+### 60-Second Quickstart
+
+Try the full capture → inspect → timeline → diagnose → replay → regression-export loop locally using the dependency-free [`examples/quickstart_server.py`](examples/quickstart_server.py) demo server:
+
+```bash
+# 1. Verify installation
+aerlog --version
+
+# 2. Record a healthy session and a simulated failure session into isolated local storage
+DATA_DIR="$(mktemp -d)"
+EXEC_OK="11111111-1111-4111-8111-111111111111"
+EXEC_ERR="22222222-2222-4222-8222-222222222222"
+
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"demo","version":"1"}}}\n{"jsonrpc":"2.0","method":"notifications/initialized"}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo_message","arguments":{"message":"hello"}}}\n' \
+  | aerlog run --execution-id "$EXEC_OK" --data-dir "$DATA_DIR" -- python examples/quickstart_server.py
+
+printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo_message","arguments":{"message":"oops"}}}\n' \
+  | aerlog run --execution-id "$EXEC_ERR" --data-dir "$DATA_DIR" -- python examples/quickstart_server.py --error >/dev/null
+
+# 3. List, inspect, and view timeline & deterministic diagnostics
+aerlog list --data-dir "$DATA_DIR"
+aerlog inspect "$EXEC_OK" --data-dir "$DATA_DIR"
+aerlog timeline "$EXEC_OK" --data-dir "$DATA_DIR"
+aerlog diagnose "$EXEC_ERR" --data-dir "$DATA_DIR"
+
+# 4. Build an offline cassette, inspect it, run deterministic replay, and export a pytest regression test
+aerlog cassette create "$EXEC_OK" --data-dir "$DATA_DIR"
+aerlog cassette inspect "$DATA_DIR"/cassettes/*.cassette.json
+aerlog replay "$EXEC_OK" --data-dir "$DATA_DIR" --fail-on-divergence
+aerlog export test "$EXEC_OK" --data-dir "$DATA_DIR" --output "$DATA_DIR/exported_tests"
+aerlog export verify "$DATA_DIR/exported_tests"/exec_*.fixture.json --data-dir "$DATA_DIR"
+```
+
+### Configuration Reference
+
+AERLOG loads configuration strictly (unknown keys fail validation) in the following precedence order:
+
+1. `--config PATH` CLI option
+2. `$AERLOG_CONFIG` environment variable
+3. `$XDG_CONFIG_HOME/aerlog/config.toml` (defaults to `~/.config/aerlog/config.toml`)
+
+All fields below match [`AerlogConfig`](src/aerlog/config/schema.py):
+
+```toml
+# Optional override (defaults to $XDG_DATA_HOME/aerlog or ~/.local/share/aerlog)
+# data_dir = "~/.local/share/aerlog"
+log_level = "INFO"                      # DEBUG | INFO | WARNING | ERROR | CRITICAL
+
+[capture]
+backpressure_policy = "block"           # block | spill | mark_incomplete
+redaction_mode = "standard"             # standard | strict_hash_only | explicit_unredacted
+max_queue_events = 2048
+max_queue_bytes = 67108864              # 64 MiB
+spill_write_timeout_s = 0.5
+drain_timeout_s = 10.0
+
+[storage]
+fsync_policy = "lifecycle"              # lifecycle | every_batch | none
+sqlite_synchronous = "NORMAL"           # NORMAL | FULL
+persist_cwd = false                     # Set true only if recording host cwd is desired
+
+[diagnostics]
+# request_timeout_ms = 5000             # Disabled until explicitly set (> 0 ms)
+repeated_call_threshold = 3             # >= 2
+
+[replay]
+default_replay_mode = "cassette"        # Offline cassette only (live blocked)
+default_match_mode = "strict"           # strict | tolerant
+unsafe_tool_policy = "block"            # block | warn (requires --allow-mutating)
+missing_response_policy = "error"       # error | omit
+
+[export]
+default_format = "both"                 # both | json
+normalize_volatile = true
+sanitize_by_default = true
+```
+
 ### Example Inspection Output
+
+Representative output from `aerlog inspect`, `aerlog timeline`, and `aerlog diagnose` on the quickstart examples above:
 
 ```text
 AERLOG EXECUTION INSPECTOR
+Execution:   11111111-1111-4111-8111-111111111111
+Status:      complete
+Redaction:   standard
+Command:     python examples/quickstart_server.py
+Started:     2026-11-11T23:34:44.797028+00:00
+Ended:       2026-11-11T23:34:44.825930+00:00
+Duration:    28.90ms (summary_monotonic_duration)
+Termination: server_stdout_eof (exit_code=0)
+Counts:      events=9, requests=3, responses=3, rpc_errors=0, tool_errors=0, notifications=1, missing=0, orphans=0, corrupt=0
 
-Execution:  exec_01J...
-Status:     COMPLETED_WITH_WARNINGS
-Duration:   2.41s
-Events:     12
-Transport:  stdio
+TRACE GROUPS
+  - [synthetic (not observed on wire)] trace_id=11111111111141118111111111111111 (events=9, requests=3, seq=1..9)
 
-TIMELINE
+Inspect timeline: aerlog timeline 11111111-1111-4111-8111-111111111111
+Inspect raw event: aerlog inspect 11111111-1111-4111-8111-111111111111 --sequence <N>
+```
 
-TIME       DIRECTION         EVENT
-------------------------------------------------
-00.000s    client -> server  initialize
-00.031s    server -> client  initialize result
-00.044s    client -> server  tools/list
-00.062s    server -> client  tools/list result
-00.081s    client -> server  tools/call
-02.081s    internal          request timeout
+```text
+AERLOG DIAGNOSTICS
+Execution:   22222222-2222-4222-8222-222222222222
+Status:      complete
+Redaction:   standard
+Req Timeout: none (not configured)
+Findings:    total=1 (critical=0, error=1, warning=0, info=0; min_severity=info)
 
-DIAGNOSTICS
+DIAGNOSTIC FINDINGS
 
-[WARN] REQUEST_WITHOUT_RESPONSE
-
-Request ID: 42
-Method:     tools/call
-Evidence:   evt_09, evt_12
-
-The request was observed without a matching response
-before the configured timeout.
-
-Limitation:
-The recording cannot establish whether the server
-completed the operation before the connection ended.
+[ERROR] JSONRPC_ERROR_RESPONSE (diag_0001; certainty=observed, category=observed_protocol_error)
+  Title:        JSON-RPC error response observed (code=-32603)
+  Observed:     Observed JSON-RPC error response code=-32603 at seq #7 for tools/call (tool=echo_message) (Simulated tool failure triggered by --error mode).
+  Evidence:
+    - seq #4 event_id=e6befd8d-d6d8-4147-97fd-42731b646a21 span=span_seq_4 trace=synthetic:22222222222242228222222222222222 [request]: tools/call [tool=echo_message]
+    - seq #7 event_id=c68cbd82-7633-482c-8e7d-5c1e4b53b491 span=span_seq_4 trace=synthetic:22222222222242228222222222222222 [error_response]: JSON-RPC error code=-32603 message='Simulated tool failure triggered by --error mode'
+  Conclusion(s):
+    - The peer emitted an explicit JSON-RPC error response (code=-32603) rather than a success result.
+  Cannot conclude:
+    - Cannot verify internal server exception details, upstream API states, or whether transient retry would succeed without server logs.
+  Next steps:
+    - aerlog inspect 22222222-2222-4222-8222-222222222222 --sequence 4
+    - aerlog timeline 22222222-2222-4222-8222-222222222222 --offset 0 --limit 25
 ```
 
 ---
@@ -1259,34 +1390,27 @@ Performance targets should be established after reproducible baselines exist. No
 
 # Security and Trust Boundaries
 
-AERLOG observes potentially sensitive data and interacts with processes that may have access to a developer's machine.
-
-Security must therefore be considered part of the architecture, not a feature added after the recorder works.
+AERLOG observes potentially sensitive payloads and launches local server subprocesses on the developer's machine. Security and data-handling controls are built directly into the capture, storage, replay, and presentation paths:
 
 ## Threat Model
 
-| Threat | Mitigation direction |
-|---|---|
-| Secrets captured in payloads | Pre-persistence redaction and export warnings. |
-| Malformed protocol input | Defensive parsing and bounded resource usage. |
-| Unbounded memory growth | Bounded queues and backpressure. |
-| Child process leakage | Process-group management and reliable cleanup. |
-| Unsafe live replay | Explicit authorization and visible target boundaries. |
-| Malicious exported fixtures | Treat recordings as data, never as executable commands. |
-| Sensitive recordings shared accidentally | Redaction preview and export warnings. |
-| Partial or corrupted recordings | Recovery handling and integrity metadata. |
+| Threat | Implemented control | Boundary / limitation |
+|---|---|---|
+| Secrets captured in payloads, CLI args, or errors | Pre-persistence [`EventRedactor`](src/aerlog/capture/redaction.py) (structured keys, PEM blocks, JWTs, URL userinfo, auth headers, token prefixes) + `--redaction-mode strict_hash_only` full withholding + fail-closed `scrub_event_dict_withheld` | Arbitrary unstructured strings without known key/token structure cannot be guaranteed removed in `standard` mode. |
+| ReDoS on pathological payloads | Linear-time boundary scanning in `_redact_pem_blocks` and single-pass regexes + pre-checks | User-configured `extra_secret_patterns` are validated for compilation, not static linear runtime. |
+| Malformed frames, oversized messages, OOM | [`FrameAccumulator`](src/aerlog/protocol/framing.py) fail-closed limit (`max_frame_bytes=16 MiB`), `STDERR_LINE_MAX_BUFFER_BYTES` (`256 KiB`), bounded capture queues (`block`/`spill`/`mark_incomplete`) | Very fast producers under `block` policy slow proxy forwarding to avoid silent memory drops. |
+| Child process / orphan leakage | Subprocesses spawn with `start_new_session=True`; shutdown escalates `SIGTERM` -> `SIGKILL` to the process group (`os.killpg`) | Requires Linux/POSIX process groups; native Windows job objects are unsupported. |
+| Untrusted / forged cassettes & annotation spoofing | SHA-256 integrity seal, `CassetteMatcher` dynamic safety re-classification ignoring forged `side_effect_class`, `_extract_tool_annotations` restricted to `tools/list`, default `unsafe_tool_policy="block"`, `--mode live` blocked (exit `1`) | Opting into `--allow-mutating` allows serving recorded mutating-tool responses in offline cassette mode (audit warning logged). |
+| Symlink & path-traversal local attacks | `0o600`/`0o700` artifacts/dirs, `O_NOFOLLOW` spool/log opens, `is_symlink()` refusal across logs/spools/cassettes/fixtures/config, strict UUID validation on `execution_id` | Protects local XDG storage against symlink redirection under the current user's account. |
+| Terminal / Rich markup injection | `_render_to_str` configures `Console(..., markup=False, highlight=False)` so stored `[...]` strings render literally | Assumes standard UTF-8 terminal output. |
 
 ## Trust Model
 
-- The local developer controls the machine and selects the processes to run.
-- MCP servers and their outputs are potentially untrusted.
-- Captured payloads are potentially sensitive.
-- Recordings are evidence, not executable instructions.
-- AERLOG should not silently modify requests or responses.
-- A successful capture does not prove that an external operation succeeded.
-- Diagnostics are limited to observable evidence and explicitly supplied instrumentation.
-
-A dedicated threat model should evolve alongside the implementation.
+- **Trusted:** The local developer choosing which MCP server command to wrap and inspecting local storage.
+- **Untrusted:** External MCP server subprocesses, peer JSON-RPC traffic, imported `.cassette.json` / `.ndjson.spool` / `.fixture.json` artifacts, and environment inputs crossing the proxy.
+- Wrapped servers execute under the local OS user account unless explicitly sandboxed externally (container, VM, or restricted OS user).
+- Recordings and fixtures are treated strictly as structured evidence/data and are never executed as shell or subprocess commands.
+- A successful capture or replay match never proves external side effects succeeded upstream.
 
 ---
 
@@ -1330,11 +1454,12 @@ The implemented capture target is **MCP stdio transport** (Streamable HTTP/SSE t
 
 ## Known Limitations
 
-- **Stdio transport only:** HTTP/SSE MCP transports are not intercepted yet.
-- **Live replay blocked:** `--mode live` is intentionally blocked fail-closed (exit `1`); replay runs strictly offline via sealed cassettes (`--mode cassette` / `--serve`).
-- **Best-effort unstructured redaction:** Structured secret keys, PEM private keys, JWTs, URL userinfo credentials, auth schemes, and known token prefixes are redacted before persistence/export, and `--redaction-mode strict_hash_only` withholds payloads completely; unstructured arbitrary secrets without matching patterns/keys cannot be guaranteed removable in `standard` mode.
-- **No `SIGKILL` recovery guarantee for in-flight buffers:** Graceful exit and `SIGINT`/`SIGTERM` drain and flush capture buffers cleanly; abrupt `SIGKILL` leaves un-flushed in-memory queue events unrecorded (prior committed JSONL lines remain intact and inspectable).
-- **Local web cockpit & FastAPI backend not yet implemented:** Use the CLI workbench for all recording, inspection, diagnostics, replay, and export workflows.
+- **Linux / POSIX primary (Windows unsupported):** Subprocess isolation and cleanup rely on POSIX sessions (`os.setsid` / `start_new_session=True`), `os.killpg`, `O_NOFOLLOW`, and `0o600`/`0o700` filesystem modes. Native Windows execution is unsupported and untested.
+- **Stdio transport only:** HTTP and Streamable HTTP/SSE MCP transports are not intercepted in v0.1.0.
+- **Live replay blocked fail-closed:** `--mode live` intentionally fails with exit `1`; replay runs offline exclusively through SHA-256-sealed cassettes (`--mode cassette` / `--serve`).
+- **Best-effort unstructured redaction (`standard` mode):** Structured secret keys, PEM private keys, JWTs, URL userinfo credentials, auth schemes, and known token prefixes are redacted before persistence/export, and `--redaction-mode strict_hash_only` withholds payloads completely; unstructured arbitrary secrets without matching patterns/keys cannot be guaranteed removable in `standard` mode.
+- **No `SIGKILL` recovery guarantee for in-flight memory buffers:** Graceful exit and `SIGINT`/`SIGTERM` drain and flush capture buffers cleanly; abrupt `SIGKILL` loses un-flushed in-memory queue items (previously written JSONL lines remain intact and recoverable).
+- **Experimental / deferred areas:** Local web cockpit (`FastAPI` backend + browser UI) and OpenTelemetry collector export are not yet implemented; W3C `traceparent`/`tracestate` correlation metadata is captured read-only on JSONL events cleanly.
 
 ---
 
@@ -1344,7 +1469,7 @@ AERLOG enters an ecosystem that already includes MCP inspection tools, record/re
 
 It should not claim to be the first tool to record MCP traffic or replay interactions.
 
-Its intended focus is an execution-centric reliability workflow:
+AERLOG focuses on an execution-centric reliability workflow:
 
 1. Capture protocol interactions and process lifecycle.
 2. Reconstruct correlated execution timelines.
@@ -1360,6 +1485,23 @@ The project should continuously compare its workflow against existing tools and 
 ---
 
 # Development Setup
+
+## Installation
+
+Install AERLOG cleanly in an isolated virtual environment or tool environment using runtime dependencies only (`pydantic`, `rich`, `typer` — `mcp` is only required for dev compatibility tests):
+
+```bash
+# Install from a built wheel or PyPI release (when published)
+pip install aerlog
+# Or install directly from a local source checkout / wheel:
+uv tool install .
+# Or inside a dedicated virtual environment:
+uv pip install dist/aerlog-0.1.0-py3-none-any.whl
+
+# Verify CLI installation
+aerlog --version
+aerlog --help
+```
 
 ## Requirements
 
@@ -1384,7 +1526,7 @@ uv sync
 ## Run Tests and Checks
 
 ```bash
-uv run pytest
+uv run pytest -v -s
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
@@ -1443,6 +1585,15 @@ Before proposing a substantial feature, open an issue describing:
 - No unsupported compatibility or benchmark claims.
 - Documentation for meaningful architectural changes.
 
+### Reporting Issues Safely
+
+When opening bug reports or sharing reproductions:
+
+- Include `aerlog --version`, OS/Python version, and the failing `aerlog` command or subcommand flags.
+- Attach `aerlog diagnose <execution_id> --json` or exported sanitized fixtures (`aerlog export test <execution_id>`) rather than raw `events.jsonl` logs whenever possible.
+- For sensitive environments, reproduce with `--redaction-mode strict_hash_only` and omit raw server arguments or private paths before sharing logs publicly.
+- If you discover a security boundary issue (redaction bypass, symlink/path handling, or unsafe replay bypass), avoid posting live secrets or reproducible credentials in public issues.
+
 ---
 
 # Future Directions
@@ -1467,24 +1618,35 @@ These are exploratory directions, not commitments. Prioritize them only after th
 
 # Project Status
 
-> **CLI Workbench Implemented & Hardened (v0.1.0.dev0).**
+> **v0.1.0 Release Ready — CLI Workbench Implemented & Hardened.**
 
 ### Implemented vs. Planned Summary
 
 | Area | Status | Details |
 |---|---|---|
-| Transparent stdio proxy & framing | **Implemented** | `aerlog run -- <cmd>`, `16 MiB` bounded framing, POSIX process-group cleanup, capped stderr capture. |
+| Transparent stdio proxy & framing | **Implemented** | `aerlog run -- <cmd>`, `16 MiB` bounded framing, POSIX process-group cleanup, `256 KiB` capped stderr capture. |
 | Capture pipeline & redaction | **Implemented** | Bounded queue (`block`/`spill`/`mark_incomplete`), linear-time redaction + `strict_hash_only`, `0o600` recovery spooling. |
 | JSONL + SQLite persistence | **Implemented** | SHA-256 JSONL logs, transactional SQLite WAL migrations, corrupt-tail recovery, dry-run/confirmed retention. |
 | Timeline & deterministic diagnostics | **Implemented** | Chronological spans, `progressToken`/W3C trace correlation, evidence-linked failure rules (`aerlog diagnose`). |
 | Offline cassette replay & regression export | **Implemented** | SHA-256 cassettes, safety re-classification, mock stdio `--serve`, fail-closed live block, static `pytest` export. |
 | Local Web Cockpit / FastAPI / HTTP transport | **Deferred** | Not yet implemented; all workflows run locally via the CLI. |
 
+### v0.1.0 Release Checklist
+
+| Item | Verification | Status |
+|---|---|---|
+| Version consistency | `pyproject.toml`, `aerlog.__version__`, and `aerlog --version` match `0.1.0` | **Verified** |
+| Static checks & typing | `ruff check .`, `ruff format --check .`, `mypy src tests`, `uv pip check` pass | **Verified** |
+| Automated test suite | Full unit + integration + packaging/doc tests pass (`pytest -v -s`) | **Verified** |
+| Build & archive allowlist | `uv build --wheel --sdist` passes; `.tar.gz`/`.whl` omit local rules/prompts, caches, and spike files | **Verified** |
+| Clean-venv installation | Fresh `venv` wheel install passes `aerlog --version`, `aerlog --help`, and quickstart E2E | **Verified** |
+| Documentation accuracy | README TOC anchors resolve; CLI examples, config schema, matrix, and limitations match codebase | **Verified** |
+
 ---
 
 # License
 
-AERLOG is intended to be released under the **Apache License 2.0**.
+AERLOG is licensed under the **Apache License 2.0**.
 
 Apache-2.0 permits use, modification, distribution, and commercial adoption while providing an explicit patent grant and requiring preservation of applicable license and attribution notices.
 

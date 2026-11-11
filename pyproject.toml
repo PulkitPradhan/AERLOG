@@ -4,10 +4,26 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aerlog"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Local-first MCP execution recorder, diagnostic workbench, and replay harness"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Pulkit Pradhan" }]
+keywords = ["mcp", "json-rpc", "debugging", "replay", "observability", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Testing",
+]
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.12,<3",
@@ -29,6 +45,20 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aerlog"]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "src/aerlog",
+    "tests",
+    "examples/quickstart_server.py",
+    "pyproject.toml",
+    "README.md",
+    "LICENSE",
+]
+exclude = [
+    "**/__pycache__",
+    "**/*.py[cod]",
+]
 
 [tool.ruff]
 target-version = "py311"
