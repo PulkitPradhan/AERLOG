@@ -128,6 +128,28 @@ class StorageSettings(BaseModel):
     )
 
 
+class DiagnosticsSettings(BaseModel):
+    """Phase 7 deterministic diagnostics configuration settings."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    request_timeout_ms: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Optional configured request timeout threshold in milliseconds. "
+            "Must be explicitly set; never defaulted silently."
+        ),
+    )
+    repeated_call_threshold: int = Field(
+        default=3,
+        ge=2,
+        description=(
+            "Minimum count of identical repeated requests before flagging REPEATED_IDENTICAL_CALLS."
+        ),
+    )
+
+
 class AerlogConfig(BaseModel):
     """Validated runtime configuration for AERLOG.
 
@@ -152,6 +174,10 @@ class AerlogConfig(BaseModel):
     storage: StorageSettings = Field(
         default_factory=StorageSettings,
         description="Phase 5 persistent JSONL and SQLite storage settings.",
+    )
+    diagnostics: DiagnosticsSettings = Field(
+        default_factory=DiagnosticsSettings,
+        description="Phase 7 deterministic diagnostic rule thresholds.",
     )
 
     @field_validator("data_dir", mode="before")

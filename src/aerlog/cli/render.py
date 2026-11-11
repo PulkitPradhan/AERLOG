@@ -12,6 +12,10 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from aerlog.analysis.diagnostics import (
+    DiagnosticReport,
+    format_short_trace,
+)
 from aerlog.analysis.timeline import (
     ExecutionTimeline,
     TimelineSlice,
@@ -386,11 +390,85 @@ def single_event_to_json(event: ExecutionEvent, *, redaction_mode: str) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def render_diagnostics_text(report: DiagnosticReport) -> str:
+    """Render deterministic evidence-linked diagnostics cleanly for terminal output."""
+
+    def _draw(console: Console) -> None:
+        console.print("AERLOG DIAGNOSTICS")
+        console.print(f"Execution:   {report.execution_id}")
+        console.print(f"Status:      {report.capture_completeness}")
+        console.print(f"Redaction:   {report.redaction_mode}")
+        timeout_txt = (
+            f"{report.request_timeout_ms} ms"
+            if report.request_timeout_ms is not None
+            else "none (not configured)"
+        )
+        console.print(f"Req Timeout: {timeout_txt}")
+        sev = report.counts_by_severity
+        console.print(
+            f"Findings:    total={report.total_diagnostics} "
+            f"(critical={sev.get('critical', 0)}, error={sev.get('error', 0)}, "
+            f"warning={sev.get('warning', 0)}, info={sev.get('info', 0)}; "
+            f"min_severity={report.min_severity})"
+        )
+
+        if not report.diagnostics:
+            console.print("\nNo observable diagnostic issues detected.")
+        else:
+            console.print("\nDIAGNOSTIC FINDINGS")
+            for item in report.diagnostics:
+                console.print(
+                    f"\n[{item.severity.upper()}] {item.code} ({item.diagnostic_id}; "
+                    f"certainty={item.certainty}, category={item.category})"
+                )
+                console.print(f"  Title:        {item.title}")
+                console.print(f"  Observed:     {item.what_was_observed}")
+                console.print("  Evidence:")
+                for ev in item.evidence:
+                    if ev.source_kind == "event":
+                        trace_txt = format_short_trace(ev.trace)
+                        span_txt = ev.span_id or "-"
+                        console.print(
+                            f"    - seq #{ev.sequence} event_id={ev.event_id} "
+                            f"span={span_txt} trace={trace_txt} [{ev.role}]: {ev.observed_summary}"
+                        )
+                    else:
+                        console.print(
+                            f"    - line {ev.line_number} offset={ev.byte_offset} "
+                            f"bytes={ev.byte_length} [{ev.role}]: {ev.observed_summary}"
+                        )
+                console.print("  Conclusion(s):")
+                for c in item.reasonable_conclusions:
+                    console.print(f"    - {c}")
+                console.print("  Cannot conclude:")
+                for unc in item.cannot_be_concluded:
+                    console.print(f"    - {unc}")
+                console.print("  Additional evidence needed:")
+                for need in item.additional_evidence_needed:
+                    console.print(f"    - {need}")
+                console.print("  Next steps:")
+                for step in item.next_steps:
+                    console.print(f"    - {step}")
+
+        console.print("\nANALYSIS LIMITATIONS")
+        for lim in report.analysis_limitations:
+            console.print(f"  - {lim}")
+
+    return _render_to_str(_draw)
+
+
+def diagnostics_report_to_json(report: DiagnosticReport) -> str:
+    """Serialize :class:`DiagnosticReport` cleanly to JSON for stdout."""
+    return report.model_dump_json(indent=2)
+
+
 __all__ = [
+    "diagnostics_report_to_json",
     "execution_inspection_to_json",
     "executions_list_to_json",
     "format_duration_ns",
     "format_offset_ns",
+    "render_diagnostics_text",
     "render_execution_inspection_text",
     "render_executions_list_text",
     "render_single_event_text",

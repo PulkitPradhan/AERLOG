@@ -1,4 +1,4 @@
-"""AERLOG CLI entry point with Phase 6 read-only execution listing and inspection."""
+"""AERLOG CLI entry point for read-only listing, inspection, timeline, and diagnostics."""
 
 from __future__ import annotations
 
@@ -8,14 +8,24 @@ from typing import Annotated
 import typer
 
 from aerlog import __version__
+from aerlog.analysis.diagnostics import (
+    DiagnosticOptions,
+    DiagnosticSeverity,
+    apply_min_severity_filter,
+    diagnose_execution,
+    parse_severity,
+    report_exceeds_severity,
+)
 from aerlog.analysis.timeline import (
     DEFAULT_TIMELINE_LIMIT,
     reconstruct_execution_timeline,
     slice_timeline,
 )
 from aerlog.cli.render import (
+    diagnostics_report_to_json,
     execution_inspection_to_json,
     executions_list_to_json,
+    render_diagnostics_text,
     render_execution_inspection_text,
     render_executions_list_text,
     render_single_event_text,
@@ -23,7 +33,7 @@ from aerlog.cli.render import (
     single_event_to_json,
     timeline_slice_to_json,
 )
-from aerlog.config import ConfigError, load_config
+from aerlog.config import AerlogConfig, ConfigError, load_config
 from aerlog.storage.database import DB_FILE_NAME, IndexedExecutionRow
 from aerlog.storage.event_log import JsonlEventLogReader
 from aerlog.storage.exceptions import (
@@ -61,17 +71,27 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit(code=0)
 
 
-def _resolve_data_dir(
+def _resolve_runtime(
     *,
     config_path: Path | None,
     data_dir: Path | None,
-) -> Path:
+) -> tuple[AerlogConfig, Path]:
     try:
         cfg = load_config(config_path)
     except ConfigError as exc:
         typer.echo(f"Configuration error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    return cfg.data_dir if data_dir is None else data_dir.expanduser()
+    resolved_dir = cfg.data_dir if data_dir is None else data_dir.expanduser()
+    return cfg, resolved_dir
+
+
+def _resolve_data_dir(
+    *,
+    config_path: Path | None,
+    data_dir: Path | None,
+) -> Path:
+    _, resolved_dir = _resolve_runtime(config_path=config_path, data_dir=data_dir)
+    return resolved_dir
 
 
 def _warn_unredacted_if_applicable(redaction_mode: str) -> None:
@@ -440,6 +460,108 @@ def view_timeline(
         typer.echo(timeline_slice_to_json(sliced))
     else:
         typer.echo(render_timeline_slice_text(sliced), nl=False)
+
+
+@app.command("diagnose")
+def diagnose_recorded_execution(
+    execution_id: Annotated[str, typer.Argument(help="Execution UUID to diagnose.")],
+    request_timeout_ms: Annotated[
+        int | None,
+        typer.Option(
+            "--request-timeout-ms",
+            min=1,
+            help="Optional request timeout threshold in milliseconds.",
+        ),
+    ] = None,
+    min_severity: Annotated[
+        str,
+        typer.Option(
+            "--min-severity",
+            help="Minimum diagnostic severity to display (info, warning, error, critical).",
+        ),
+    ] = "info",
+    fail_on: Annotated[
+        str | None,
+        typer.Option(
+            "--fail-on",
+            help="Exit with code 2 if any finding meets or exceeds severity.",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Fail with code 1 if corrupt JSONL records exist."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit structured JSON diagnostic report to stdout."),
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override AERLOG data directory."),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to AERLOG configuration TOML file."),
+    ] = None,
+) -> None:
+    """Run deterministic, evidence-linked diagnostics over a recorded execution."""
+    try:
+        parsed_min_sev: DiagnosticSeverity = parse_severity(min_severity)
+        parsed_fail_on: DiagnosticSeverity | None = (
+            parse_severity(fail_on) if fail_on is not None else None
+        )
+    except ValueError as exc:
+        typer.echo(f"Diagnostics option error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    effective_timeout = (
+        request_timeout_ms if request_timeout_ms is not None else cfg.diagnostics.request_timeout_ms
+    )
+    options = DiagnosticOptions(
+        request_timeout_ms=effective_timeout,
+        repeated_call_threshold=cfg.diagnostics.repeated_call_threshold,
+    )
+
+    repo = RecordingRepository(resolved_dir)
+    try:
+        full_report = diagnose_execution(
+            repo,
+            execution_id,
+            options=options,
+            min_severity="info",
+            strict_integrity=strict,
+        )
+    except (
+        ExecutionNotFoundError,
+        InvalidExecutionIdError,
+        StorageCorruptionError,
+        UnsupportedSchemaVersionError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Diagnostics error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        repo.close()
+
+    _warn_unredacted_if_applicable(full_report.redaction_mode)
+    if full_report.has_corruptions:
+        typer.echo(
+            "WARNING: Execution contains corrupt or partial JSONL record(s); "
+            "diagnostics reflect verified prefix records and corruption markers.",
+            err=True,
+        )
+
+    gate_triggered = report_exceeds_severity(full_report, threshold=parsed_fail_on)
+    display_report = apply_min_severity_filter(full_report, min_severity=parsed_min_sev)
+
+    if json_output:
+        typer.echo(diagnostics_report_to_json(display_report))
+    else:
+        typer.echo(render_diagnostics_text(display_report), nl=False)
+
+    if gate_triggered:
+        raise typer.Exit(code=2)
 
 
 def main() -> None:
