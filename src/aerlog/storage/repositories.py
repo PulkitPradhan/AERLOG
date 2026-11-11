@@ -19,6 +19,7 @@ from aerlog.events.models import (
 )
 from aerlog.events.types import EVENT_SCHEMA_VERSION, CaptureCompleteness, RedactionMode
 from aerlog.storage.database import (
+    DB_FILE_NAME,
     IndexedEventRow,
     IndexedExecutionRow,
     SQLiteMetadataStore,
@@ -26,6 +27,7 @@ from aerlog.storage.database import (
 from aerlog.storage.event_log import (
     EVENTS_FILE_NAME,
     EXECUTION_FILE_NAME,
+    EXECUTIONS_DIR_NAME,
     STORAGE_SCHEMA_VERSION,
     CorruptRecordReport,
     ExecutionManifest,
@@ -254,6 +256,18 @@ class RecordingRepository:
         """Ensure SQLite metadata store and migrations are initialized."""
         self._store.initialize()
 
+    def has_existing_storage(self) -> bool:
+        """Return True if an SQLite DB or any valid execution dir already exists on disk.
+
+        Never creates directories or database files when storage has not been created yet.
+        """
+        if self._store.is_open or (self._data_dir / DB_FILE_NAME).exists():
+            return True
+        exec_root = self._data_dir / EXECUTIONS_DIR_NAME
+        if not exec_root.is_dir():
+            return False
+        return bool(self._reader.discover_execution_ids())
+
     def close(self) -> None:
         """Close owned SQLite resources if created by this repository."""
         if self._owns_store:
@@ -282,7 +296,8 @@ class RecordingRepository:
     def get_execution(self, execution_id: str) -> StoredExecutionRecord:
         """Retrieve combined SQLite index row, companion files, and divergence state."""
         clean_id = validate_execution_id(execution_id)
-        row = self._store.get_execution_row(clean_id)
+        db_exists = self._store.is_open or self._store.db_path.exists()
+        row = self._store.get_execution_row(clean_id) if db_exists else None
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         events_path = exec_dir / EVENTS_FILE_NAME
         jsonl_exists = events_path.exists()
@@ -328,19 +343,49 @@ class RecordingRepository:
         *,
         strict_integrity: bool = False,
         verify_checksums: bool = True,
+        mark_missing: bool = True,
     ) -> JsonlReadResult:
         """Read and verify all events directly from authoritative ``events.jsonl``."""
         clean_id = validate_execution_id(execution_id)
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         if not exec_dir.exists():
-            row = self._store.get_execution_row(clean_id)
-            if row is not None:
-                self._store.mark_missing_jsonl(clean_id)
+            if mark_missing and (self._store.is_open or self._store.db_path.exists()):
+                row = self._store.get_execution_row(clean_id)
+                if row is not None:
+                    self._store.mark_missing_jsonl(clean_id)
             raise ExecutionNotFoundError(f"Execution directory missing for {clean_id!r}")
         return self._reader.read_execution(
             clean_id,
             strict=strict_integrity,
             verify_checksums=verify_checksums,
+        )
+
+    def get_event_by_sequence(
+        self,
+        execution_id: str,
+        sequence: int,
+        *,
+        verify_checksum: bool = True,
+    ) -> ExecutionEvent:
+        """Retrieve a single stored event by ``execution_id`` and 1-based ``sequence``."""
+        if sequence < 1:
+            raise ValueError(f"sequence must be >= 1, got {sequence}")
+        read_res = self.get_execution_events(
+            execution_id,
+            strict_integrity=False,
+            verify_checksums=verify_checksum,
+            mark_missing=False,
+        )
+        for item in read_res.events:
+            if item.event.sequence == sequence:
+                return item.event
+        for issue in read_res.corruptions:
+            if issue.line_number == sequence:
+                raise StorageCorruptionError(
+                    f"Event sequence {sequence} in {execution_id!r} is corrupt: {issue.details}"
+                )
+        raise ExecutionNotFoundError(
+            f"Event sequence {sequence} not found in execution {execution_id!r}"
         )
 
     def query_events(
