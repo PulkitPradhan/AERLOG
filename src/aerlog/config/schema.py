@@ -107,6 +107,27 @@ class CaptureSettings(BaseModel):
     )
 
 
+class StorageSettings(BaseModel):
+    """Phase 5 local JSONL and SQLite persistence settings."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    fsync_policy: Literal["lifecycle", "every_batch", "none"] = Field(
+        default="lifecycle",
+        description="When to fsync JSONL event logs ('lifecycle', 'every_batch', or 'none').",
+    )
+    sqlite_synchronous: Literal["NORMAL", "FULL"] = Field(
+        default="NORMAL",
+        description="SQLite PRAGMA synchronous mode under WAL.",
+    )
+    persist_cwd: bool = Field(
+        default=False,
+        description=(
+            "Whether to record host working directory paths (disabled by default for privacy)."
+        ),
+    )
+
+
 class AerlogConfig(BaseModel):
     """Validated runtime configuration for AERLOG.
 
@@ -127,6 +148,10 @@ class AerlogConfig(BaseModel):
     capture: CaptureSettings = Field(
         default_factory=CaptureSettings,
         description="Phase 4 capture pipeline redaction and durability defaults.",
+    )
+    storage: StorageSettings = Field(
+        default_factory=StorageSettings,
+        description="Phase 5 persistent JSONL and SQLite storage settings.",
     )
 
     @field_validator("data_dir", mode="before")
