@@ -150,6 +150,34 @@ class DiagnosticsSettings(BaseModel):
     )
 
 
+class ReplaySettings(BaseModel):
+    """Phase 8 safe offline cassette replay defaults (live replay blocked by default)."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    default_replay_mode: Literal["cassette"] = Field(
+        default="cassette",
+        description="Default replay mode ('cassette' offline only; live mode blocked).",
+    )
+    default_match_mode: Literal["strict", "tolerant"] = Field(
+        default="strict",
+        description="Request matching mode ('strict' ordered vs 'tolerant' normalized).",
+    )
+    unsafe_tool_policy: Literal["block", "warn"] = Field(
+        default="block",
+        description=(
+            "Safety policy for potentially_mutating and unknown_unsafe interactions "
+            "('block' by default; 'warn' with explicit --allow-mutating)."
+        ),
+    )
+    missing_response_policy: Literal["error", "omit"] = Field(
+        default="error",
+        description=(
+            "Behavior when a recorded request has no captured response ('error' or 'omit')."
+        ),
+    )
+
+
 class AerlogConfig(BaseModel):
     """Validated runtime configuration for AERLOG.
 
@@ -178,6 +206,10 @@ class AerlogConfig(BaseModel):
     diagnostics: DiagnosticsSettings = Field(
         default_factory=DiagnosticsSettings,
         description="Phase 7 deterministic diagnostic rule thresholds.",
+    )
+    replay: ReplaySettings = Field(
+        default_factory=ReplaySettings,
+        description="Phase 8 offline cassette replay and side-effect safety defaults.",
     )
 
     @field_validator("data_dir", mode="before")

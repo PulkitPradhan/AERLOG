@@ -6,6 +6,7 @@ import io
 import json
 from collections.abc import Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from rich import box
@@ -22,6 +23,8 @@ from aerlog.analysis.timeline import (
 )
 from aerlog.capture.redaction import EventRedactor, RedactionConfig
 from aerlog.events.models import ExecutionEvent
+from aerlog.replay.cassette import Cassette
+from aerlog.replay.runner import ReplayReport
 from aerlog.storage.database import IndexedExecutionRow
 
 
@@ -462,17 +465,195 @@ def diagnostics_report_to_json(report: DiagnosticReport) -> str:
     return report.model_dump_json(indent=2)
 
 
+def render_cassette_summary_text(cassette: Cassette, *, path: Path | None = None) -> str:
+    """Render privacy-safe cassette structure and safety classification table."""
+
+    def _draw(console: Console) -> None:
+        console.print("AERLOG REPLAY CASSETTE")
+        console.print(f"Cassette ID:        {cassette.cassette_id}")
+        console.print(f"Schema Version:     {cassette.cassette_schema_version}")
+        console.print(f"Source Execution:   {cassette.source_execution_id}")
+        console.print(f"Created At (UTC):   {cassette.created_at.isoformat()}")
+        console.print(f"Source Status:      {cassette.source_capture_completeness}")
+        console.print(f"Source Redaction:   {cassette.source_redaction_mode}")
+        console.print(f"Contains Raw Secs:  {cassette.contains_raw_secrets}")
+        console.print(f"Redacted Markers:   {cassette.contains_redacted_placeholders}")
+        console.print(f"SHA-256 Digest:     {cassette.cassette_sha256 or '-'}")
+        if path is not None:
+            console.print(f"Cassette File:      {path}")
+        if cassette.command_summary:
+            console.print(f"Command (redacted): {' '.join(cassette.command_summary)}")
+        console.print(
+            f"Interactions:       {len(cassette.interactions)} requests, "
+            f"{len(cassette.standalone_notifications)} standalone notifications, "
+            f"{len(cassette.cancellations)} cancellations"
+        )
+
+        if cassette.interactions:
+            table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+            table.add_column("IDX", justify="right", no_wrap=True)
+            table.add_column("REQ SEQ", justify="right", no_wrap=True)
+            table.add_column("METHOD", no_wrap=True)
+            table.add_column("TOOL", no_wrap=True)
+            table.add_column("SAFETY CLASS", no_wrap=True)
+            table.add_column("REPLAYABLE", no_wrap=True)
+            table.add_column("RECORDED OUTCOME")
+            for slot in cassette.interactions:
+                table.add_row(
+                    str(slot.interaction_index),
+                    str(slot.request_sequence),
+                    slot.method,
+                    slot.tool_name or "-",
+                    slot.side_effect_class,
+                    "yes" if slot.replayable else "no",
+                    slot.outcome,
+                )
+            console.print(table)
+
+    return _render_to_str(_draw)
+
+
+def cassette_summary_to_json(cassette: Cassette, *, path: Path | None = None) -> str:
+    """Serialize structural cassette metadata safely to JSON without exposing raw payloads."""
+    payload = {
+        "cassette_schema_version": cassette.cassette_schema_version,
+        "cassette_id": cassette.cassette_id,
+        "created_at": cassette.created_at.isoformat(),
+        "source_execution_id": cassette.source_execution_id,
+        "source_timeline_version": cassette.source_timeline_version,
+        "source_capture_completeness": cassette.source_capture_completeness,
+        "source_redaction_mode": cassette.source_redaction_mode,
+        "source_unclean_shutdown": cassette.source_unclean_shutdown,
+        "source_has_corruptions": cassette.source_has_corruptions,
+        "contains_raw_secrets": cassette.contains_raw_secrets,
+        "contains_redacted_placeholders": cassette.contains_redacted_placeholders,
+        "command_summary": list(cassette.command_summary),
+        "observed_mcp_protocol_versions": list(cassette.observed_mcp_protocol_versions),
+        "cassette_sha256": cassette.cassette_sha256,
+        "cassette_path": str(path) if path is not None else None,
+        "interaction_count": len(cassette.interactions),
+        "standalone_notification_count": len(cassette.standalone_notifications),
+        "cancellation_count": len(cassette.cancellations),
+        "interactions": [
+            {
+                "interaction_index": slot.interaction_index,
+                "request_sequence": slot.request_sequence,
+                "response_sequence": slot.response_sequence,
+                "origin_direction": slot.origin_direction,
+                "method": slot.method,
+                "tool_name": slot.tool_name,
+                "side_effect_class": slot.side_effect_class,
+                "side_effect_reason": slot.side_effect_reason,
+                "outcome": slot.outcome,
+                "replayable": slot.replayable,
+                "non_replayable_reason": slot.non_replayable_reason,
+                "exact_params_sha256": slot.exact_params_sha256,
+                "normalized_params_sha256": slot.normalized_params_sha256,
+            }
+            for slot in cassette.interactions
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def render_replay_report_text(
+    report: ReplayReport,
+    *,
+    report_path: Path | None = None,
+) -> str:
+    """Render offline cassette :class:`ReplayReport` summary cleanly for terminal output."""
+
+    def _draw(console: Console) -> None:
+        console.print("AERLOG CASSETTE REPLAY REPORT")
+        console.print(f"Replay ID:          {report.replay_id} (is_replay={report.is_replay})")
+        console.print(f"Source Execution:   {report.source_execution_id}")
+        console.print(f"Cassette ID:        {report.cassette_id}")
+        console.print(f"Replay Mode:        {report.replay_mode} ({report.driver_mode})")
+        console.print(f"Match Mode:         {report.match_mode}")
+        console.print(f"Unsafe Policy:      {report.unsafe_tool_policy}")
+        console.print(f"Missing Policy:     {report.missing_response_policy}")
+        console.print(f"Overall Status:     {report.overall_status}")
+        if report_path is not None:
+            console.print(f"Report File:        {report_path}")
+        console.print(
+            f"Summary Counts:     steps={report.total_steps}, matched={report.matched_count}, "
+            f"diverged={report.diverged_count}, blocked={report.blocked_count}, "
+            f"unmatched={report.unmatched_count}, missing={report.missing_response_count}, "
+            f"safety_notices={report.safety_warning_count}"
+        )
+
+        if report.steps:
+            table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+            table.add_column("STEP", justify="right", no_wrap=True)
+            table.add_column("KIND", no_wrap=True)
+            table.add_column("METHOD", no_wrap=True)
+            table.add_column("TOOL", no_wrap=True)
+            table.add_column("SLOT", justify="right", no_wrap=True)
+            table.add_column("SAFETY CLASS", no_wrap=True)
+            table.add_column("OUTCOME")
+            for step in report.steps:
+                slot_str = (
+                    str(step.matched_interaction_index)
+                    if step.matched_interaction_index is not None
+                    else "-"
+                )
+                table.add_row(
+                    str(step.step_index),
+                    step.kind,
+                    step.method,
+                    step.tool_name or "-",
+                    slot_str,
+                    step.side_effect_class or "-",
+                    step.replayed_status,
+                )
+            console.print(table)
+
+        if report.safety_notices:
+            console.print("SAFETY AUDIT NOTICES")
+            for notice in report.safety_notices:
+                console.print(f"  - [{notice.severity.upper()}] {notice.code}: {notice.message}")
+
+        if report.divergences:
+            console.print("\nREPLAY DIVERGENCES")
+            for div in report.divergences:
+                step_txt = f"step #{div.step_index}" if div.step_index is not None else "session"
+                console.print(
+                    f"  - [{div.severity.upper()}] {div.kind} ({step_txt}): {div.message}"
+                )
+
+        console.print("\nREPLAY LIMITATIONS")
+        for lim in report.limitations:
+            console.print(f"  - {lim}")
+
+    return _render_to_str(_draw)
+
+
+def replay_report_to_json(
+    report: ReplayReport,
+    *,
+    report_path: Path | None = None,
+) -> str:
+    """Serialize :class:`ReplayReport` cleanly to JSON for stdout."""
+    payload = report.model_dump(mode="json")
+    payload["report_path"] = str(report_path) if report_path is not None else None
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 __all__ = [
+    "cassette_summary_to_json",
     "diagnostics_report_to_json",
     "execution_inspection_to_json",
     "executions_list_to_json",
     "format_duration_ns",
     "format_offset_ns",
+    "render_cassette_summary_text",
     "render_diagnostics_text",
     "render_execution_inspection_text",
     "render_executions_list_text",
+    "render_replay_report_text",
     "render_single_event_text",
     "render_timeline_slice_text",
+    "replay_report_to_json",
     "single_event_to_json",
     "timeline_slice_to_json",
 ]

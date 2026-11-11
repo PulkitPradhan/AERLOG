@@ -1,7 +1,8 @@
-"""AERLOG CLI entry point for read-only listing, inspection, timeline, and diagnostics."""
+"""AERLOG CLI entry point for listing, inspection, timeline, diagnostics, and offline replay."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Annotated
 
@@ -22,24 +23,43 @@ from aerlog.analysis.timeline import (
     slice_timeline,
 )
 from aerlog.cli.render import (
+    cassette_summary_to_json,
     diagnostics_report_to_json,
     execution_inspection_to_json,
     executions_list_to_json,
+    render_cassette_summary_text,
     render_diagnostics_text,
     render_execution_inspection_text,
     render_executions_list_text,
+    render_replay_report_text,
     render_single_event_text,
     render_timeline_slice_text,
+    replay_report_to_json,
     single_event_to_json,
     timeline_slice_to_json,
 )
 from aerlog.config import AerlogConfig, ConfigError, load_config
+from aerlog.replay import (
+    Cassette,
+    MissingResponsePolicy,
+    ReplayError,
+    ReplayMatchMode,
+    UnsafeToolPolicy,
+    build_cassette_from_execution,
+    ensure_replay_mode_allowed,
+    load_cassette,
+    replay_cassette,
+    save_cassette,
+    save_replay_report,
+    serve_cassette_stdio,
+)
 from aerlog.storage.database import DB_FILE_NAME, IndexedExecutionRow
 from aerlog.storage.event_log import JsonlEventLogReader
 from aerlog.storage.exceptions import (
     ExecutionNotFoundError,
     InvalidExecutionIdError,
     StorageCorruptionError,
+    StorageError,
     UnsupportedSchemaVersionError,
 )
 from aerlog.storage.repositories import RecordingRepository
@@ -57,6 +77,14 @@ executions_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(executions_app, name="executions")
+
+cassette_app = typer.Typer(
+    name="cassette",
+    help="Create and inspect offline replay cassettes.",
+    invoke_without_command=True,
+    add_completion=False,
+)
+app.add_typer(cassette_app, name="cassette")
 
 
 _ALLOWED_COMPLETENESS = frozenset(
@@ -564,9 +592,354 @@ def diagnose_recorded_execution(
         raise typer.Exit(code=2)
 
 
+def _warn_cassette_raw_secrets_if_applicable(cassette: Cassette) -> None:
+    if cassette.contains_raw_secrets:
+        typer.echo(
+            "WARNING: Cassette was created from an 'explicit_unredacted' recording "
+            "(contains_raw_secrets=True); sensitive unredacted data may be present.",
+            err=True,
+        )
+
+
+def _parse_match_mode(value: str) -> ReplayMatchMode:
+    normalized = value.strip().lower()
+    if normalized == "strict":
+        return "strict"
+    if normalized == "tolerant":
+        return "tolerant"
+    raise ValueError(f"Invalid --match {value!r}; expected 'strict' or 'tolerant'")
+
+
+def _parse_missing_policy(value: str) -> MissingResponsePolicy:
+    normalized = value.strip().lower()
+    if normalized == "error":
+        return "error"
+    if normalized == "omit":
+        return "omit"
+    raise ValueError(f"Invalid --missing-policy {value!r}; expected 'error' or 'omit'")
+
+
+@cassette_app.callback()
+def cassette_root(ctx: typer.Context) -> None:
+    """Offline replay cassette management commands."""
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
+
+
+@cassette_app.command("create")
+def cassette_create(
+    execution_id: Annotated[str, typer.Argument(help="Execution UUID to convert into a cassette.")],
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Optional custom output path for the cassette file."),
+    ] = None,
+    allow_unredacted_cassette: Annotated[
+        bool,
+        typer.Option(
+            "--allow-unredacted-cassette",
+            help="Explicitly permit creating a cassette from an 'explicit_unredacted' recording.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Fail with code 1 if corrupt JSONL records exist."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit cassette summary JSON to stdout."),
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override AERLOG data directory."),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to AERLOG configuration TOML file."),
+    ] = None,
+) -> None:
+    """Create a hashed offline replay cassette from an existing execution recording."""
+    _, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    repo = RecordingRepository(resolved_dir)
+    try:
+        cassette = build_cassette_from_execution(
+            repo,
+            execution_id,
+            strict_integrity=strict,
+            allow_unredacted_cassette=allow_unredacted_cassette,
+        )
+        saved_path = save_cassette(cassette, data_dir=resolved_dir, output_path=output)
+    except (
+        ExecutionNotFoundError,
+        InvalidExecutionIdError,
+        StorageCorruptionError,
+        UnsupportedSchemaVersionError,
+        StorageError,
+        ReplayError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Cassette creation error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        repo.close()
+
+    _warn_cassette_raw_secrets_if_applicable(cassette)
+    if cassette.source_has_corruptions:
+        typer.echo(
+            "WARNING: Source recording contains corrupt/partial JSONL records; cassette covers "
+            "verified prefix events only.",
+            err=True,
+        )
+
+    if json_output:
+        typer.echo(cassette_summary_to_json(cassette, path=saved_path))
+    else:
+        typer.echo(render_cassette_summary_text(cassette, path=saved_path), nl=False)
+
+
+@cassette_app.command("inspect")
+def cassette_inspect(
+    cassette_id_or_path: Annotated[
+        str, typer.Argument(help="Cassette UUID or path to a .cassette.json file.")
+    ],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit cassette metadata JSON to stdout."),
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override AERLOG data directory."),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to AERLOG configuration TOML file."),
+    ] = None,
+) -> None:
+    """Inspect and SHA-256 verify an offline replay cassette read-only."""
+    _, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    try:
+        cassette, resolved_path = load_cassette(cassette_id_or_path, data_dir=resolved_dir)
+    except (
+        InvalidExecutionIdError,
+        ReplayError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Cassette inspection error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    _warn_cassette_raw_secrets_if_applicable(cassette)
+    if json_output:
+        typer.echo(cassette_summary_to_json(cassette, path=resolved_path))
+    else:
+        typer.echo(render_cassette_summary_text(cassette, path=resolved_path), nl=False)
+
+
+@app.command("replay")
+def replay_recorded_execution(
+    execution_id: Annotated[
+        str | None,
+        typer.Argument(
+            help="Recorded execution UUID to replay (optional when --cassette is given)."
+        ),
+    ] = None,
+    cassette_path: Annotated[
+        Path | None,
+        typer.Option("--cassette", help="Path to an existing offline .cassette.json file."),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="Replay mode ('cassette' offline only; 'live' is blocked fail-closed).",
+        ),
+    ] = "cassette",
+    match: Annotated[
+        str | None,
+        typer.Option("--match", help="Request matching mode: 'strict' or 'tolerant'."),
+    ] = None,
+    serve: Annotated[
+        bool,
+        typer.Option(
+            "--serve",
+            help="Run an offline cassette-backed mock MCP stdio server on stdin/stdout.",
+        ),
+    ] = False,
+    allow_mutating: Annotated[
+        bool,
+        typer.Option(
+            "--allow-mutating",
+            help=(
+                "Allow offline replay of potentially_mutating and unknown_unsafe interactions "
+                "with audit warnings."
+            ),
+        ),
+    ] = False,
+    allow_unredacted_cassette: Annotated[
+        bool,
+        typer.Option(
+            "--allow-unredacted-cassette",
+            help="Permit building an in-session cassette from an 'explicit_unredacted' recording.",
+        ),
+    ] = False,
+    exact_id: Annotated[
+        bool,
+        typer.Option("--exact-id", help="Require exact incoming JSON-RPC request IDs to match."),
+    ] = False,
+    missing_policy: Annotated[
+        str | None,
+        typer.Option(
+            "--missing-policy",
+            help="Behavior when recorded request lacked a response: 'error' or 'omit'.",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict", help="Fail with code 1 if source recording has JSONL corruptions."
+        ),
+    ] = False,
+    fail_on_divergence: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-divergence",
+            help="Exit with code 2 if any request diverged, remained unconsumed, or was blocked.",
+        ),
+    ] = False,
+    no_save_report: Annotated[
+        bool,
+        typer.Option(
+            "--no-save-report", help="Do not write ReplayReport under <data_dir>/replays."
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit structured JSON ReplayReport to stdout."),
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override AERLOG data directory."),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to AERLOG configuration TOML file."),
+    ] = None,
+) -> None:
+    """Replay recorded MCP interactions safely offline from a cassette without real tools."""
+    try:
+        validated_mode = ensure_replay_mode_allowed(mode)
+    except (ReplayError, ValueError) as exc:
+        typer.echo(f"Replay blocked: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if execution_id is None and cassette_path is None:
+        typer.echo("Replay error: specify an execution_id or pass '--cassette <path>'.", err=True)
+        raise typer.Exit(code=1)
+    if serve and json_output:
+        typer.echo(
+            "Replay error: '--json' cannot be combined with '--serve' because stdout carries "
+            "live JSON-RPC frames.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    try:
+        effective_match: ReplayMatchMode = (
+            _parse_match_mode(match) if match is not None else cfg.replay.default_match_mode
+        )
+        effective_missing: MissingResponsePolicy = (
+            _parse_missing_policy(missing_policy)
+            if missing_policy is not None
+            else cfg.replay.missing_response_policy
+        )
+    except ValueError as exc:
+        typer.echo(f"Replay option error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    unsafe_policy: UnsafeToolPolicy = "warn" if allow_mutating else cfg.replay.unsafe_tool_policy
+
+    try:
+        if cassette_path is not None:
+            cassette, _ = load_cassette(cassette_path, data_dir=resolved_dir)
+        else:
+            assert execution_id is not None
+            repo = RecordingRepository(resolved_dir)
+            try:
+                cassette = build_cassette_from_execution(
+                    repo,
+                    execution_id,
+                    strict_integrity=strict,
+                    allow_unredacted_cassette=allow_unredacted_cassette,
+                )
+            finally:
+                repo.close()
+    except (
+        ExecutionNotFoundError,
+        InvalidExecutionIdError,
+        StorageCorruptionError,
+        UnsupportedSchemaVersionError,
+        ReplayError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Replay error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    _warn_cassette_raw_secrets_if_applicable(cassette)
+    if cassette.source_has_corruptions:
+        typer.echo(
+            "WARNING: Source recording has corruptions; cassette contains verified prefix only.",
+            err=True,
+        )
+
+    if serve:
+        report = asyncio.run(
+            serve_cassette_stdio(
+                cassette,
+                mode=validated_mode,
+                match_mode=effective_match,
+                unsafe_tool_policy=unsafe_policy,
+                missing_response_policy=effective_missing,
+                require_exact_id=exact_id,
+            )
+        )
+    else:
+        report = replay_cassette(
+            cassette,
+            mode=validated_mode,
+            match_mode=effective_match,
+            unsafe_tool_policy=unsafe_policy,
+            missing_response_policy=effective_missing,
+            require_exact_id=exact_id,
+        )
+
+    saved_report_path: Path | None = None
+    if not no_save_report:
+        try:
+            saved_report_path = save_replay_report(report, data_dir=resolved_dir)
+        except StorageError as exc:
+            typer.echo(f"Replay report persistence error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+
+    if serve:
+        typer.echo(
+            render_replay_report_text(report, report_path=saved_report_path),
+            err=True,
+            nl=False,
+        )
+    elif json_output:
+        typer.echo(replay_report_to_json(report, report_path=saved_report_path))
+    else:
+        typer.echo(render_replay_report_text(report, report_path=saved_report_path), nl=False)
+
+    if fail_on_divergence and (
+        report.diverged_count > 0 or report.blocked_count > 0 or report.unmatched_count > 0
+    ):
+        raise typer.Exit(code=2)
+
+
 def main() -> None:
     """Console script entry point for ``aerlog``."""
     app()
 
 
-__all__ = ["app", "executions_app", "main"]
+__all__ = ["app", "cassette_app", "executions_app", "main"]
