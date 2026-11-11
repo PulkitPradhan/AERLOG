@@ -1181,27 +1181,39 @@ A web dashboard is not required to meet these criteria.
 
 # CLI Experience
 
-The following commands describe the intended developer experience. They are illustrative until implemented.
+AERLOG exposes the full local capture, inspection, diagnostics, offline replay, and regression export workflow from the terminal:
 
 ```bash
-# Start a server through AERLOG
+# Start a server through the transparent stdio capture proxy
 aerlog run -- python examples/demo_mcp_server.py
 
-# List recorded executions
+# List recorded executions (`aerlog list` is an alias for `aerlog executions list`)
+aerlog list
 aerlog executions list
 
-# Inspect a specific execution
+# Inspect a specific execution summary or single event by sequence
 aerlog inspect <execution-id>
+aerlog inspect <execution-id> --sequence 3 --json
 
-# View its chronological timeline
-aerlog timeline <execution-id>
+# View or filter its chronological timeline
+aerlog timeline <execution-id> --direction client_to_server
 
-# Replay recorded interactions without contacting the original server
-aerlog replay <execution-id> --mode cassette
+# Run deterministic, evidence-linked diagnostics
+aerlog diagnose <execution-id> --fail-on error
 
-# Export a regression test
+# Create or verify offline replay cassettes
+aerlog cassette create <execution-id>
+aerlog cassette inspect <cassette-id-or-path>
+
+# Replay recorded interactions offline without contacting the original server
+aerlog replay <execution-id> --mode cassette --fail-on-divergence
+
+# Export and verify portable deterministic regression tests
 aerlog export test <execution-id> --output tests/generated/
+aerlog export verify tests/generated/exec_<execution-id>.fixture.json --cassette <cassette-id-or-path>
 ```
+
+**Exit codes:** `0` success (clean run, empty list, passing verify); `1` operational/validation/integrity error (invalid options, missing storage/execution, `--strict` JSONL corruption, tampered fixture/cassette, blocked `--mode live`, or unredacted opt-in refusal); `2` CLI syntax error or automated gate failure (`diagnose --fail-on`, `replay --fail-on-divergence`, `export verify` drift); `aerlog run` forwards wrapped server/proxy exit codes (`128 + sig`, `126` permission denied, `127` command not found, `65` oversized frame, `74` diagnostic log failure).
 
 ### Example Inspection Output
 

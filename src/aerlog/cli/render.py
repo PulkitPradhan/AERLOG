@@ -840,6 +840,37 @@ def regression_verify_to_json(
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def render_run_start_stderr(
+    *,
+    execution_id: str,
+    command: Sequence[str],
+) -> str:
+    """Format a concise redaction-safe proxy start notice exclusively for ``stderr``."""
+    safe_cmd = _defensive_redact_command(command, redaction_mode="standard")
+    return f"[aerlog] Recording MCP execution {execution_id} (cmd={safe_cmd!r})\n"
+
+
+def render_run_summary_stderr(
+    *,
+    execution_id: str,
+    command: Sequence[str],
+    redaction_mode: str,
+    termination_reason: str,
+    exit_code: int,
+    client_frames: int,
+    server_frames: int,
+    data_dir: Path,
+) -> str:
+    """Format a concise redaction-safe proxy run summary exclusively for ``stderr``."""
+    _ = redaction_mode
+    safe_cmd = _defensive_redact_command(command, redaction_mode="standard")
+    return (
+        f"[aerlog] execution={execution_id} status={termination_reason} "
+        f"exit_code={exit_code} frames={client_frames}/{server_frames} "
+        f"cmd={safe_cmd!r} data_dir={data_dir}\n"
+    )
+
+
 __all__ = [
     "cassette_summary_to_json",
     "diagnostics_report_to_json",
@@ -856,6 +887,8 @@ __all__ = [
     "render_export_bundle_text",
     "render_regression_verify_text",
     "render_replay_report_text",
+    "render_run_start_stderr",
+    "render_run_summary_stderr",
     "render_single_event_text",
     "render_timeline_slice_text",
     "replay_report_to_json",
