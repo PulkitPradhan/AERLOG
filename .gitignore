@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode and packaging artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test, coverage, lint, and type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime/debug artifacts (never commit recordings)
+.aerlog/
