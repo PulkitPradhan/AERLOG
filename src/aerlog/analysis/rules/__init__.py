@@ -1,4 +1,4 @@
-"""Approved deterministic diagnostic rules for AERLOG Phase 7."""
+"""Deterministic diagnostic rules for AERLOG failure analysis."""
 
 from __future__ import annotations
 

@@ -299,12 +299,13 @@ class EventNormalizer:
 
     def build_header(self) -> ExecutionHeader:
         """Build the immutable run header using the redacted command representation."""
+        cwd_value = self._cwd if self._redactor.config.mode != "strict_hash_only" else None
         return ExecutionHeader(
             execution_id=self._execution_id,
             started_at=self._started_at,
             monotonic_start_ns=self._monotonic_start_ns,
             command=self._redacted_command,
-            cwd=self._cwd,
+            cwd=cwd_value,
             redaction_mode=self._redactor.config.mode,
             backpressure_policy=self._backpressure_policy,
         )
@@ -967,7 +968,22 @@ class EventNormalizer:
             kind = "jsonrpc_unknown_object"
 
         if corr_meta is not None:
-            trace_ctx = corr_meta.trace
+            raw_trace = corr_meta.trace
+            if raw_trace is not None and raw_trace.observed_tracestate is not None:
+                if mode == "strict_hash_only":
+                    trace_ctx = raw_trace.model_copy(update={"observed_tracestate": None})
+                elif mode == "standard":
+                    ts_out = self._redactor.redact_text_value(
+                        raw_trace.observed_tracestate,
+                        path_label="trace.observed_tracestate",
+                    )
+                    summaries.append(ts_out.summary)
+                    safe_ts = None if ts_out.summary.degraded else ts_out.text
+                    trace_ctx = raw_trace.model_copy(update={"observed_tracestate": safe_ts})
+                else:
+                    trace_ctx = raw_trace
+            else:
+                trace_ctx = raw_trace
             corr_info = corr_meta.correlation
             warnings = corr_meta.warnings
             if corr_meta.derived is not None:
@@ -1044,7 +1060,32 @@ class EventNormalizer:
     ) -> tuple[ExecutionEvent, ExecutionSummary]:
         """Emit ``execution_finished`` and construct the final :class:`ExecutionSummary`."""
         effective_rc = self._last_returncode if returncode is None else returncode
-        unanswered = self._correlator.unanswered_request_labels()
+        raw_unanswered = self._correlator.unanswered_request_labels()
+        raw_versions = self._correlator.observed_protocol_versions
+        mode = self._redactor.config.mode
+        if mode == "strict_hash_only":
+            unanswered: tuple[str, ...] = ()
+            versions: tuple[str, ...] = ()
+        elif mode == "standard":
+            unans_out = self._redactor.redact_value(
+                list(raw_unanswered), root_path="summary.unanswered_request_ids"
+            )
+            vers_out = self._redactor.redact_value(
+                list(raw_versions), root_path="summary.observed_mcp_protocol_versions"
+            )
+            unanswered = (
+                tuple(str(x) for x in unans_out.value)
+                if not unans_out.summary.degraded and isinstance(unans_out.value, list)
+                else ()
+            )
+            versions = (
+                tuple(str(x) for x in vers_out.value)
+                if not vers_out.summary.degraded and isinstance(vers_out.value, list)
+                else ()
+            )
+        else:
+            unanswered = raw_unanswered
+            versions = raw_versions
 
         if force_incomplete or self._dropped_events > 0 or self._gap_count > 0:
             completeness: CaptureCompleteness = "incomplete"
@@ -1073,7 +1114,7 @@ class EventNormalizer:
                 total_events=final_seq,
                 dropped_events=self._dropped_events,
                 degraded_events=self._degraded_events,
-                unanswered_request_count=len(unanswered),
+                unanswered_request_count=len(raw_unanswered),
                 unanswered_request_ids=unanswered,
                 spool_file=spool_file,
             ),
@@ -1084,8 +1125,8 @@ class EventNormalizer:
             ended_at=ended_at,
             duration_ns=max(0, monotonic_end_ns - self._monotonic_start_ns),
             command=self._redacted_command,
-            cwd=self._cwd if self._redactor.config.mode != "strict_hash_only" else None,
-            redaction_mode=self._redactor.config.mode,
+            cwd=self._cwd if mode != "strict_hash_only" else None,
+            redaction_mode=mode,
             backpressure_policy=self._backpressure_policy,
             capture_completeness=completeness,
             termination_reason=termination_reason,
@@ -1098,7 +1139,7 @@ class EventNormalizer:
             gap_count=self._gap_count,
             unanswered_request_ids=unanswered,
             observed_trace_ids=tuple(self._observed_trace_ids),
-            observed_mcp_protocol_versions=self._correlator.observed_protocol_versions,
+            observed_mcp_protocol_versions=versions,
             spool_file=spool_file,
         )
         return finished_event, summary

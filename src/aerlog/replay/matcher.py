@@ -7,6 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from aerlog.capture.redaction import REDACTION_FAILED_MARKER, EventRedactor, RedactionConfig
 from aerlog.events.models import JsonRpcIdValue, classify_jsonrpc_id
 from aerlog.events.types import JsonRpcIdType
 from aerlog.replay.cassette import (
@@ -19,6 +20,7 @@ from aerlog.replay.safety import (
     SafetyAuditNotice,
     SideEffectClass,
     UnsafeToolPolicy,
+    classify_interaction_safety,
     requires_unsafe_opt_in,
 )
 
@@ -186,9 +188,36 @@ class CassetteMatcher:
         self._client_slots: tuple[CassetteInteraction, ...] = tuple(
             item for item in cassette.interactions if item.origin_direction == "client_to_server"
         )
+        self._tool_annotations: dict[str, dict[str, Any]] = {}
+        for item in cassette.interactions:
+            if item.method != "tools/list" or not isinstance(item.response_result, Mapping):
+                continue
+            tools = item.response_result.get("tools")
+            if not isinstance(tools, list):
+                continue
+            for tool in tools:
+                if not isinstance(tool, Mapping):
+                    continue
+                name = tool.get("name")
+                ann = tool.get("annotations")
+                if isinstance(name, str) and name and isinstance(ann, Mapping):
+                    self._tool_annotations[name] = dict(ann)
+        self._redactor = EventRedactor(RedactionConfig(mode="standard"))
         self._consumed_indices: set[int] = set()
         self._step_counter = 0
         self._seen_request_keys: dict[tuple[str, str], int] = {}
+
+    def _safe_text(self, value: str) -> str:
+        out = self._redactor.redact_text_value(value, path_label="replay.divergence")
+        if out.summary.degraded or out.text is None:
+            return REDACTION_FAILED_MARKER
+        return out.text
+
+    def _safe_value(self, value: Any) -> Any:
+        out = self._redactor.redact_value(value, root_path="replay.divergence")
+        if out.summary.degraded:
+            return REDACTION_FAILED_MARKER
+        return out.value
 
     @property
     def consumed_indices(self) -> frozenset[int]:
@@ -234,18 +263,37 @@ class CassetteMatcher:
         id_rebound = slot.request_id_type != id_type or slot.request_id != incoming_id
         safety_notice: SafetyAuditNotice | None = None
 
-        if requires_unsafe_opt_in(slot.side_effect_class):
+        # Always re-compute safety dynamically from slot method, extracted tool name, and
+        # verified tools/list annotations rather than trusting stored side_effect_class.
+        effective_tool_name: str | None = slot.tool_name
+        if slot.method == "tools/call" and isinstance(slot.params, Mapping):
+            raw_tool_name = slot.params.get("name")
+            if isinstance(raw_tool_name, str) and raw_tool_name:
+                effective_tool_name = raw_tool_name
+        recomputed = classify_interaction_safety(
+            slot.method,
+            tool_name=effective_tool_name,
+            tool_annotations=(
+                self._tool_annotations.get(effective_tool_name) if effective_tool_name else None
+            ),
+        )
+        effective_class = recomputed.side_effect_class
+        effective_reason = recomputed.reason
+        safe_method = self._safe_text(slot.method)
+        safe_tool = self._safe_text(effective_tool_name) if effective_tool_name else None
+
+        if requires_unsafe_opt_in(effective_class):
             if self._unsafe_tool_policy == "block":
-                tool_desc = f" tool={slot.tool_name!r}" if slot.tool_name else ""
+                tool_desc = f" tool={safe_tool!r}" if safe_tool else ""
                 notice = SafetyAuditNotice(
                     code="BLOCKED_UNSAFE_TOOL",
                     severity="error",
-                    method=slot.method,
-                    tool_name=slot.tool_name,
-                    side_effect_class=slot.side_effect_class,
+                    method=safe_method,
+                    tool_name=safe_tool,
+                    side_effect_class=effective_class,
                     message=(
-                        f"Blocked replay of {slot.method}{tool_desc} "
-                        f"({slot.side_effect_class}: {slot.side_effect_reason}); pass "
+                        f"Blocked replay of {safe_method}{tool_desc} "
+                        f"({effective_class}: {effective_reason}); pass "
                         "'--allow-mutating' to serve recorded offline response."
                     ),
                 )
@@ -253,12 +301,12 @@ class CassetteMatcher:
                     kind="blocked_unsafe_tool",
                     severity="error",
                     step_index=step_index,
-                    method=slot.method,
+                    method=safe_method,
                     message=notice.message,
                     details={
                         "interaction_index": slot.interaction_index,
-                        "tool_name": slot.tool_name,
-                        "side_effect_class": slot.side_effect_class,
+                        "tool_name": safe_tool,
+                        "side_effect_class": effective_class,
                     },
                 )
                 err_frame = _jsonrpc_error_frame(
@@ -268,7 +316,7 @@ class CassetteMatcher:
                     message=notice.message,
                     data={
                         "aerlog_divergence": div.kind,
-                        "side_effect_class": slot.side_effect_class,
+                        "side_effect_class": effective_class,
                     },
                 )
                 return MatchDecision(
@@ -276,7 +324,7 @@ class CassetteMatcher:
                     outcome_kind="blocked_unsafe_tool",
                     interaction=slot,
                     response_frame_obj=err_frame,
-                    side_effect_class=slot.side_effect_class,
+                    side_effect_class=effective_class,
                     id_rebound=id_rebound,
                     diverged=True,
                     divergence=div,
@@ -286,13 +334,13 @@ class CassetteMatcher:
             safety_notice = SafetyAuditNotice(
                 code="MUTATING_OPERATION_REPLAYED_OFFLINE",
                 severity="warning",
-                method=slot.method,
-                tool_name=slot.tool_name,
-                side_effect_class=slot.side_effect_class,
+                method=safe_method,
+                tool_name=safe_tool,
+                side_effect_class=effective_class,
                 message=(
-                    f"Served offline cassette response for {slot.side_effect_class} call "
-                    f"{slot.method}"
-                    + (f" ({slot.tool_name})" if slot.tool_name else "")
+                    f"Served offline cassette response for {effective_class} call "
+                    f"{safe_method}"
+                    + (f" ({safe_tool})" if safe_tool else "")
                     + " under explicit opt-in; no real tool handler executed."
                 ),
             )
@@ -302,9 +350,9 @@ class CassetteMatcher:
                 kind="missing_recorded_response",
                 severity="warning",
                 step_index=step_index,
-                method=slot.method,
+                method=safe_method,
                 message=(
-                    f"Recorded request #{slot.interaction_index} ({slot.method}) ended with "
+                    f"Recorded request #{slot.interaction_index} ({safe_method}) ended with "
                     f"{slot.non_replayable_reason or 'no_response'}; no cached reply exists."
                 ),
                 details={
@@ -329,7 +377,7 @@ class CassetteMatcher:
                 outcome_kind="missing_recorded_response",
                 interaction=slot,
                 response_frame_obj=missing_err_frame,
-                side_effect_class=slot.side_effect_class,
+                side_effect_class=effective_class,
                 id_rebound=id_rebound,
                 diverged=True,
                 divergence=div,
@@ -349,9 +397,9 @@ class CassetteMatcher:
                 kind="out_of_order_request",
                 severity="warning",
                 step_index=step_index,
-                method=slot.method,
+                method=safe_method,
                 message=(
-                    f"Tolerant replay matched slot #{slot.interaction_index} ({slot.method}) "
+                    f"Tolerant replay matched slot #{slot.interaction_index} ({safe_method}) "
                     "out of recorded chronological order."
                 ),
                 details={"matched_interaction_index": slot.interaction_index},
@@ -371,7 +419,7 @@ class CassetteMatcher:
             interaction=slot,
             response_frame_obj=response_frame,
             emitted_notifications=emitted,
-            side_effect_class=slot.side_effect_class,
+            side_effect_class=effective_class,
             id_rebound=id_rebound,
             diverged=out_of_order_used,
             divergence=div_out,
@@ -423,11 +471,11 @@ class CassetteMatcher:
                     kind="id_mismatch",
                     severity="error",
                     step_index=step_index,
-                    method=method,
+                    method=self._safe_text(method),
                     message=(
-                        f"Strict exact-ID mismatch for {method}: expected "
-                        f"{next_slot.request_id_type}:{next_slot.request_id!r}, got "
-                        f"{id_type}:{request_id!r}."
+                        f"Strict exact-ID mismatch for {self._safe_text(method)}: expected "
+                        f"{next_slot.request_id_type}:{self._safe_value(next_slot.request_id)!r}, "
+                        f"got {id_type}:{self._safe_value(request_id)!r}."
                     ),
                     details={"expected_index": next_slot.interaction_index},
                 )
@@ -746,15 +794,16 @@ class CassetteMatcher:
                     diverged=False,
                 )
 
+            safe_target = self._safe_value(raw_target)
             div = ReplayDivergence(
                 kind="cancellation_target_missing",
                 severity="warning",
                 step_index=step_index,
-                method=method,
+                method=self._safe_text(method),
                 message=(
-                    f"Cancellation notification targeted unknown/unseen requestId={raw_target!r}."
+                    f"Cancellation notification targeted unknown/unseen requestId={safe_target!r}."
                 ),
-                details={"target_request_id": raw_target},
+                details={"target_request_id": safe_target},
             )
             return MatchDecision(
                 matched=False,

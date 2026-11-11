@@ -15,6 +15,7 @@ from aerlog.protocol.jsonrpc import inspect_frame, redact_text
 from aerlog.proxy.diagnostics import DiagnosticSink
 
 STDERR_LINE_MAX_CHARS = 4096
+STDERR_LINE_MAX_BUFFER_BYTES = 262_144
 
 StreamDirection = Literal["client_to_server", "server_to_client"]
 
@@ -29,21 +30,27 @@ class ProxyObserver(Protocol):
         cwd: Path | None,
         env_overrides: Mapping[str, str] | None,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Record proxy startup parameters before the server subprocess spawns."""
+        ...
 
     async def on_wire_frame(
         self,
         direction: StreamDirection,
         raw_frame: bytes,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Observe one complete unmodified wire frame forwarded between client and server."""
+        ...
 
     async def on_incomplete_frame(
         self,
         direction: StreamDirection,
         trailing_bytes: bytes,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Observe trailing unterminated wire bytes encountered at stream EOF."""
+        ...
 
     async def on_frame_too_large(
         self,
@@ -51,9 +58,13 @@ class ProxyObserver(Protocol):
         observed_bytes: int,
         max_frame_bytes: int,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Observe a fail-closed oversized wire frame exceeding ``max_frame_bytes``."""
+        ...
 
-    async def on_stderr_line(self, raw_line: bytes, monotonic_time_ns: int) -> None: ...
+    async def on_stderr_line(self, raw_line: bytes, monotonic_time_ns: int) -> None:
+        """Observe one line read from child server ``stderr``."""
+        ...
 
     async def on_transport_error(
         self,
@@ -61,9 +72,13 @@ class ProxyObserver(Protocol):
         reason: str,
         error: str,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Observe a pipe closure, spawn failure, or transport OS error."""
+        ...
 
-    async def on_proxy_signal(self, signal_name: str, monotonic_time_ns: int) -> None: ...
+    async def on_proxy_signal(self, signal_name: str, monotonic_time_ns: int) -> None:
+        """Observe an OS signal or task cancellation delivered to the proxy."""
+        ...
 
     async def on_child_shutdown_escalate(
         self,
@@ -71,9 +86,13 @@ class ProxyObserver(Protocol):
         pgid: int,
         error: str | None,
         monotonic_time_ns: int,
-    ) -> None: ...
+    ) -> None:
+        """Observe ``SIGTERM``/``SIGKILL`` escalation against the server process group."""
+        ...
 
-    async def on_process_exited(self, returncode: int | None, monotonic_time_ns: int) -> None: ...
+    async def on_process_exited(self, returncode: int | None, monotonic_time_ns: int) -> None:
+        """Observe child server subprocess termination and exit code."""
+        ...
 
     async def on_execution_finished(
         self,
@@ -81,14 +100,16 @@ class ProxyObserver(Protocol):
         termination_reason: str,
         exit_code: int,
         returncode: int | None,
-    ) -> None: ...
+    ) -> None:
+        """Finalize capture when proxy forwarding and process cleanup complete."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
 class StreamForwardResult:
     """Summary of one completed unidirectional forwarding pump."""
 
-    direction: str
+    direction: StreamDirection
     frames_forwarded: int
     bytes_forwarded: int
     eof_incomplete_frame: bool
@@ -157,19 +178,17 @@ async def forward_protocol_stream(
                 )
                 await sink.emit(observation.event_kind, **observation.to_diagnostic_fields())
 
-                notified_observer = False
                 try:
                     writer.write(frame)
                     await writer.drain()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    if observer is not None and not notified_observer:
+                    if observer is not None:
                         await observer.on_wire_frame(direction, frame, read_ns)
                     raise
                 frames_forwarded += 1
                 bytes_forwarded += len(frame)
                 if observer is not None:
                     await observer.on_wire_frame(direction, frame, read_ns)
-                    notified_observer = True
 
         trailing = accumulator.flush_eof()
         if trailing is not None:
@@ -180,8 +199,12 @@ async def forward_protocol_stream(
                 "byte_length": len(trailing),
             }
             if diag_cfg.include_previews:
-                decoded = trailing[: diag_cfg.preview_max_chars].decode("utf-8", errors="replace")
-                fields["preview"] = redact_text(decoded)[: diag_cfg.preview_max_chars]
+                char_limit = max(0, diag_cfg.preview_max_chars)
+                if char_limit > 0:
+                    window = trailing[: max(char_limit * 8, 4096)].decode("utf-8", errors="replace")
+                    fields["preview"] = redact_text(window)[:char_limit]
+                else:
+                    fields["preview"] = ""
             await sink.emit("incomplete_trailing_frame", **fields)
             if observer is not None:
                 await observer.on_incomplete_frame(direction, trailing, read_ns)
@@ -220,42 +243,92 @@ async def forward_stderr_stream(
     *,
     chunk_size: int = 65536,
     max_line_chars: int = STDERR_LINE_MAX_CHARS,
+    max_line_bytes: int = STDERR_LINE_MAX_BUFFER_BYTES,
     observer: ProxyObserver | None = None,
 ) -> None:
-    """Read child ``stderr`` lines and emit redacted diagnostics off ``stdout``."""
+    """Read child ``stderr`` lines with bounded line buffering and emit redacted diagnostics."""
+    char_limit = max(0, max_line_chars)
+    byte_cap = max(max(0, max_line_bytes), max(1, char_limit * 8))
     buffer = bytearray()
+    discarding_tail = False
+    oversized_total_bytes = 0
     diag_cfg = sink.config
 
-    def _emit_line(raw_line: bytes) -> dict[str, object]:
-        if not diag_cfg.include_previews:
-            return {"byte_length": len(raw_line)}
-        decoded = raw_line.decode("utf-8", errors="replace")
-        redacted = redact_text(decoded)
-        truncated = redacted[:max_line_chars]
-        return {
-            "byte_length": len(raw_line),
-            "text": truncated,
-            "truncated": len(redacted) > max_line_chars,
-        }
+    async def _flush_line(raw_line: bytes, *, true_byte_length: int) -> None:
+        if raw_line.endswith(b"\r"):
+            raw_line = raw_line[:-1]
+            true_byte_length = max(len(raw_line), true_byte_length - 1)
+        line_ns = time.monotonic_ns()
+        if diag_cfg.include_previews:
+            decoded = raw_line.decode("utf-8", errors="replace")
+            redacted = redact_text(decoded)
+            preview = redacted[:char_limit] if char_limit > 0 else ""
+            fields: dict[str, object] = {
+                "byte_length": true_byte_length,
+                "text": preview,
+                "truncated": (true_byte_length > len(raw_line)) or (len(redacted) > char_limit),
+            }
+        else:
+            fields = {"byte_length": true_byte_length}
+        await sink.emit("server_stderr", **fields)
+        if observer is not None:
+            await observer.on_stderr_line(raw_line, line_ns)
 
     while True:
         chunk = await reader.read(chunk_size)
         if not chunk:
             break
-        buffer.extend(chunk)
-        while (newline_idx := buffer.find(b"\n")) != -1:
-            line = bytes(buffer[:newline_idx])
-            del buffer[: newline_idx + 1]
-            if line.endswith(b"\r"):
-                line = line[:-1]
-            line_ns = time.monotonic_ns()
-            await sink.emit("server_stderr", **_emit_line(line))
-            if observer is not None:
-                await observer.on_stderr_line(line, line_ns)
 
-    if buffer:
+        pos = 0
+        chunk_len = len(chunk)
+        while pos < chunk_len:
+            newline_idx = chunk.find(b"\n", pos)
+            if discarding_tail:
+                if newline_idx == -1:
+                    oversized_total_bytes += chunk_len - pos
+                    pos = chunk_len
+                else:
+                    oversized_total_bytes += newline_idx - pos
+                    await _flush_line(bytes(buffer), true_byte_length=oversized_total_bytes)
+                    buffer.clear()
+                    discarding_tail = False
+                    oversized_total_bytes = 0
+                    pos = newline_idx + 1
+                continue
+
+            if newline_idx != -1:
+                seg_len = newline_idx - pos
+                total_len = len(buffer) + seg_len
+                if total_len > byte_cap:
+                    room = max(0, byte_cap - len(buffer))
+                    if room:
+                        buffer.extend(chunk[pos : pos + room])
+                    bounded = bytes(buffer)
+                    buffer.clear()
+                    await _flush_line(bounded, true_byte_length=total_len)
+                elif buffer:
+                    buffer.extend(chunk[pos:newline_idx])
+                    complete = bytes(buffer)
+                    buffer.clear()
+                    await _flush_line(complete, true_byte_length=len(complete))
+                else:
+                    direct = chunk[pos:newline_idx]
+                    await _flush_line(direct, true_byte_length=len(direct))
+                pos = newline_idx + 1
+            else:
+                remaining = chunk_len - pos
+                room = byte_cap - len(buffer)
+                if remaining <= room:
+                    buffer.extend(chunk[pos:])
+                else:
+                    if room > 0:
+                        buffer.extend(chunk[pos : pos + room])
+                    discarding_tail = True
+                    oversized_total_bytes = len(buffer) + (remaining - max(0, room))
+                pos = chunk_len
+
+    if buffer or discarding_tail:
         tail = bytes(buffer)
-        line_ns = time.monotonic_ns()
-        await sink.emit("server_stderr", **_emit_line(tail))
-        if observer is not None:
-            await observer.on_stderr_line(tail, line_ns)
+        final_len = oversized_total_bytes if discarding_tail else len(tail)
+        buffer.clear()
+        await _flush_line(tail, true_byte_length=final_len)

@@ -24,14 +24,12 @@ REDACTION_FAILED_MARKER = "[REDACTION_FAILED_WITHHELD]"
 _MAX_RECURSION_DEPTH = 64
 _MAX_RECORDED_PATHS = 128
 
-_PEM_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----"
-)
-_ESCAPED_PEM_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----[^\"]*?-----END [A-Z0-9 _-]*PRIVATE KEY-----"
-)
+_PEM_BEGIN_RE = re.compile(r"-----BEGIN [A-Z0-9 _-]{0,32}?PRIVATE KEY-----")
+_PEM_END_RE = re.compile(r"-----END [A-Z0-9 _-]{0,32}?PRIVATE KEY-----")
 _JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b")
-_URL_USERINFO_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]{0,31}+://)([^/\s:@?#]+:[^/\s@?#]*)@")
+_URL_USERINFO_RE = re.compile(
+    r"([a-zA-Z][a-zA-Z0-9+.-]{0,31}+://)(?:[^/\s:@?#]+:[^/\s@?#]*|[^/\s:@?#]*:[^/\s@?#]+)@"
+)
 
 _SAFE_COMPACT_KEYS = frozenset(
     {
@@ -77,6 +75,11 @@ _SENSITIVE_KEY_TOKENS = frozenset(
         "set_cookie",
         "connection_string",
         "bearer",
+        "secrets",
+        "tokens",
+        "passwords",
+        "api_keys",
+        "aws_secret_access_key",
     }
 )
 
@@ -89,14 +92,19 @@ _SENSITIVE_CLI_FLAG_NAMES = frozenset(
         "--refresh-token",
         "--client-secret",
         "--secret",
+        "--secret-key",
+        "--signing-key",
         "--password",
         "--passwd",
+        "--passphrase",
         "--private-key",
         "--auth",
         "--authorization",
+        "--bearer",
     }
 )
 
+_ACRONYM_SPLIT_RE = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _KEY_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
@@ -115,6 +123,11 @@ class RedactionConfig:
             raise ValueError(f"Unsupported redaction_mode: {self.mode!r}")
         if self.max_text_chars < 0:
             raise ValueError("max_text_chars must be non-negative")
+        for pattern in self.extra_secret_patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"Invalid extra_secret_patterns regex {pattern!r}: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,8 +148,33 @@ class RedactedValueOutcome:
 
 
 def _normalize_key_snake(key: str) -> str:
-    camel_split = _KEY_SPLIT_RE.sub(r"\1_\2", key)
+    acronym_split = _ACRONYM_SPLIT_RE.sub(r"\1_\2", key)
+    camel_split = _KEY_SPLIT_RE.sub(r"\1_\2", acronym_split)
     return _NON_ALNUM_RE.sub("_", camel_split.lower()).strip("_")
+
+
+def _redact_pem_blocks(text: str) -> tuple[str, int]:
+    """Scan linearly for bounded PEM private key blocks to prevent ReDoS."""
+    if "-----BEGIN " not in text or "-----END " not in text:
+        return text, 0
+    out: list[str] = []
+    pos = 0
+    count = 0
+    while True:
+        begin_match = _PEM_BEGIN_RE.search(text, pos)
+        if begin_match is None:
+            break
+        end_match = _PEM_END_RE.search(text, begin_match.end())
+        if end_match is None:
+            break
+        out.append(text[pos : begin_match.start()])
+        out.append(REDACTED_KEY_BLOCK_MARKER)
+        pos = end_match.end()
+        count += 1
+    if count == 0:
+        return text, 0
+    out.append(text[pos:])
+    return "".join(out), count
 
 
 def _is_safe_key(key: str) -> bool:
@@ -178,31 +216,39 @@ class EventRedactor:
         if norm in self._extra_sensitive_snake:
             return True
         parts = norm.split("_") if norm else []
-        if parts and parts[-1] in {"secret", "password", "passwd", "passphrase", "token"}:
+        if parts and parts[-1] in {
+            "secret",
+            "secrets",
+            "password",
+            "passwords",
+            "passwd",
+            "passphrase",
+            "token",
+            "tokens",
+        }:
             return True
         return any(
             norm.endswith(suffix)
-            for suffix in ("_api_key", "_private_key", "_secret_key", "_signing_key")
+            for suffix in (
+                "_api_key",
+                "_private_key",
+                "_secret_key",
+                "_signing_key",
+                "_access_key",
+            )
         )
 
     def _redact_string_impl(self, text: str) -> tuple[str, int]:
-        findings = 0
-        current = text
-
-        for regex, replacement in (
-            (_PEM_PRIVATE_KEY_RE, REDACTED_KEY_BLOCK_MARKER),
-            (_ESCAPED_PEM_PRIVATE_KEY_RE, REDACTED_KEY_BLOCK_MARKER),
-        ):
-            current, count = regex.subn(replacement, current)
-            findings += count
+        current, findings = _redact_pem_blocks(text)
 
         # Pre-check literal delimiters before running URL regex on multi-MiB strings.
         if "://" in current and "@" in current:
             current, count = _URL_USERINFO_RE.subn(rf"\1{REDACTED_MARKER}@", current)
             findings += count
 
-        current, count = _JWT_RE.subn(REDACTED_MARKER, current)
-        findings += count
+        if "eyJ" in current:
+            current, count = _JWT_RE.subn(REDACTED_MARKER, current)
+            findings += count
 
         after_protocol = _protocol_redact_text(current)
         if after_protocol != current:
@@ -237,9 +283,14 @@ class EventRedactor:
         if isinstance(value, Mapping):
             out: dict[str, Any] = {}
             for raw_k, raw_v in value.items():
-                k = str(raw_k)
+                raw_key_str = str(raw_k)
+                k, key_findings = self._redact_string_impl(raw_key_str)
                 child_path = f"{path}.{k}" if path else k
-                if self._is_sensitive_key(k):
+                if key_findings > 0:
+                    findings[0] += key_findings
+                    if len(paths) < _MAX_RECORDED_PATHS:
+                        paths.append(child_path or "$")
+                if self._is_sensitive_key(raw_key_str):
                     out[k] = self._redact_sensitive_subtree(
                         raw_v, child_path, paths, findings, depth + 1
                     )
@@ -400,8 +451,9 @@ class EventRedactor:
                 ),
             )
 
-        truncated = len(redacted) > limit
-        bounded = redacted[:limit]
+        effective_limit = max(0, limit)
+        truncated = len(redacted) > effective_limit
+        bounded = redacted[:effective_limit]
         return RedactedTextOutcome(
             text=bounded,
             truncated=truncated,
@@ -571,6 +623,64 @@ def merge_redaction_summaries(
         redacted_paths=tuple(seen_paths),
         error="; ".join(errors) if errors else None,
     )
+
+
+def scrub_event_dict_withheld(
+    raw_event: dict[str, Any],
+    *,
+    redactor: EventRedactor,
+    failure_replacement: str | None = None,
+) -> dict[str, Any]:
+    """Fail-closed scrubbing of a serialized ``ExecutionEvent`` dictionary.
+
+    Used by recovery spooling and spool import under ``strict_hash_only`` or
+    when standard redaction fails so raw wire, error, and trace data cannot leak.
+    """
+    out = copy.deepcopy(raw_event)
+    payload = out.get("payload")
+    if isinstance(payload, dict):
+        for key in (
+            "params",
+            "result",
+            "error",
+            "error_message",
+            "error_data",
+            "value",
+            "text",
+            "raw_bytes_b64",
+            "redacted_lossy_text",
+            "cwd",
+        ):
+            if key in payload:
+                payload[key] = None
+        for key in ("extra_fields", "details", "redacted_env_overrides"):
+            if key in payload:
+                payload[key] = {}
+        for key in ("unanswered_request_ids", "env_override_keys"):
+            if key in payload:
+                payload[key] = []
+        if "body" in payload:
+            payload["body"] = {}
+        if "command" in payload and isinstance(payload["command"], list):
+            if failure_replacement is not None:
+                payload["command"] = [failure_replacement]
+            else:
+                safe_cmd, _ = redactor.redact_command([str(c) for c in payload["command"]])
+                payload["command"] = list(safe_cmd)
+        if failure_replacement is not None:
+            for req_str_key in ("error", "message"):
+                if req_str_key in payload and isinstance(payload[req_str_key], str):
+                    payload[req_str_key] = failure_replacement
+            if payload.get("kind") == "child_shutdown_escalate":
+                payload["error"] = None
+
+    trace = out.get("trace")
+    if isinstance(trace, dict) and "observed_tracestate" in trace:
+        trace["observed_tracestate"] = None
+    derived = out.get("derived")
+    if isinstance(derived, dict) and "otel_attributes" in derived:
+        derived["otel_attributes"] = {}
+    return out
 
 
 __all__ = [

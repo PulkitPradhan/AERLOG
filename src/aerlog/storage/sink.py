@@ -14,7 +14,7 @@ from aerlog.storage.exceptions import StorageWriteError
 
 
 class PersistentCaptureSink:
-    """Implements Phase 4 ``CaptureSink`` over ``events.jsonl`` and ``aerlog.db``."""
+    """Implements ``CaptureSink`` over ``events.jsonl`` and ``aerlog.db``."""
 
     def __init__(
         self,

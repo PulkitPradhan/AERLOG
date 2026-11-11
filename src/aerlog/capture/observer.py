@@ -1,4 +1,4 @@
-"""Bridge between Phase 3 StdioProxy hooks and Phase 4 CapturePipeline."""
+"""Bridge between StdioProxy hooks and CapturePipeline."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from aerlog.events.types import WireDirection
 
 
 class CaptureProxyObserver:
-    """Implements Phase 3 ``ProxyObserver`` hooks to feed a :class:`CapturePipeline`."""
+    """Implements ``ProxyObserver`` hooks to feed a :class:`CapturePipeline`."""
 
     def __init__(
         self,
@@ -59,6 +59,7 @@ class CaptureProxyObserver:
     ) -> None:
         """Initialize and start the capture pipeline for one proxy session."""
         _ = monotonic_time_ns
+        self._last_summary = None
         pipeline = CapturePipeline(
             self._sink,
             command=command,

@@ -1,4 +1,4 @@
-"""Production Phase 3 transparent MCP stdio proxy orchestrator."""
+"""Transparent bidirectional MCP stdio proxy orchestrator."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
+from aerlog.capture.redaction import EventRedactor, RedactionConfig
 from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES, FrameTooLargeError
-from aerlog.protocol.jsonrpc import redact_text
 from aerlog.proxy.diagnostics import (
     BackpressurePolicy,
     DiagnosticConfig,
@@ -74,6 +74,8 @@ class ProxyConfig:
             raise ValueError("ProxyConfig.max_frame_bytes must be positive")
         if self.chunk_size <= 0:
             raise ValueError("ProxyConfig.chunk_size must be positive")
+        if self.grace_before_term < 0 or self.grace_before_kill < 0 or self.drain_timeout < 0:
+            raise ValueError("Timeout settings must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,57 +157,64 @@ class StdioProxy:
                 termination_reason="diagnostic_write_failed",
             )
 
-        redacted_cmd = [redact_text(part) for part in cfg.command]
+        safe_cmd, _ = EventRedactor(RedactionConfig(mode="standard")).redact_command(cfg.command)
+        redacted_cmd = list(safe_cmd)
         loop = asyncio.get_running_loop()
         owns_stdout = stdout_writer is None
-        if stdin_reader is None or stdout_writer is None:
-            pipe_reader, pipe_writer = await open_stdio_pipes(loop, cfg.chunk_size)
-            if stdin_reader is None:
-                stdin_reader = pipe_reader
-            if stdout_writer is None:
-                stdout_writer = pipe_writer
-
         managed: ManagedProcess | None = None
-        if observer is not None:
-            await observer.on_execution_started(
-                command=cfg.command,
-                cwd=cfg.cwd,
-                env_overrides=cfg.env,
-                monotonic_time_ns=time.monotonic_ns(),
-            )
         try:
-            managed = await spawn_mcp_server(
-                cfg.command,
-                cwd=cfg.cwd,
-                env=cfg.env,
-                chunk_size=cfg.chunk_size,
-            )
-        except SpawnError as exc:
-            await sink.emit("server_spawn_failed", command=redacted_cmd, error=str(exc))
+            if stdin_reader is None or stdout_writer is None:
+                pipe_reader, pipe_writer = await open_stdio_pipes(loop, cfg.chunk_size)
+                if stdin_reader is None:
+                    stdin_reader = pipe_reader
+                if stdout_writer is None:
+                    stdout_writer = pipe_writer
+
             if observer is not None:
-                await observer.on_transport_error(
-                    None, "spawn_failed", str(exc), time.monotonic_ns()
+                await observer.on_execution_started(
+                    command=cfg.command,
+                    cwd=cfg.cwd,
+                    env_overrides=cfg.env,
+                    monotonic_time_ns=time.monotonic_ns(),
                 )
-                await observer.on_execution_finished(
-                    termination_reason="spawn_failed",
+            try:
+                managed = await spawn_mcp_server(
+                    cfg.command,
+                    cwd=cfg.cwd,
+                    env=cfg.env,
+                    chunk_size=cfg.chunk_size,
+                )
+            except SpawnError as exc:
+                await sink.emit("server_spawn_failed", command=redacted_cmd, error=str(exc))
+                if observer is not None:
+                    await observer.on_transport_error(
+                        None, "spawn_failed", str(exc), time.monotonic_ns()
+                    )
+                    await observer.on_execution_finished(
+                        termination_reason="spawn_failed",
+                        exit_code=exc.exit_code,
+                        returncode=None,
+                    )
+                return ProxyResult(
                     exit_code=exc.exit_code,
-                    returncode=None,
+                    client_frames=0,
+                    server_frames=0,
+                    diagnostic_write_errors=sink.write_errors,
+                    dropped_diagnostics=sink.dropped_count,
+                    diagnostics_complete=sink.is_complete,
+                    oversized_error=None,
+                    termination_reason="spawn_failed",
                 )
-            await sink.close()
-            if owns_stdout:
-                with suppress(OSError, BrokenPipeError, ConnectionResetError):
-                    stdout_writer.close()
-                    await stdout_writer.wait_closed()
-            return ProxyResult(
-                exit_code=exc.exit_code,
-                client_frames=0,
-                server_frames=0,
-                diagnostic_write_errors=sink.write_errors,
-                dropped_diagnostics=sink.dropped_count,
-                diagnostics_complete=sink.is_complete,
-                oversized_error=None,
-                termination_reason="spawn_failed",
-            )
+        finally:
+            if managed is None:
+                if owns_stdout and stdout_writer is not None:
+                    with suppress(OSError, BrokenPipeError, ConnectionResetError):
+                        stdout_writer.close()
+                        await stdout_writer.wait_closed()
+                await sink.close()
+
+        assert stdin_reader is not None
+        assert stdout_writer is not None
 
         proc = managed.process
         assert proc.stdin is not None
@@ -306,6 +315,8 @@ class StdioProxy:
                         termination_reason = "frame_too_large"
                         break
                     if c2s_exc is not None:
+                        termination_reason = "transport_error"
+                        exit_code = 1
                         raise c2s_exc
                     c2s_result = c2s_task.result()
                     if not pending:
@@ -319,6 +330,8 @@ class StdioProxy:
                         termination_reason = "frame_too_large"
                         break
                     if s2c_done_exc is not None:
+                        termination_reason = "transport_error"
+                        exit_code = 1
                         raise s2c_done_exc
                     s2c_result = s2c_task.result()
                     with suppress(TimeoutError):

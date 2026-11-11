@@ -8,7 +8,7 @@
 
 A local-first observability, debugging, and reliability workbench for MCP-powered AI agents.
 
-[![Status](https://img.shields.io/badge/status-early%20development-blue)](#project-status)
+[![Status](https://img.shields.io/badge/status-cli%20workbench-blue)](#project-status)
 [![Protocol](https://img.shields.io/badge/protocol-MCP-7c3aed)](https://modelcontextprotocol.io/)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776ab)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
@@ -155,7 +155,7 @@ The initial release is not intended to be:
 
 ## Core Capabilities
 
-The following capabilities describe the intended product. They are not claims that the features have already been implemented.
+Capabilities **1–5** below (stdio execution capture, timeline reconstruction, deterministic failure diagnostics, offline cassette replay, and deterministic regression export) are **implemented and tested**. Capability **6** (local web cockpit) and **live replay execution** remain **planned / not yet implemented** (live replay is blocked fail-closed by policy).
 
 ### 1. MCP Execution Capture
 
@@ -244,11 +244,11 @@ Potential exported material:
 
 The goal is to turn a debugging session into a repeatable test that can be executed locally or in CI.
 
-### 6. Local Developer Cockpit
+### 6. Local Developer Cockpit *(Planned — Not Yet Implemented)*
 
-The first interface is a CLI.
+The current interface is a full terminal **CLI**.
 
-A local web cockpit is a later milestone, intended to provide:
+A local web cockpit (FastAPI + browser UI) is a deferred milestone intended to eventually expose:
 
 - Execution discovery and search.
 - Chronological event timelines.
@@ -380,7 +380,7 @@ flowchart TB
 | Persistence | Stores the event stream and queryable execution metadata. |
 | Execution analysis | Reconstructs timelines and generates evidence-backed diagnostics. |
 | Replay and export | Loads recordings, controls replay behavior, and generates regression fixtures. |
-| Application interface | Coordinates user workflows through the CLI and future cockpit. |
+| Application interface | Coordinates user workflows through the CLI (with future cockpit deferred). |
 
 The proxy and capture pipeline are deliberately separated. Analysis should not be responsible for maintaining a live transport connection, and storage should not contain protocol-forwarding logic.
 
@@ -498,7 +498,7 @@ The intended dependency direction is:
 
 ```mermaid
 flowchart TB
-    UI["User Interfaces<br/>CLI / Future Web Cockpit"]
+    UI["User Interfaces<br/>CLI (Implemented) / Web Cockpit (Deferred)"]
 
     APP["Application Layer<br/>Execution Workflows"]
 
@@ -680,22 +680,29 @@ A conceptual event envelope:
 }
 ```
 
-This is an illustrative schema, not a finalized wire format.
-
-### Event Categories
+Note: this snippet illustrates the logical envelope concept. The implemented Pydantic schema in [`src/aerlog/events/models.py`](src/aerlog/events/models.py) includes schema versioning, SHA-256 checksums, `WireFrameInfo`, `TraceContext`, `CorrelationInfo`, `RedactionSummary`, and event kinds:
 
 | Event kind | Description |
 |---|---|
-| `process_started` | Server subprocess successfully started. |
-| `process_stderr` | Server emitted diagnostic output. |
-| `jsonrpc_request` | A JSON-RPC request was observed. |
-| `jsonrpc_response` | A JSON-RPC response was observed. |
-| `jsonrpc_notification` | A notification was observed. |
-| `transport_error` | A forwarding or transport error occurred. |
-| `timeout` | A timeout was observed or declared by AERLOG. |
-| `process_exited` | Server subprocess terminated. |
-| `capture_warning` | A limitation or recording issue occurred. |
-| `capture_gap` | A known gap exists in the recorded event sequence. |
+| `execution_started` | Proxy capture session initialized (with redacted command). |
+| `execution_finished` | Session finalized with exit status, counts, and completeness status. |
+| `process_stderr` | Server stderr diagnostic output captured off stdout. |
+| `jsonrpc_request` | A JSON-RPC request frame was observed. |
+| `jsonrpc_response` | A JSON-RPC success response frame was observed. |
+| `jsonrpc_error` | A JSON-RPC error response frame was observed. |
+| `jsonrpc_notification` | A JSON-RPC notification frame was observed. |
+| `jsonrpc_unknown_object` | A JSON object without standard request/response/error/notification keys. |
+| `non_object_json_frame` | Valid UTF-8 JSON value whose root is not an object (e.g., list or primitive). |
+| `malformed_json_frame` | Valid UTF-8 frame that failed JSON parsing. |
+| `malformed_utf8_frame` | Wire frame containing invalid UTF-8 bytes. |
+| `incomplete_trailing_frame` | Unterminated trailing bytes flushed at EOF. |
+| `frame_too_large` | Fail-closed marker emitted when a frame exceeds `max_frame_bytes`. |
+| `transport_error` | Transport pipe closure, spawn failure, or I/O error observed at the proxy boundary. |
+| `proxy_signal` | OS signal (`SIGINT`/`SIGTERM`) or cancellation handled by the proxy. |
+| `child_shutdown_escalate` | Process-group `SIGTERM`/`SIGKILL` escalation marker. |
+| `process_exited` | Child MCP server subprocess termination event. |
+| `capture_warning` | Non-fatal warning regarding redaction, correlation, or recovery spooling. |
+| `capture_gap` | Explicit non-silent loss marker emitted under `mark_incomplete` or failure. |
 
 ### Core Fields
 
@@ -778,31 +785,33 @@ Responsibilities:
 
 SQLite should be treated as an index and metadata store, not as an independent source of truth that can silently contradict the event log.
 
-### C. Conceptual Storage Layout
+### C. Storage Layout
 
 ```text
-~/.local/share/aerlog/
-│
-├── config.toml
+~/.local/share/aerlog/                    # Default XDG_DATA_HOME/aerlog (configurable)
 │
 ├── executions/
-│   ├── <execution-id>/
-│   │   ├── events.jsonl
-│   │   ├── execution.json
-│   │   └── manifest.json
-│   │
 │   └── <execution-id>/
-│       ├── events.jsonl
-│       ├── execution.json
-│       └── manifest.json
+│       ├── events.jsonl                  # 0o600 append-only event log with SHA-256 lines
+│       ├── execution.json                # 0o600 execution header/summary metadata
+│       └── manifest.json                 # 0o600 integrity manifest
 │
-├── aerlog.db
+├── spool/
+│   └── <execution-id>.ndjson.spool       # 0o600 recovery spool if primary sink stalls
 │
-└── logs/
-    └── aerlog.log
+├── cassettes/
+│   └── <cassette-id>.cassette.json       # 0o600 SHA-256-sealed offline replay cassettes
+│
+├── replays/
+│   └── <replay-id>/
+│       └── report.json                   # 0o600 isolated replay divergence reports
+│
+└── aerlog.db                             # 0o600 SQLite WAL index & migration metadata
+
+~/.config/aerlog/config.toml              # Optional runtime TOML configuration
 ```
 
-The final location should follow operating-system conventions and remain configurable.
+Paths follow XDG Base Directory conventions (`$XDG_DATA_HOME/aerlog`, `$XDG_CONFIG_HOME/aerlog`) and are overridable via `--data-dir`, `--config`, or `$AERLOG_CONFIG`.
 
 ### D. Storage Integrity
 
@@ -922,7 +931,7 @@ Redaction must be testable and predictable. AERLOG must not silently present a m
 
 # Repository Structure
 
-The following is the proposed modular repository layout. It describes the intended architecture, not a claim that all modules currently exist.
+The implemented repository layout is structured cleanly across modular packages:
 
 ```text
 aerlog/
@@ -934,140 +943,89 @@ aerlog/
 ├── .gitignore
 ├── .python-version
 │
-├── docs/
-│   ├── architecture/
-│   │   ├── overview.md
-│   │   ├── capture-pipeline.md
-│   │   ├── event-model.md
-│   │   ├── storage.md
-│   │   ├── replay-and-safety.md
-│   │   └── decisions/
-│   │       ├── 0001-python-core.md
-│   │       ├── 0002-stdio-proxy-first.md
-│   │       └── 0003-jsonl-and-sqlite.md
-│   │
-│   ├── protocol/
-│   │   └── compatibility.md
-│   │
-│   ├── security/
-│   │   └── threat-model.md
-│   │
-│   └── development/
-│       └── testing.md
-│
 ├── src/
 │   └── aerlog/
 │       ├── __init__.py
 │       ├── __main__.py
 │       │
 │       ├── cli/
-│       │   ├── app.py
-│       │   └── commands/
-│       │       ├── run.py
-│       │       ├── list.py
-│       │       ├── inspect.py
-│       │       ├── timeline.py
-│       │       ├── replay.py
-│       │       └── export.py
-│       │
-│       ├── application/
-│       │   ├── execution.py
-│       │   ├── inspection.py
-│       │   ├── replay.py
-│       │   └── export.py
+│       │   ├── app.py                   # Typer CLI commands & workflow orchestration
+│       │   └── render.py                # Safe Rich terminal & JSON serializers
 │       │
 │       ├── proxy/
-│       │   ├── manager.py
-│       │   ├── subprocess.py
-│       │   ├── forwarding.py
-│       │   └── lifecycle.py
+│       │   ├── diagnostics.py           # Bounded off-stdout DiagnosticSink
+│       │   ├── forwarding.py            # Bidirectional stdio & bounded stderr pumps
+│       │   ├── stdio_proxy.py           # Transparent StdioProxy orchestrator
+│       │   └── subprocess.py            # POSIX session launch & PGID escalation
 │       │
 │       ├── protocol/
-│       │   ├── framing.py
-│       │   ├── jsonrpc.py
-│       │   ├── messages.py
-│       │   └── compatibility.py
+│       │   ├── framing.py               # Bounded FrameAccumulator & line endings
+│       │   └── jsonrpc.py               # Read-only frame inspection & redaction
 │       │
 │       ├── capture/
-│       │   ├── reader.py
-│       │   ├── pipeline.py
-│       │   ├── normalizer.py
-│       │   └── redaction.py
+│       │   ├── normalizer.py            # Wire/lifecycle event normalization
+│       │   ├── observer.py              # CaptureProxyObserver bridge
+│       │   ├── pipeline.py              # Bounded queue, backpressure & spill durability
+│       │   ├── redaction.py             # Pre-persistence redaction & fail-safe withholding
+│       │   └── sinks.py                 # CaptureSink protocol & 0o600 RecoverySpool
 │       │
 │       ├── events/
-│       │   ├── models.py
-│       │   ├── types.py
-│       │   └── correlation.py
+│       │   ├── correlation.py           # FIFO ID matching, progressTokens & traces
+│       │   ├── ids.py                   # UUIDs, synthetic trace IDs & W3C traceparent
+│       │   ├── models.py                # Versioned Pydantic event & summary schemas
+│       │   └── types.py                 # Literal/Enum contracts & OTel attribute keys
 │       │
 │       ├── storage/
-│       │   ├── event_log.py
-│       │   ├── database.py
-│       │   ├── repositories.py
-│       │   └── migrations/
+│       │   ├── database.py              # SQLite WAL index & busy-timeout store
+│       │   ├── event_log.py             # 0o600 JSONL writer/reader & integrity manifests
+│       │   ├── exceptions.py            # Typed storage/corruption/version errors
+│       │   ├── repositories.py          # Unified retrieval, reconciliation & spool import
+│       │   ├── retention.py             # Dry-run & opt-in retention pruning
+│       │   ├── sink.py                  # PersistentCaptureSink coordinator
+│       │   └── migrations/              # Transactional BEGIN IMMEDIATE SQLite migrations
 │       │
 │       ├── analysis/
-│       │   ├── timeline.py
-│       │   ├── diagnostics.py
-│       │   └── rules/
+│       │   ├── diagnostics.py           # Evidence-linked deterministic diagnostics engine
+│       │   ├── timeline.py              # Chronological timeline & span reconstruction
+│       │   └── rules/                   # Modular protocol, timeout, exit & retry rules
 │       │
 │       ├── replay/
-│       │   ├── cassette.py
-│       │   ├── runner.py
-│       │   └── safety.py
+│       │   ├── cassette.py              # Sealed SHA-256 cassette schema & builder
+│       │   ├── matcher.py               # Slot-consumed strict/tolerant offline matcher
+│       │   ├── runner.py                # Offline replay runner & mock MCP stdio server
+│       │   └── safety.py                # Side-effect classifier & fail-closed live block
 │       │
 │       ├── export/
-│       │   └── regression.py
+│       │   ├── regression.py            # Deterministic uuid5 fixture & pytest codegen
+│       │   └── sanitizer.py             # Secret redaction & volatile field normalizer
 │       │
 │       └── config/
-│           ├── loader.py
-│           └── schema.py
+│           ├── loader.py                # TOML/XDG configuration loader
+│           └── schema.py                # Strict Pydantic AerlogConfig models
 │
 ├── tests/
-│   ├── unit/
-│   │   ├── test_framing.py
-│   │   ├── test_correlation.py
-│   │   ├── test_redaction.py
-│   │   ├── test_diagnostics.py
-│   │   └── test_event_models.py
-│   │
-│   ├── integration/
-│   │   ├── test_stdio_proxy.py
-│   │   ├── test_capture_pipeline.py
-│   │   ├── test_storage_recovery.py
-│   │   └── test_cassette_replay.py
-│   │
-│   ├── fixtures/
-│   │   ├── servers/
-│   │   └── recordings/
-│   │
-│   └── conftest.py
+│   ├── unit/                            # Framing, correlation, redaction, models, rules, CLI, replay, export
+│   ├── integration/                     # Stdio proxy, SDK auto/legacy, capture, recovery, CLI, faults & scale
+│   └── conftest.py                      # XDG isolation fixtures
 │
-├── examples/
-│   ├── demo_mcp_server.py
-│   ├── timeout_scenario.py
-│   └── repeated_call_scenario.py
-│
-└── web/                         # Future local cockpit
-    ├── package.json
-    ├── src/
-    └── README.md
+└── examples/
+    └── protocol-spike/                  # Local protocol verification spike scripts
 ```
 
 ### Module Boundaries
 
 | Module | Ownership |
 |---|---|
-| `cli/` | Parses commands and presents results. |
-| `application/` | Coordinates complete user-facing workflows. |
-| `proxy/` | Owns subprocess and stream lifecycle. |
-| `protocol/` | Owns message framing and JSON-RPC interpretation. |
-| `capture/` | Owns observation, normalization, and redaction. |
-| `events/` | Owns event contracts and correlation primitives. |
-| `storage/` | Owns persistence and retrieval. |
-| `analysis/` | Owns timelines and diagnostic rules. |
-| `replay/` | Owns cassette behavior and replay safety. |
-| `export/` | Owns portable regression test generation. |
-| `config/` | Owns runtime configuration and validation. |
+| `cli/` | Parses commands, coordinates workflows, and renders safe terminal/JSON output. |
+| `proxy/` | Owns subprocess sessions, POSIX process-group cleanup, and stdio forwarding. |
+| `protocol/` | Owns newline-delimited framing limits and read-only JSON-RPC frame inspection. |
+| `capture/` | Owns event normalization, bounded queues, redaction, and `0o600` recovery spooling. |
+| `events/` | Owns Pydantic event contracts, correlation state, and trace identifiers. |
+| `storage/` | Owns `0o600` append-only JSONL logs, SQLite WAL indexes, migrations, and recovery. |
+| `analysis/` | Owns chronological timelines and deterministic, evidence-backed diagnostic rules. |
+| `replay/` | Owns cassette schemas, slot matching, offline mock serving, and replay safety gates. |
+| `export/` | Owns deterministic SHA-256 regression fixtures and portable `pytest` file generation. |
+| `config/` | Owns XDG/TOML runtime configuration loading and validation. |
 
 Keep the application modular. Introduce additional processes or services only when a demonstrated requirement justifies them.
 
@@ -1088,10 +1046,10 @@ The initial stack prioritizes correctness, maintainability, and local execution.
 | Event persistence | JSONL | Simple, inspectable, append-oriented records. |
 | Metadata database | SQLite | Local indexing and queries without a separate service. |
 | CLI | Typer + Rich | Readable terminal interface. |
-| Local API (later) | FastAPI | Backend for the future cockpit. |
-| Web UI (later) | React + TypeScript + Vite | Familiar developer-facing interface. |
-| Testing | pytest | Unit, integration, and fixture-based tests. |
-| Code quality | Ruff | Linting and formatting. |
+| Local API *(deferred)* | FastAPI | Planned backend for the future local cockpit *(not yet implemented)*. |
+| Web UI *(deferred)* | React + TypeScript + Vite | Planned browser cockpit *(not yet implemented)*. |
+| Testing | `pytest` + `pytest-asyncio` | Unit, integration, fault-injection, and fixture tests. |
+| Code quality & typing | `ruff` + `mypy --strict` | Linting, formatting, and static type checking. |
 | Optional telemetry | OpenTelemetry | Future trace-context interoperability. |
 
 ### Why Not Start With...?
@@ -1118,48 +1076,29 @@ The MVP should prove one complete, useful engineering workflow:
 
 ### Milestone Plan
 
-- [ ] **M0 — Protocol spike**
-  - Study MCP stdio transport behavior.
-  - Build a minimal test MCP server and client.
-  - Verify message framing and process lifecycle.
+- [x] **M0 — Protocol spike** (`examples/protocol-spike/`)
+  - Verified MCP stdio transport behavior, message framing, and process lifecycle.
 
-- [ ] **M1 — Transparent proxy**
-  - Launch a configured server subprocess.
-  - Forward traffic in both directions.
-  - Preserve stdout protocol integrity.
-  - Handle cancellation and subprocess cleanup.
+- [x] **M1 — Transparent proxy** (`aerlog.proxy`, `aerlog.protocol`)
+  - Launches configured server subprocesses in isolated POSIX sessions, preserves stdout byte-for-byte, and enforces bounded frames plus signal/orphan cleanup.
 
-- [ ] **M2 — Event capture**
-  - Capture requests, responses, and notifications.
-  - Record process and transport events.
-  - Normalize events and persist them.
+- [x] **M2 — Event capture** (`aerlog.capture`, `aerlog.storage`)
+  - Captures requests, responses, notifications, stderr, and lifecycle events with bounded queues, pre-persistence redaction, `0o600` recovery spooling, JSONL logs, and SQLite WAL indexes.
 
-- [ ] **M3 — Correlation and timeline**
-  - Match requests and responses.
-  - Preserve event ordering.
-  - Build a readable execution timeline.
+- [x] **M3 — Correlation and timeline** (`aerlog.events`, `aerlog.analysis.timeline`)
+  - Matches request/response pairs and `progressToken` streams, preserves unknown fields/ID types, and builds chronological timelines.
 
-- [ ] **M4 — Deterministic diagnostics**
-  - Detect missing responses.
-  - Identify observed timeouts.
-  - Capture explicit protocol errors.
-  - Detect unexpected process termination.
+- [x] **M4 — Deterministic diagnostics** (`aerlog.analysis.diagnostics`)
+  - Detects missing responses, timeouts, explicit JSON-RPC/tool errors, unexpected exits, malformed frames, and repeated calls with verifiable evidence citations.
 
-- [ ] **M5 — Cassette replay**
-  - Load stored executions.
-  - Validate recording integrity.
-  - Replay recorded responses without contacting the original server.
+- [x] **M5 — Cassette replay** (`aerlog.replay`)
+  - Builds SHA-256-sealed cassettes, validates integrity, enforces side-effect gating, serves offline cassette responses (`--mode cassette` / `--serve`), and blocks live replay fail-closed.
 
-- [ ] **M6 — Regression export**
-  - Generate portable fixtures.
-  - Produce repeatable protocol tests.
-  - Verify exported tests against deterministic scenarios.
+- [x] **M6 — Regression export** (`aerlog.export`)
+  - Generates deterministic sanitized `.fixture.json` artifacts and static `pytest` regression suites with offline drift verification.
 
-- [ ] **M7 — Local cockpit**
-  - Add execution discovery.
-  - Visualize event timelines.
-  - Inspect diagnostics and payloads.
-  - Provide replay and export controls.
+- [ ] **M7 — Local cockpit *(deferred / not implemented)***
+  - Planned web discovery, visual timelines, and browser UI.
 
 ### MVP Acceptance Criteria
 
@@ -1185,7 +1124,7 @@ AERLOG exposes the full local capture, inspection, diagnostics, offline replay, 
 
 ```bash
 # Start a server through the transparent stdio capture proxy
-aerlog run -- python examples/demo_mcp_server.py
+aerlog run -- python path/to/mcp_server.py
 
 # List recorded executions (`aerlog list` is an alias for `aerlog executions list`)
 aerlog list
@@ -1378,13 +1317,24 @@ Optional agent-side instrumentation may eventually supply explicit task IDs, mod
 
 Such metadata must be clearly distinguished from information observed by the proxy.
 
-## Initial Transport Scope
+## Initial Transport & Verified Compatibility Matrix
 
-The first implementation targets **MCP stdio transport**.
+The implemented capture target is **MCP stdio transport** (Streamable HTTP/SSE transports remain future work).
 
-Additional transports should be considered after the stdio capture pipeline is reliable and their protocol and lifecycle requirements have been evaluated.
+| Dimension | Verified Status | Notes |
+|---|---|---|
+| Python | **3.11+ supported**; tested on **CPython 3.12.15** | Uses Python 3.11+ stdlib (`tomllib`, `asyncio`, `datetime.UTC`). |
+| Official MCP Python SDK | **Tested against `mcp==2.3.0`** | End-to-end capture, timeline, offline `--serve` replay, and fixture export verified for both **`mode="legacy"`** (`2024-11-05`–`2025-11-25`) and **`mode="auto"`** (`2026-07-28`, `server/discover`). |
+| Operating systems | **Linux / POSIX primary** | Uses POSIX sessions (`start_new_session=True`), process groups (`os.killpg`), and `0o600`/`0o700` file modes. |
+| Frame & line limits | `16 MiB` default `max_frame_bytes`; `256 KiB` capped per-line stderr buffer | Oversized wire frames fail closed cleanly (`exit 65`); multi-MiB valid frames pass cleanly. |
 
-Compatibility claims should be tied to tested MCP SDK and protocol versions.
+## Known Limitations
+
+- **Stdio transport only:** HTTP/SSE MCP transports are not intercepted yet.
+- **Live replay blocked:** `--mode live` is intentionally blocked fail-closed (exit `1`); replay runs strictly offline via sealed cassettes (`--mode cassette` / `--serve`).
+- **Best-effort unstructured redaction:** Structured secret keys, PEM private keys, JWTs, URL userinfo credentials, auth schemes, and known token prefixes are redacted before persistence/export, and `--redaction-mode strict_hash_only` withholds payloads completely; unstructured arbitrary secrets without matching patterns/keys cannot be guaranteed removable in `standard` mode.
+- **No `SIGKILL` recovery guarantee for in-flight buffers:** Graceful exit and `SIGINT`/`SIGTERM` drain and flush capture buffers cleanly; abrupt `SIGKILL` leaves un-flushed in-memory queue events unrecorded (prior committed JSONL lines remain intact and inspectable).
+- **Local web cockpit & FastAPI backend not yet implemented:** Use the CLI workbench for all recording, inspection, diagnostics, replay, and export workflows.
 
 ---
 
@@ -1411,15 +1361,12 @@ The project should continuously compare its workflow against existing tools and 
 
 # Development Setup
 
-The following describes the intended development workflow. Update commands and dependencies when the initial implementation is established.
-
 ## Requirements
 
-- Python 3.11 or newer.
+- Python 3.11 or newer (tested on CPython 3.12.15).
 - Git.
 - `uv` (recommended) or `pip`.
-- A Unix-like environment for the initial subprocess development path.
-- An MCP-compatible test client and server for integration testing.
+- Linux / POSIX environment (uses POSIX sessions and process groups for subprocess cleanup).
 
 ## Clone the Repository
 
@@ -1430,23 +1377,20 @@ cd aerlog
 
 ## Install Development Dependencies
 
-Once the project configuration is implemented:
-
 ```bash
-uv sync --all-extras
+uv sync
 ```
 
 ## Run Tests and Checks
 
 ```bash
 uv run pytest
-
 uv run ruff check .
-
 uv run ruff format --check .
+uv run mypy src tests
 ```
 
-The exact dependency groups and commands should remain synchronized with `pyproject.toml`.
+The exact dependency groups and tool configurations are defined in [`pyproject.toml`](pyproject.toml).
 
 ## Suggested Development Workflow
 
@@ -1523,13 +1467,18 @@ These are exploratory directions, not commitments. Prioritize them only after th
 
 # Project Status
 
-> **Early design and implementation planning.**
+> **CLI Workbench Implemented & Hardened (v0.1.0.dev0).**
 
-The architecture, repository structure, CLI commands, and milestones in this README describe the intended direction of AERLOG. They should not be interpreted as evidence that the listed features, interfaces, compatibility guarantees, or performance characteristics are already implemented.
+### Implemented vs. Planned Summary
 
-The first engineering objective is to build a transparent stdio proxy and a trustworthy event capture pipeline.
-
-More ambitious functionality should be earned through tested, observable foundations.
+| Area | Status | Details |
+|---|---|---|
+| Transparent stdio proxy & framing | **Implemented** | `aerlog run -- <cmd>`, `16 MiB` bounded framing, POSIX process-group cleanup, capped stderr capture. |
+| Capture pipeline & redaction | **Implemented** | Bounded queue (`block`/`spill`/`mark_incomplete`), linear-time redaction + `strict_hash_only`, `0o600` recovery spooling. |
+| JSONL + SQLite persistence | **Implemented** | SHA-256 JSONL logs, transactional SQLite WAL migrations, corrupt-tail recovery, dry-run/confirmed retention. |
+| Timeline & deterministic diagnostics | **Implemented** | Chronological spans, `progressToken`/W3C trace correlation, evidence-linked failure rules (`aerlog diagnose`). |
+| Offline cassette replay & regression export | **Implemented** | SHA-256 cassettes, safety re-classification, mock stdio `--serve`, fail-closed live block, static `pytest` export. |
+| Local Web Cockpit / FastAPI / HTTP transport | **Deferred** | Not yet implemented; all workflows run locally via the CLI. |
 
 ---
 

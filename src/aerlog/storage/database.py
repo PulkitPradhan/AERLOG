@@ -132,6 +132,10 @@ class SQLiteMetadataStore:
         persist_cwd: bool = False,
         busy_timeout_ms: int = 5000,
     ) -> None:
+        if synchronous not in ("NORMAL", "FULL"):
+            raise ValueError(f"Unsupported sqlite_synchronous mode: {synchronous!r}")
+        if busy_timeout_ms < 0:
+            raise ValueError("busy_timeout_ms must be non-negative")
         self._data_dir = data_dir
         self._db_path = (data_dir / DB_FILE_NAME) if db_path is None else db_path
         self._synchronous: SqliteSynchronousMode = synchronous
@@ -142,10 +146,12 @@ class SQLiteMetadataStore:
 
     @property
     def db_path(self) -> Path:
+        """Path to the SQLite database file."""
         return self._db_path
 
     @property
     def is_open(self) -> bool:
+        """Whether a SQLite connection is currently active."""
         return self._conn is not None
 
     def _restrict_sqlite_files(self) -> None:
@@ -648,17 +654,21 @@ class SQLiteMetadataStore:
         if not execution_ids:
             return 0
         clean_ids = [validate_execution_id(eid) for eid in execution_ids]
+        deleted = 0
         with self._lock:
             conn = self._conn_or_init()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                placeholders = ", ".join("?" for _ in clean_ids)
-                cur = conn.execute(
-                    f"DELETE FROM executions WHERE execution_id IN ({placeholders})",
-                    clean_ids,
-                )
+                for offset in range(0, len(clean_ids), 500):
+                    chunk = clean_ids[offset : offset + 500]
+                    placeholders = ", ".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM executions WHERE execution_id IN ({placeholders})",
+                        chunk,
+                    )
+                    deleted += cur.rowcount
                 conn.commit()
-                return cur.rowcount
+                return deleted
             except sqlite3.Error as exc:
                 with suppress(sqlite3.Error):
                     conn.rollback()

@@ -137,8 +137,13 @@ def save_replay_report(report: ReplayReport, *, data_dir: Path) -> Path:
 def load_replay_report(replay_id: str, *, data_dir: Path) -> ReplayReport:
     """Load and strictly validate a previously saved :class:`ReplayReport`."""
     target = resolve_replay_report_path(data_dir, replay_id)
-    decoded = json.loads(target.read_text(encoding="utf-8"))
-    return ReplayReport.model_validate(decoded)
+    if target.is_symlink():
+        raise CassetteValidationError(f"Refusing symlink replay report: {target}")
+    try:
+        decoded = json.loads(target.read_text(encoding="utf-8"))
+        return ReplayReport.model_validate(decoded)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise CassetteValidationError(f"Failed loading replay report {target}: {exc}") from exc
 
 
 class CassetteReplaySession:

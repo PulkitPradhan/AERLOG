@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from rich import box
 from rich.console import Console
@@ -23,6 +22,7 @@ from aerlog.analysis.timeline import (
 )
 from aerlog.capture.redaction import EventRedactor, RedactionConfig
 from aerlog.events.models import ExecutionEvent
+from aerlog.events.types import RedactionMode
 from aerlog.export.regression import (
     RegressionExportBundleResult,
     RegressionFixture,
@@ -63,7 +63,10 @@ def _defensive_redact_command_args(command: Sequence[str], *, redaction_mode: st
     """Apply defense-in-depth redaction on display command args without mutating storage."""
     if redaction_mode == "explicit_unredacted":
         return list(command)
-    redactor = EventRedactor(RedactionConfig(mode="standard"))
+    effective_mode: RedactionMode = (
+        "strict_hash_only" if redaction_mode == "strict_hash_only" else "standard"
+    )
+    redactor = EventRedactor(RedactionConfig(mode=effective_mode))
     safe_cmd, _ = redactor.redact_command(command)
     return list(safe_cmd)
 
@@ -74,9 +77,16 @@ def _defensive_redact_command(command: Sequence[str], *, redaction_mode: str) ->
     return " ".join(safe_cmd) if safe_cmd else "-"
 
 
-def _render_to_str(render_fn: Any) -> str:
+def _render_to_str(render_fn: Callable[[Console], None]) -> str:
     buf = io.StringIO()
-    console = Console(file=buf, force_terminal=False, color_system=None, width=140)
+    console = Console(
+        file=buf,
+        force_terminal=False,
+        color_system=None,
+        width=140,
+        markup=False,
+        highlight=False,
+    )
     render_fn(console)
     return buf.getvalue()
 
@@ -413,11 +423,16 @@ def render_diagnostics_text(report: DiagnosticReport) -> str:
         )
         console.print(f"Req Timeout: {timeout_txt}")
         sev = report.counts_by_severity
+        filtered_suffix = (
+            f"; unfiltered_total={report.unfiltered_total_diagnostics}"
+            if report.unfiltered_total_diagnostics != report.total_diagnostics
+            else ""
+        )
         console.print(
             f"Findings:    total={report.total_diagnostics} "
             f"(critical={sev.get('critical', 0)}, error={sev.get('error', 0)}, "
             f"warning={sev.get('warning', 0)}, info={sev.get('info', 0)}; "
-            f"min_severity={report.min_severity})"
+            f"min_severity={report.min_severity}{filtered_suffix})"
         )
 
         if not report.diagnostics:
@@ -844,9 +859,10 @@ def render_run_start_stderr(
     *,
     execution_id: str,
     command: Sequence[str],
+    redaction_mode: str = "standard",
 ) -> str:
     """Format a concise redaction-safe proxy start notice exclusively for ``stderr``."""
-    safe_cmd = _defensive_redact_command(command, redaction_mode="standard")
+    safe_cmd = _defensive_redact_command(command, redaction_mode=redaction_mode)
     return f"[aerlog] Recording MCP execution {execution_id} (cmd={safe_cmd!r})\n"
 
 
@@ -862,8 +878,7 @@ def render_run_summary_stderr(
     data_dir: Path,
 ) -> str:
     """Format a concise redaction-safe proxy run summary exclusively for ``stderr``."""
-    _ = redaction_mode
-    safe_cmd = _defensive_redact_command(command, redaction_mode="standard")
+    safe_cmd = _defensive_redact_command(command, redaction_mode=redaction_mode)
     return (
         f"[aerlog] execution={execution_id} status={termination_reason} "
         f"exit_code={exit_code} frames={client_frames}/{server_frames} "

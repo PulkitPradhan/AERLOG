@@ -8,7 +8,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
-from aerlog.capture.redaction import EventRedactor, RedactionConfig
+from aerlog.capture.redaction import (
+    REDACTION_FAILED_MARKER,
+    EventRedactor,
+    RedactionConfig,
+    scrub_event_dict_withheld,
+)
 from aerlog.config.schema import default_data_dir
 from aerlog.events.models import ExecutionEvent, ExecutionHeader, ExecutionSummary
 
@@ -43,25 +48,33 @@ class InMemoryCaptureSink:
         self.closed = False
 
     async def on_start(self, header: ExecutionHeader) -> None:
+        """Record execution header in memory."""
         self.header = header
 
     async def emit_events(self, events: Sequence[ExecutionEvent]) -> None:
+        """Append normalized events in memory."""
         self.events.extend(events)
 
     async def on_finish(self, summary: ExecutionSummary) -> None:
+        """Record finalized execution summary in memory."""
         self.summary = summary
 
     async def flush(self) -> None:
+        """Increment in-memory flush counter."""
         self.flush_count += 1
 
     async def close(self) -> None:
+        """Mark the in-memory sink closed."""
         self.closed = True
 
 
 def _open_strict_spool_file(path: Path) -> TextIO:
     """Open or create ``path`` in append mode strictly restricted to owner ``0o600``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
     try:
         os.chmod(fd, 0o600)
     except OSError:
@@ -72,8 +85,21 @@ def _open_strict_spool_file(path: Path) -> TextIO:
 
 def default_spool_path(execution_id: str, spill_dir: Path | None = None) -> Path:
     """Return local recovery spool file path for ``execution_id``."""
+    if (
+        not execution_id
+        or "\x00" in execution_id
+        or "/" in execution_id
+        or "\\" in execution_id
+        or execution_id in {".", ".."}
+        or ".." in execution_id
+    ):
+        raise ValueError(f"Invalid execution_id for recovery spool path: {execution_id!r}")
     root = default_data_dir() / "spool" if spill_dir is None else spill_dir
-    return root / f"{execution_id}.ndjson.spool"
+    resolved_root = root.resolve()
+    target = (resolved_root / f"{execution_id}.ndjson.spool").resolve()
+    if not target.is_relative_to(resolved_root) or target.parent != resolved_root:
+        raise ValueError(f"Path containment violation for spool execution_id: {execution_id!r}")
+    return target
 
 
 class RecoverySpool:
@@ -122,26 +148,56 @@ class RecoverySpool:
                 f"redaction_mode={mode!r}"
             )
 
-        # Defense in depth: verify serialized payload/derived/wire data conform to active redaction.
-        payload_dict = raw_obj.get("payload")
+        # Verify serialized payload, derived, and trace fields conform to active redaction.
         if mode == "strict_hash_only":
-            if isinstance(payload_dict, dict):
-                for key in ("params", "result", "error", "body", "text", "value", "extra_fields"):
-                    if key in payload_dict and payload_dict[key] is not None:
-                        payload_dict[key] = None
-        else:
-            redacted_payload = self._redactor.redact_value(payload_dict, root_path="spool.payload")
-            if redacted_payload.summary.degraded:
-                raw_obj["degraded"] = True
-                raw_obj["payload"] = {"kind": event.kind}
-            else:
-                raw_obj["payload"] = redacted_payload.value
+            return scrub_event_dict_withheld(raw_obj, redactor=self._redactor)
+
+        if event.redaction.payload_mode == "redaction_failed" or event.degraded:
+            return scrub_event_dict_withheld(
+                raw_obj,
+                redactor=self._redactor,
+                failure_replacement=REDACTION_FAILED_MARKER,
+            )
+
+        payload_dict = raw_obj.get("payload")
+        redacted_payload = self._redactor.redact_value(payload_dict, root_path="spool.payload")
+        if redacted_payload.summary.degraded:
+            secured = scrub_event_dict_withheld(
+                raw_obj,
+                redactor=self._redactor,
+                failure_replacement=REDACTION_FAILED_MARKER,
+            )
+            secured["degraded"] = True
+            return secured
+        raw_obj["payload"] = redacted_payload.value
+
+        trace = raw_obj.get("trace")
+        if isinstance(trace, dict) and isinstance(trace.get("observed_tracestate"), str):
+            ts_out = self._redactor.redact_text_value(
+                trace["observed_tracestate"], path_label="spool.trace.observed_tracestate"
+            )
+            trace["observed_tracestate"] = (
+                REDACTION_FAILED_MARKER if ts_out.summary.degraded else ts_out.text
+            )
+        derived = raw_obj.get("derived")
+        if isinstance(derived, dict) and isinstance(derived.get("otel_attributes"), dict):
+            otel_out = self._redactor.redact_value(
+                derived["otel_attributes"], root_path="spool.derived.otel_attributes"
+            )
+            derived["otel_attributes"] = {} if otel_out.summary.degraded else otel_out.value
         return raw_obj
 
     def _write_line(self, record_type: str, data: dict[str, Any]) -> None:
         self.open()
         assert self._stream is not None
-        line = json.dumps({"record_type": record_type, "data": data}, ensure_ascii=False) + "\n"
+        line = (
+            json.dumps(
+                {"record_type": record_type, "data": data},
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        )
         self._stream.write(line)
         self._stream.flush()
         self._record_count += 1
@@ -170,6 +226,23 @@ class RecoverySpool:
             data["command"] = list(safe_cmd)
             if self._redactor.config.mode == "strict_hash_only":
                 data["cwd"] = None
+                data["unanswered_request_ids"] = []
+                data["observed_mcp_protocol_versions"] = []
+            else:
+                ids_out = self._redactor.redact_value(
+                    list(summary.unanswered_request_ids),
+                    root_path="spool.summary.unanswered_request_ids",
+                )
+                vers_out = self._redactor.redact_value(
+                    list(summary.observed_mcp_protocol_versions),
+                    root_path="spool.summary.observed_mcp_protocol_versions",
+                )
+                data["unanswered_request_ids"] = (
+                    [] if ids_out.summary.degraded else list(ids_out.value or [])
+                )
+                data["observed_mcp_protocol_versions"] = (
+                    [] if vers_out.summary.degraded else list(vers_out.value or [])
+                )
         self._write_line("summary", data)
 
     def flush(self) -> None:

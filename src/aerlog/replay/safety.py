@@ -28,6 +28,7 @@ _PROTOCOL_CONTROL_METHODS: Final[frozenset[str]] = frozenset(
         "notifications/initialized",
         "notifications/progress",
         "ping",
+        "server/discover",
     }
 )
 
@@ -36,40 +37,57 @@ _DISCOVERY_READ_METHODS: Final[frozenset[str]] = frozenset(
         "prompts/list",
         "resources/list",
         "resources/templates/list",
+        "roots/list",
         "tools/list",
     }
 )
 
 _MUTATING_VERBS: Final[frozenset[str]] = frozenset(
     {
+        "append",
+        "chmod",
+        "chown",
+        "commit",
         "create",
         "delete",
         "deploy",
         "drop",
+        "edit",
+        "eval",
         "exec",
         "execute",
         "insert",
         "kill",
         "modify",
         "mutate",
+        "mv",
         "patch",
         "pay",
         "post",
         "publish",
+        "purge",
+        "push",
         "put",
         "remove",
+        "rename",
         "reset",
         "rm",
         "run",
+        "save",
         "send",
+        "set",
         "shell",
+        "spawn",
         "transfer",
         "trigger",
+        "truncate",
         "update",
+        "upsert",
         "write",
     }
 )
 
+_ACRONYM_BOUNDARY_RE: Final[re.Pattern[str]] = re.compile(r"([A-Z]+)([A-Z][a-z])")
 _CAMEL_BOUNDARY_RE: Final[re.Pattern[str]] = re.compile(r"([a-z0-9])([A-Z])")
 _TOKEN_SPLIT_RE: Final[re.Pattern[str]] = re.compile(r"[^a-z0-9]+")
 
@@ -79,7 +97,7 @@ class ReplayError(Exception):
 
 
 class LiveReplayBlockedError(ReplayError):
-    """Raised whenever live replay is requested; live execution is blocked in Phase 8."""
+    """Raised whenever live replay is requested; offline cassette replay only is permitted."""
 
 
 class UnredactedCassetteRefusedError(ReplayError):
@@ -126,7 +144,8 @@ class SafetyAuditNotice(BaseModel):
 
 
 def _tokenize_name(raw_name: str) -> set[str]:
-    snake = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", raw_name).lower()
+    acronym_split = _ACRONYM_BOUNDARY_RE.sub(r"\1_\2", raw_name)
+    snake = _CAMEL_BOUNDARY_RE.sub(r"\1_\2", acronym_split).lower()
     return {tok for tok in _TOKEN_SPLIT_RE.split(snake) if tok}
 
 

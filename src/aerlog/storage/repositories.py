@@ -11,7 +11,13 @@ from typing import Any, Literal
 
 from pydantic import ValidationError
 
-from aerlog.capture.redaction import EventRedactor, RedactionConfig, merge_redaction_summaries
+from aerlog.capture.redaction import (
+    REDACTION_FAILED_MARKER,
+    EventRedactor,
+    RedactionConfig,
+    merge_redaction_summaries,
+    scrub_event_dict_withheld,
+)
 from aerlog.events.models import (
     ExecutionEvent,
     ExecutionHeader,
@@ -246,10 +252,12 @@ class RecordingRepository:
 
     @property
     def data_dir(self) -> Path:
+        """Root AERLOG data directory managed by this repository."""
         return self._data_dir
 
     @property
     def store(self) -> SQLiteMetadataStore:
+        """SQLite metadata store backing indexed queries."""
         return self._store
 
     def initialize(self) -> None:
@@ -366,13 +374,14 @@ class RecordingRepository:
         sequence: int,
         *,
         verify_checksum: bool = True,
+        strict_integrity: bool = False,
     ) -> ExecutionEvent:
         """Retrieve a single stored event by ``execution_id`` and 1-based ``sequence``."""
         if sequence < 1:
             raise ValueError(f"sequence must be >= 1, got {sequence}")
         read_res = self.get_execution_events(
             execution_id,
-            strict_integrity=False,
+            strict_integrity=strict_integrity,
             verify_checksums=verify_checksum,
             mark_missing=False,
         )
@@ -551,7 +560,9 @@ class RecordingRepository:
         redaction_mode: RedactionMode = "standard",
         fsync_policy: FsyncPolicy = "lifecycle",
     ) -> SpoolImportReport:
-        """Validate, redact, deduplicate, and import a Phase 4 ``0o600`` recovery spool."""
+        """Validate, redact, deduplicate, and import a ``0o600`` local recovery spool."""
+        if spool_path.is_symlink():
+            raise StorageCorruptionError(f"Refusing symlink recovery spool: {spool_path}")
         if not spool_path.exists():
             raise ExecutionNotFoundError(f"Recovery spool not found: {spool_path}")
 
@@ -585,7 +596,7 @@ class RecordingRepository:
                 body = raw_line[:-1].rstrip(b"\r")
                 try:
                     decoded = json.loads(body.decode("utf-8", errors="strict"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
                     corrupt_lines.append(
                         CorruptRecordReport(
                             execution_id="unknown",
@@ -598,7 +609,7 @@ class RecordingRepository:
                                 else "invalid_json"
                             ),
                             excerpt_sha256=line_hash,
-                            details=f"Spool line {line_no} malformed: {exc}",
+                            details=f"Spool line {line_no} malformed: {type(exc).__name__}",
                         )
                     )
                     offset += line_len
@@ -654,6 +665,11 @@ class RecordingRepository:
                             )
                         )
                 except (ValidationError, ValueError) as exc:
+                    err_summary = (
+                        f"ValidationError ({exc.error_count()} errors)"
+                        if isinstance(exc, ValidationError)
+                        else f"ValueError: {type(exc).__name__}"
+                    )
                     corrupt_lines.append(
                         CorruptRecordReport(
                             execution_id="unknown",
@@ -662,7 +678,7 @@ class RecordingRepository:
                             byte_length=line_len,
                             issue_kind="event_validation_failed",
                             excerpt_sha256=line_hash,
-                            details=f"Spool line {line_no} validation failed: {exc}",
+                            details=f"Spool line {line_no} validation failed: {err_summary}",
                         )
                     )
                 offset += line_len
@@ -773,38 +789,73 @@ def _re_redact_event(event: ExecutionEvent, *, redactor: EventRedactor) -> Execu
     if mode == "explicit_unredacted":
         return event
 
-    raw_payload = event.payload.model_dump(mode="json")
+    raw_event = event.model_dump(mode="python")
     if mode == "strict_hash_only":
-        for key in ("params", "result", "error", "body", "text", "value", "extra_fields"):
-            if key in raw_payload and raw_payload[key] is not None:
-                raw_payload[key] = None
-        return ExecutionEvent.model_validate(
-            {
-                **event.model_dump(mode="python"),
-                "payload": raw_payload,
-                "redaction": event.redaction.model_copy(
-                    update={"mode": mode, "payload_mode": "strict_hash_only", "applied": True}
-                ).model_dump(mode="python"),
-            }
-        )
+        scrubbed = scrub_event_dict_withheld(raw_event, redactor=redactor)
+        scrubbed["redaction"] = event.redaction.model_copy(
+            update={"mode": mode, "payload_mode": "strict_hash_only", "applied": True}
+        ).model_dump(mode="python")
+        return ExecutionEvent.model_validate(scrubbed)
 
+    raw_payload = event.payload.model_dump(mode="json")
     outcome = redactor.redact_value(raw_payload, root_path="spool.payload")
     if outcome.summary.degraded or not isinstance(outcome.value, dict):
         merged = merge_redaction_summaries(mode, [event.redaction, outcome.summary])
-        return event.model_copy(
-            update={
-                "degraded": True,
-                "redaction": merged.model_copy(update={"degraded": True}),
-            }
+        # Fail closed: never allow raw payload/trace/otel fields through when redaction fails.
+        scrubbed = scrub_event_dict_withheld(
+            raw_event,
+            redactor=redactor,
+            failure_replacement=REDACTION_FAILED_MARKER,
         )
+        scrubbed["degraded"] = True
+        scrubbed["redaction"] = merged.model_copy(
+            update={"applied": False, "degraded": True, "payload_mode": "redaction_failed"}
+        ).model_dump(mode="python")
+        return ExecutionEvent.model_validate(scrubbed)
 
     redacted_payload_dict = dict(outcome.value)
     redacted_payload_dict["kind"] = event.kind
-    base_applied = event.redaction.model_copy(update={"mode": mode, "applied": True})
-    merged_summary = merge_redaction_summaries(mode, [base_applied, outcome.summary])
+    summaries = [
+        event.redaction.model_copy(update={"mode": mode, "applied": True}),
+        outcome.summary,
+    ]
+
+    trace_dict = raw_event.get("trace")
+    if isinstance(trace_dict, dict) and isinstance(trace_dict.get("observed_tracestate"), str):
+        ts_out = redactor.redact_text_value(
+            trace_dict["observed_tracestate"], path_label="spool.trace.observed_tracestate"
+        )
+        summaries.append(ts_out.summary)
+        trace_dict["observed_tracestate"] = None if ts_out.summary.degraded else ts_out.text
+
+    derived_dict = raw_event.get("derived")
+    if isinstance(derived_dict, dict) and isinstance(derived_dict.get("otel_attributes"), dict):
+        otel_out = redactor.redact_value(
+            derived_dict["otel_attributes"], root_path="spool.derived.otel_attributes"
+        )
+        summaries.append(otel_out.summary)
+        derived_dict["otel_attributes"] = (
+            {}
+            if otel_out.summary.degraded or not isinstance(otel_out.value, dict)
+            else otel_out.value
+        )
+
+    merged_summary = merge_redaction_summaries(mode, summaries)
+    if merged_summary.degraded:
+        scrubbed = scrub_event_dict_withheld(
+            raw_event,
+            redactor=redactor,
+            failure_replacement=REDACTION_FAILED_MARKER,
+        )
+        scrubbed["degraded"] = True
+        scrubbed["redaction"] = merged_summary.model_copy(
+            update={"applied": False, "degraded": True, "payload_mode": "redaction_failed"}
+        ).model_dump(mode="python")
+        return ExecutionEvent.model_validate(scrubbed)
+
     return ExecutionEvent.model_validate(
         {
-            **event.model_dump(mode="python"),
+            **raw_event,
             "payload": redacted_payload_dict,
             "redaction": merged_summary.model_dump(mode="python"),
         }

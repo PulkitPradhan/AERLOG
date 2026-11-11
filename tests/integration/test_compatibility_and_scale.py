@@ -382,9 +382,8 @@ async def test_mcp_sdk_auto_and_legacy_modes_record_replay_serve_and_export(
     # Remove server script completely to guarantee replay serve runs strictly offline.
     srv_script.unlink()
 
-    # Known Phase 8 safety classification limit: MCP 2026-07-28 `server/discover` is not yet
-    # classified under _PROTOCOL_CONTROL_METHODS/_DISCOVERY_READ_METHODS in replay/safety.py,
-    # so strict auto replay/export requires --allow-mutating while legacy mode passes directly.
+    # MCP 2026-07-28 `server/discover` is classified as protocol_control, so strict
+    # auto-mode offline replay, --serve, and regression export pass without --allow-mutating.
     serve_args = [
         "-m",
         "aerlog",
@@ -396,8 +395,7 @@ async def test_mcp_sdk_auto_and_legacy_modes_record_replay_serve_and_export(
         str(data_dir),
     ]
     if mode == "auto":
-        # Verify default policy explicitly blocks server/discover before --allow-mutating opt-in.
-        blocked_auto = _run_aerlog_cli(
+        clean_auto = _run_aerlog_cli(
             "replay",
             exec_id,
             "--fail-on-divergence",
@@ -407,12 +405,20 @@ async def test_mcp_sdk_auto_and_legacy_modes_record_replay_serve_and_export(
             "--json",
             env=env,
         )
-        assert blocked_auto.returncode == 2
+        assert clean_auto.returncode == 0, clean_auto.stderr
+        rep_json = json.loads(clean_auto.stdout)
+        assert rep_json["overall_status"] == "clean_match"
         assert any(
-            step["method"] == "server/discover" and step["outcome_kind"] == "blocked_unsafe_tool"
-            for step in json.loads(blocked_auto.stdout)["steps"]
+            step["method"] == "server/discover"
+            and step["side_effect_class"] == "protocol_control"
+            and step["outcome_kind"] == "matched_ok"
+            for step in rep_json["steps"]
         )
-        serve_args.append("--allow-mutating")
+        cass_res = _run_aerlog_cli(
+            "cassette", "create", exec_id, "--data-dir", str(data_dir), "--json", env=env
+        )
+        assert cass_res.returncode == 0, cass_res.stderr
+        assert "2026-07-28" in json.loads(cass_res.stdout).get("observed_mcp_protocol_versions", [])
 
     serve_params = StdioServerParameters(
         command=_PYTHON,
@@ -438,8 +444,6 @@ async def test_mcp_sdk_auto_and_legacy_modes_record_replay_serve_and_export(
         str(data_dir),
         "--json",
     ]
-    if mode == "auto":
-        exp_args.append("--allow-mutating")
     exp_proc = _run_aerlog_cli(*exp_args, env=env)
     assert exp_proc.returncode == 0, exp_proc.stderr
     ver_proc = _run_aerlog_cli(

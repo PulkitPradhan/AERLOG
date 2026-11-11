@@ -1,4 +1,4 @@
-"""Deterministic multi-event behavioral pattern rules (Phase 7 approved subset)."""
+"""Deterministic multi-event behavioral pattern rules for diagnostics."""
 
 from __future__ import annotations
 

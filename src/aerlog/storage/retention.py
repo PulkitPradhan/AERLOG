@@ -57,7 +57,7 @@ def _execution_dir_bytes(data_dir: Path, execution_id: str) -> int:
         return 0
     total = 0
     for child in exec_dir.rglob("*"):
-        if child.is_file():
+        if child.is_file() and not child.is_symlink():
             total += child.stat().st_size
     return total
 

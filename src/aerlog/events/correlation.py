@@ -290,7 +290,11 @@ class RequestCorrelator:
         if method == "initialize" and isinstance(params, Mapping):
             observed_ver = self._record_protocol_version(params.get("protocolVersion"))
         elif isinstance(params, Mapping) and isinstance(params.get("_meta"), Mapping):
-            observed_ver = self._record_protocol_version(params["_meta"].get("mcpProtocolVersion"))
+            meta = params["_meta"]
+            observed_ver = self._record_protocol_version(
+                meta.get("mcpProtocolVersion")
+                or meta.get("io.modelcontextprotocol/protocolVersion")
+            )
 
         trace_ctx = self._extract_trace(params, warnings)
 

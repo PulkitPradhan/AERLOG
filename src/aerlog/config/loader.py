@@ -97,6 +97,9 @@ def load_config(
             raise ConfigNotFoundError(f"Configuration file not found: {config_path}")
         return AerlogConfig(data_dir=default_data_dir(environ))
 
+    if config_path.is_symlink():
+        raise ConfigValidationError(f"Refusing symlink configuration path: {config_path}")
+
     if config_path.is_dir():
         raise ConfigValidationError(
             f"Configuration path is a directory, expected a TOML file: {config_path}"
@@ -109,7 +112,7 @@ def load_config(
 
     try:
         parsed: dict[str, Any] = tomllib.loads(raw_text)
-    except tomllib.TOMLDecodeError as exc:
+    except (tomllib.TOMLDecodeError, RecursionError) as exc:
         raise ConfigParseError(f"Invalid TOML in {config_path}: {exc}") from exc
 
     payload: dict[str, Any] = dict(parsed)

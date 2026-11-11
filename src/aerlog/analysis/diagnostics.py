@@ -376,6 +376,14 @@ class DiagnosticContext:
         elif not steps:
             steps.append(f"aerlog timeline {self.execution_id}")
 
+        safe_observed: dict[str, Any] = {}
+        if observed_values:
+            obs_out = self.redactor.redact_value(
+                dict(observed_values), root_path=f"diagnostic.{code}.observed_values"
+            )
+            if not obs_out.summary.degraded and isinstance(obs_out.value, dict):
+                safe_observed = obs_out.value
+
         return DiagnosticDraft(
             code=code,
             category=category,
@@ -386,7 +394,7 @@ class DiagnosticContext:
                 what_was_observed, path_label=f"diagnostic.{code}.observed", max_chars=500
             ),
             evidence=ev_tuple,
-            observed_values=dict(observed_values or {}),
+            observed_values=safe_observed,
             reasonable_conclusions=tuple(reasonable_conclusions),
             cannot_be_concluded=tuple(cannot_be_concluded),
             additional_evidence_needed=tuple(additional_evidence_needed),

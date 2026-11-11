@@ -342,18 +342,22 @@ class JsonlEventLogWriter:
 
     @property
     def execution_id(self) -> str:
+        """Execution UUID targeted by this JSONL log writer."""
         return self._execution_id
 
     @property
     def execution_dir(self) -> Path:
+        """Per-execution storage directory."""
         return self._exec_dir
 
     @property
     def events_path(self) -> Path:
+        """Path to ``events.jsonl`` inside the execution directory."""
         return self._events_path
 
     @property
     def byte_offset(self) -> int:
+        """Current append byte offset within ``events.jsonl``."""
         return self._byte_offset
 
     def open(self, header: ExecutionHeader) -> ExecutionManifest:
@@ -367,7 +371,10 @@ class JsonlEventLogWriter:
         _ensure_private_dir(self._exec_dir)
 
         try:
-            fd = os.open(self._events_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(self._events_path, flags, 0o600)
             os.chmod(fd, 0o600)
             self._fd = fd
             self._byte_offset = os.lseek(fd, 0, os.SEEK_END)
@@ -537,28 +544,58 @@ class JsonlEventLogReader:
         summary: ExecutionSummary | None = None
         manifest: ExecutionManifest | None = None
 
+        if exec_path.is_symlink():
+            raise StorageCorruptionError(f"Refusing symlink metadata file: {exec_path}")
         if exec_path.exists():
-            raw_exec = json.loads(exec_path.read_text(encoding="utf-8"))
-            if isinstance(raw_exec, dict):
-                _check_major_version(
-                    raw_exec.get("schema_version"),
-                    expected=EVENT_SCHEMA_VERSION,
-                    label="event schema_version",
-                )
-                if "ended_at" in raw_exec:
-                    summary = ExecutionSummary.model_validate(raw_exec)
-                else:
-                    header = ExecutionHeader.model_validate(raw_exec)
+            try:
+                raw_exec = json.loads(exec_path.read_text(encoding="utf-8"))
+                if isinstance(raw_exec, dict):
+                    _check_major_version(
+                        raw_exec.get("schema_version"),
+                        expected=EVENT_SCHEMA_VERSION,
+                        label="event schema_version",
+                    )
+                    if "ended_at" in raw_exec:
+                        summary = ExecutionSummary.model_validate(raw_exec)
+                    else:
+                        header = ExecutionHeader.model_validate(raw_exec)
+            except UnsupportedSchemaVersionError:
+                raise
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValidationError,
+            ) as exc:
+                raise StorageCorruptionError(
+                    f"Corrupt execution metadata file {exec_path}: {type(exc).__name__}"
+                ) from exc
 
+        if manifest_path.is_symlink():
+            raise StorageCorruptionError(f"Refusing symlink manifest file: {manifest_path}")
         if manifest_path.exists():
-            raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if isinstance(raw_manifest, dict):
-                _check_major_version(
-                    raw_manifest.get("storage_schema_version"),
-                    expected=STORAGE_SCHEMA_VERSION,
-                    label="storage_schema_version",
-                )
-                manifest = ExecutionManifest.model_validate(raw_manifest)
+            try:
+                raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(raw_manifest, dict):
+                    _check_major_version(
+                        raw_manifest.get("storage_schema_version"),
+                        expected=STORAGE_SCHEMA_VERSION,
+                        label="storage_schema_version",
+                    )
+                    manifest = ExecutionManifest.model_validate(raw_manifest)
+            except UnsupportedSchemaVersionError:
+                raise
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                RecursionError,
+                ValidationError,
+            ) as exc:
+                raise StorageCorruptionError(
+                    f"Corrupt execution manifest file {manifest_path}: {type(exc).__name__}"
+                ) from exc
 
         return header, summary, manifest
 
@@ -571,8 +608,14 @@ class JsonlEventLogReader:
         verify_checksum: bool = True,
     ) -> ExecutionEvent:
         """Seek directly to one indexed JSONL slice and validate its checksum and schema."""
+        if byte_offset < 0 or byte_length <= 0:
+            raise StorageCorruptionError(
+                f"Invalid event slice bounds offset={byte_offset} len={byte_length}"
+            )
         exec_dir = resolve_execution_dir(self._data_dir, execution_id)
         events_path = exec_dir / EVENTS_FILE_NAME
+        if events_path.is_symlink():
+            raise StorageCorruptionError(f"Refusing symlink events log: {events_path}")
         with events_path.open("rb") as handle:
             handle.seek(byte_offset)
             raw_line = handle.read(byte_length)
@@ -584,7 +627,7 @@ class JsonlEventLogReader:
         decoded, issue = _parse_jsonl_line(
             execution_id=execution_id,
             raw_line=raw_line,
-            line_number=0,
+            line_number=1,
             byte_offset=byte_offset,
             verify_checksum=verify_checksum,
         )
@@ -604,6 +647,8 @@ class JsonlEventLogReader:
         clean_id = validate_execution_id(execution_id)
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         events_path = exec_dir / EVENTS_FILE_NAME
+        if events_path.is_symlink():
+            raise StorageCorruptionError(f"Refusing symlink events log: {events_path}")
         header, summary, manifest = self.read_metadata(clean_id)
 
         valid_events: list[IndexedLogEvent] = []
@@ -761,7 +806,7 @@ def _parse_jsonl_line(
 
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         return None, CorruptRecordReport(
             execution_id=execution_id,
             line_number=line_number,
@@ -769,7 +814,7 @@ def _parse_jsonl_line(
             byte_length=line_len,
             issue_kind="invalid_json",
             excerpt_sha256=line_hash,
-            details=f"Line {line_number} invalid JSON: {exc}",
+            details=f"Line {line_number} invalid JSON: {type(exc).__name__}",
         )
 
     if not isinstance(parsed, dict) or parsed.get("record_type") != "event":
@@ -848,6 +893,10 @@ def _parse_jsonl_line(
     try:
         validated = ExecutionEvent.model_validate(event_obj)
     except ValidationError as exc:
+        locs = ", ".join(
+            ".".join(str(part) for part in err.get("loc", ()))
+            for err in exc.errors(include_url=False, include_input=False)[:5]
+        )
         return None, CorruptRecordReport(
             execution_id=execution_id,
             line_number=line_number,
@@ -855,7 +904,10 @@ def _parse_jsonl_line(
             byte_length=line_len,
             issue_kind="event_validation_failed",
             excerpt_sha256=line_hash,
-            details=f"Line {line_number} failed ExecutionEvent validation: {exc}",
+            details=(
+                f"Line {line_number} failed ExecutionEvent validation "
+                f"({exc.error_count()} errors" + (f": {locs})" if locs else ")")
+            ),
         )
 
     return validated, None

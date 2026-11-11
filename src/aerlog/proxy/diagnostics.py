@@ -1,11 +1,12 @@
 """Bounded off-stdout diagnostic sink with explicit write-failure and backpressure policies.
 
-Note on Phase boundaries:
-    In Phase 3, diagnostic records represent proxy operational telemetry and
-    envelope metadata; dropping diagnostic records under ``drop_with_gap`` while
+Note on backpressure semantics:
+    Diagnostic records represent proxy operational telemetry and envelope
+    metadata; dropping diagnostic records under ``drop_with_gap`` while
     recording an explicit gap count keeps live protocol forwarding unblocked.
-    Phase 4 protocol event capture MUST NOT silently discard protocol events and
-    must instead block, spill to durable storage, or mark executions incomplete.
+    Protocol event capture, by contrast, MUST NOT silently discard protocol
+    events and must instead block, spill to durable storage, or mark executions
+    incomplete.
 
 Note on sensitivity:
     Diagnostic logs may still contain sensitive data (for example in server
@@ -52,12 +53,24 @@ class DiagnosticConfig:
             raise ValueError("preview_max_chars must be non-negative")
         if self.preview_max_hex_bytes < 0:
             raise ValueError("preview_max_hex_bytes must be non-negative")
+        if self.write_policy not in ("degrade", "strict"):
+            raise ValueError(f"Unsupported write_policy: {self.write_policy!r}")
+        if self.backpressure_policy not in ("drop_with_gap", "block"):
+            raise ValueError(f"Unsupported backpressure_policy: {self.backpressure_policy!r}")
 
 
 def _open_restricted_log_file(path: Path) -> TextIO:
     """Open ``path`` for appending UTF-8 text with ``0o600`` permissions on creation."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.chmod(fd, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
     return os.fdopen(fd, "a", encoding="utf-8", buffering=1)
 
 
@@ -229,13 +242,14 @@ class DiagnosticSink:
     def _write_record(self, record: dict[str, Any]) -> bool:
         if self._stream is None:
             return False
-        line = json.dumps(record, ensure_ascii=False) + "\n"
         try:
+            line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
             self._stream.write(line)
             self._stream.flush()
             return True
-        except OSError as exc:
-            self._handle_write_failure(exc, context="writing diagnostic log")
+        except (OSError, TypeError, ValueError) as exc:
+            err = exc if isinstance(exc, OSError) else OSError(str(exc))
+            self._handle_write_failure(err, context="writing diagnostic log")
             return False
 
     def _handle_write_failure(self, exc: OSError, *, context: str) -> None:

@@ -19,18 +19,39 @@ MessageKind = Literal["request", "notification", "response", "error_response", "
 
 _AUTH_SCHEME_RE = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}")
 _TOKEN_PREFIX_RE = re.compile(
-    r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|xox[baprs]-[A-Za-z0-9-]{8,}|AIza[0-9A-Za-z_-]{16,})\b"
+    r"\b(?:"
+    r"sk-[A-Za-z0-9_-]{8,}|"
+    r"(?:sk|pk)_(?:live|test)_[A-Za-z0-9_]{8,}|"
+    r"gh[pousr]_[A-Za-z0-9_]{8,}|"
+    r"github_pat_[A-Za-z0-9_]{8,}|"
+    r"xox[baprs]-[A-Za-z0-9_-]{8,}|"
+    r"AIza[0-9A-Za-z_-]{16,}|"
+    r"(?:AKIA|ASIA)[0-9A-Z]{16}|"
+    r"hf_[A-Za-z0-9]{16,}|"
+    r"npm_[A-Za-z0-9]{16,}|"
+    r"glpat-[A-Za-z0-9_-]{16,}|"
+    r"pypi-[A-Za-z0-9_-]{16,}"
+    r")\b"
 )
-_QUOTED_SECRET_KV_RE = re.compile(
-    r'(?i)(["\']?(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|'
-    r'client[_-]?secret|private[_-]?key|password|passwd|secret|token)["\']?\s*[:=]\s*)'
-    r'(?:"[^"]*"|\'[^\']*\')'
+_KV_NAME = (
+    r"(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"client[_-]?secret|private[_-]?key|secret[_-]?key|password|passwd|secret|token)"
 )
-_UNQUOTED_SECRET_KV_RE = re.compile(
-    r"(?i)(\b(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"client[_-]?secret|private[_-]?key|password|passwd|secret|token)\s*[:=]\s*)"
-    r'(?:(?:bearer|basic)\s+)?([^\s,}&;"\']+)'
+_SECRET_KV_RE = re.compile(
+    rf'(?i)((?:(["\']){_KV_NAME}\2|\b{_KV_NAME})\s*[:=]\s*)'
+    r'(?:(?P<dq>"(?:[^"\\]|\\.)*"|"[^\r\n"]*(?=$|\r|\n))'
+    r"|(?P<sq>'(?:[^'\\]|\\.)*'|'[^\r\n']*(?=$|\r|\n))"
+    r'|(?P<uq>(?:(?:bearer|basic)\s+)?[^\s,}&;"\']+))'
 )
+
+
+def _replace_secret_kv(match: re.Match[str]) -> str:
+    prefix = match.group(1)
+    if match.group("dq") is not None:
+        return f'{prefix}"[REDACTED]"'
+    if match.group("sq") is not None:
+        return f"{prefix}'[REDACTED]'"
+    return f"{prefix}[REDACTED]"
 
 
 def redact_text(text: str) -> str:
@@ -41,8 +62,7 @@ def redact_text(text: str) -> str:
         secrets; diagnostic logs may still carry sensitive text unless payload
         previews are disabled via configuration.
     """
-    redacted = _QUOTED_SECRET_KV_RE.sub(r'\1"[REDACTED]"', text)
-    redacted = _UNQUOTED_SECRET_KV_RE.sub(r"\1[REDACTED]", redacted)
+    redacted = _SECRET_KV_RE.sub(_replace_secret_kv, text)
     redacted = _AUTH_SCHEME_RE.sub(r"\1 [REDACTED]", redacted)
     return _TOKEN_PREFIX_RE.sub("[REDACTED]", redacted)
 
@@ -120,6 +140,8 @@ def inspect_frame(
     Returns:
         Read-only :class:`FrameObservation` summarizing the frame.
     """
+    char_limit = max(0, preview_max_chars)
+    hex_limit = max(0, preview_max_hex_bytes)
     line_ending = detect_line_ending(raw_frame)
     payload = raw_frame[:-1] if raw_frame.endswith(b"\n") else raw_frame
     if payload.endswith(b"\r"):
@@ -128,7 +150,7 @@ def inspect_frame(
     try:
         text = payload.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
-        preview_hex = payload[:preview_max_hex_bytes].hex() if include_previews else None
+        preview_hex = payload[:hex_limit].hex() if include_previews else None
         return FrameObservation(
             direction=direction,
             event_kind="malformed_utf8",
@@ -141,7 +163,12 @@ def inspect_frame(
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
-        preview = redact_text(text)[:preview_max_chars] if include_previews else None
+        preview: str | None = None
+        if include_previews and char_limit > 0:
+            bounded_window = text[: max(char_limit * 8, 4096)]
+            preview = redact_text(bounded_window)[:char_limit]
+        elif include_previews:
+            preview = ""
         return FrameObservation(
             direction=direction,
             event_kind="malformed_json",

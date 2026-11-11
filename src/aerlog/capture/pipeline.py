@@ -35,7 +35,7 @@ from aerlog.capture.normalizer import (
 from aerlog.capture.redaction import RedactionConfig
 from aerlog.capture.sinks import CaptureSink, RecoverySpool, default_spool_path
 from aerlog.events.ids import new_execution_id
-from aerlog.events.models import ExecutionEvent, ExecutionFinishedPayload, ExecutionSummary
+from aerlog.events.models import ExecutionEvent, ExecutionSummary
 from aerlog.events.types import CaptureBackpressurePolicy, RedactionMode
 
 _DEFAULT_MAX_QUEUE_EVENTS = 2048
@@ -147,6 +147,7 @@ class CapturePipeline:
 
         self._worker_task: asyncio.Task[None] | None = None
         self._spill_trigger = asyncio.Event()
+        self._start_lock = asyncio.Lock()
         self._started = False
         self._finalized = False
         self._summary: ExecutionSummary | None = None
@@ -386,19 +387,22 @@ class CapturePipeline:
         """Deliver header + startup events and launch the background consumer task."""
         if self._started:
             return
-        self._started = True
+        async with self._start_lock:
+            if self._started:
+                return
 
-        header = self._normalizer.build_header()
-        ok = await self._call_primary_sink_with_spill_guard(self._sink.on_start(header))
-        if ok:
-            self._sink_delivered_header = True
-        elif self._config.backpressure_policy == "spill" and self._spilled:
-            # Header already written inside _activate_spill.
-            pass
+            header = self._normalizer.build_header()
+            ok = await self._call_primary_sink_with_spill_guard(self._sink.on_start(header))
+            if ok:
+                self._sink_delivered_header = True
+            elif self._config.backpressure_policy == "spill" and self._spilled:
+                # Header already written inside _activate_spill.
+                pass
 
-        startup_events = self._normalizer.start_execution()
-        await self._deliver_events(startup_events)
-        self._worker_task = asyncio.create_task(self._consumer_loop())
+            startup_events = self._normalizer.start_execution()
+            await self._deliver_events(startup_events)
+            self._worker_task = asyncio.create_task(self._consumer_loop())
+            self._started = True
 
     async def enqueue(self, raw_input: RawCaptureInput) -> None:
         """Enqueue a raw observation strictly honoring configured backpressure semantics."""
@@ -520,8 +524,14 @@ class CapturePipeline:
                 if remaining:
                     if self._config.backpressure_policy == "spill":
                         self._activate_spill("drain_timeout", "Worker drain timeout reached")
-                        for raw_rem in remaining:
-                            if self._spilled:
+                        if not self._spilled:
+                            self._record_gap_span(
+                                remaining[-1].monotonic_time_ns,
+                                count=len(remaining),
+                                reason="drain_timeout_spill_failed",
+                            )
+                        else:
+                            for raw_rem in remaining:
                                 try:
                                     self._spool.write_events(self._normalizer.normalize(raw_rem))
                                 except OSError as exc:
@@ -542,22 +552,23 @@ class CapturePipeline:
         trailing_gaps = self._flush_pending_gap_events()
         if trailing_gaps and (self._spilled or self._sink_error is None):
             await self._deliver_events(trailing_gaps)
-        elif trailing_gaps:
-            # Primary sink already dead without spill; still count dropped events accurately.
-            pass
 
         ended_at = datetime.now(UTC)
         monotonic_end_ns = time.monotonic_ns()
-        finished_event, summary = self._normalizer.finalize_execution(
-            ended_at=ended_at,
-            monotonic_end_ns=monotonic_end_ns,
-            termination_reason=termination_reason,
-            exit_code=exit_code,
-            returncode=returncode,
-            spilled=self._spilled,
-            force_incomplete=self._force_incomplete,
-            spool_file=str(self._spool.path) if self._spilled else None,
-        )
+
+        def _build_final() -> tuple[ExecutionEvent, ExecutionSummary]:
+            return self._normalizer.finalize_execution(
+                ended_at=ended_at,
+                monotonic_end_ns=monotonic_end_ns,
+                termination_reason=termination_reason,
+                exit_code=exit_code,
+                returncode=returncode,
+                spilled=self._spilled,
+                force_incomplete=self._force_incomplete,
+                spool_file=str(self._spool.path) if self._spilled else None,
+            )
+
+        finished_event, summary = _build_final()
 
         if self._spilled:
             try:
@@ -566,11 +577,19 @@ class CapturePipeline:
                 self._spool.flush()
             except OSError as exc:
                 self._spool_error = repr(exc)
+                self._force_incomplete = True
+                summary = summary.model_copy(update={"capture_completeness": "incomplete"})
         elif self._sink_error is None:
             ok = await self._call_primary_sink_with_spill_guard(
                 self._sink.emit_events([finished_event])
             )
-            if ok:
+            if not ok:
+                if self._spilled:
+                    finished_event, summary = _build_final()
+                else:
+                    self._force_incomplete = True
+                    summary = summary.model_copy(update={"capture_completeness": "incomplete"})
+            else:
                 try:
                     await asyncio.wait_for(
                         self._sink.on_finish(summary),
@@ -584,17 +603,12 @@ class CapturePipeline:
                     self._sink_error = repr(exc)
                     if self._config.backpressure_policy == "spill":
                         self._activate_spill("finalize_sink_failed", repr(exc))
+                        if not self._spilled:
+                            self._force_incomplete = True
                     else:
                         self._force_incomplete = True
-                        summary = summary.model_copy(update={"capture_completeness": "incomplete"})
-                        if isinstance(finished_event.payload, ExecutionFinishedPayload):
-                            finished_event = finished_event.model_copy(
-                                update={
-                                    "payload": finished_event.payload.model_copy(
-                                        update={"completeness": "incomplete"}
-                                    )
-                                }
-                            )
+                    finished_event, summary = _build_final()
+
             if self._spilled:
                 try:
                     self._spool.write_events([finished_event])
@@ -602,6 +616,11 @@ class CapturePipeline:
                     self._spool.flush()
                 except OSError as exc:
                     self._spool_error = repr(exc)
+                    self._force_incomplete = True
+                    summary = summary.model_copy(update={"capture_completeness": "incomplete"})
+        else:
+            self._force_incomplete = True
+            summary = summary.model_copy(update={"capture_completeness": "incomplete"})
 
         with suppress(Exception):
             await asyncio.wait_for(

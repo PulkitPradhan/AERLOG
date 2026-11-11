@@ -388,6 +388,7 @@ class _MutableSpanBuild:
     uncertainty_notes: list[str] = field(default_factory=list)
 
     def to_model(self) -> TimelineSpan:
+        """Convert mutable span accumulator into an immutable :class:`TimelineSpan`."""
         return TimelineSpan(
             span_id=self.span_id,
             span_kind=self.span_kind,

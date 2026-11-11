@@ -96,6 +96,11 @@ async def spawn_mcp_server(
             start_new_session=True,
         )
     except FileNotFoundError as exc:
+        if cwd is not None and not cwd.exists():
+            raise SpawnError(
+                f"Working directory not found: {cwd} ({exc})",
+                exit_code=1,
+            ) from exc
         raise SpawnError(
             f"Executable not found: {cmd_list[0]} ({exc})",
             exit_code=EXIT_SPAWN_NOT_FOUND,
@@ -198,6 +203,12 @@ async def terminate_process_group(
                 pass
             except PermissionError as exc:
                 kill_err = repr(exc)
+                await sink.emit(
+                    "child_signal_permission_error",
+                    signal="SIGKILL",
+                    pgid=pgid,
+                    error=kill_err,
+                )
             if observer is not None:
                 await observer.on_child_shutdown_escalate(
                     "SIGKILL", pgid, kill_err, time.monotonic_ns()

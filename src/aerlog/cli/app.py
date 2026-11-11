@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 import os
 from pathlib import Path
-from typing import Annotated, NoReturn, get_args
+from typing import Annotated, NoReturn, TextIO, TypeVar, get_args
 
 import typer
 
@@ -51,11 +51,13 @@ from aerlog.config import AerlogConfig, ConfigError, load_config
 from aerlog.events.ids import new_execution_id
 from aerlog.events.types import (
     CaptureBackpressurePolicy,
+    CaptureCompleteness,
     EventDirection,
     EventKind,
     RedactionMode,
 )
 from aerlog.export import (
+    ExportError,
     ExportFormat,
     RegressionFixtureValidationError,
     UnredactedExportRefusedError,
@@ -68,6 +70,7 @@ from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES
 from aerlog.proxy.stdio_proxy import ProxyConfig, ProxyResult, run_stdio_proxy
 from aerlog.replay import (
     Cassette,
+    CassetteValidationError,
     MissingResponsePolicy,
     ReplayError,
     ReplayMatchMode,
@@ -81,7 +84,12 @@ from aerlog.replay import (
     serve_cassette_stdio,
 )
 from aerlog.storage.database import DB_FILE_NAME, IndexedExecutionRow
-from aerlog.storage.event_log import FsyncPolicy, JsonlEventLogReader, validate_execution_id
+from aerlog.storage.event_log import (
+    FsyncPolicy,
+    JsonlEventLogReader,
+    resolve_execution_dir,
+    validate_execution_id,
+)
 from aerlog.storage.exceptions import (
     ExecutionNotFoundError,
     InvalidExecutionIdError,
@@ -94,7 +102,7 @@ from aerlog.storage.sink import PersistentCaptureSink
 
 _ROOT_EPILOG = (
     "Workflow examples:\n\n"
-    "  aerlog run -- python examples/demo_mcp_server.py\n\n"
+    "  aerlog run -- python path/to/mcp_server.py\n\n"
     "  aerlog list\n\n"
     "  aerlog inspect <execution_id>\n\n"
     "  aerlog timeline <execution_id>\n\n"
@@ -114,7 +122,7 @@ app = typer.Typer(
 
 executions_app = typer.Typer(
     name="executions",
-    help="List and inspect recorded MCP executions.",
+    help="List recorded MCP executions.",
     invoke_without_command=True,
     add_completion=False,
 )
@@ -137,14 +145,16 @@ export_app = typer.Typer(
 app.add_typer(export_app, name="export")
 
 
-_ALLOWED_COMPLETENESS = frozenset(
-    {"recording", "complete", "spilled", "degraded", "incomplete", "corrupted"}
+_ALLOWED_COMPLETENESS_VALUES: tuple[CaptureCompleteness, ...] = get_args(CaptureCompleteness)
+_ALLOWED_DIRECTIONS_VALUES: tuple[EventDirection, ...] = get_args(EventDirection)
+_ALLOWED_EVENT_KINDS_VALUES: tuple[EventKind, ...] = get_args(EventKind)
+_ALLOWED_BACKPRESSURE_VALUES: tuple[CaptureBackpressurePolicy, ...] = get_args(
+    CaptureBackpressurePolicy
 )
-_ALLOWED_DIRECTIONS = frozenset(get_args(EventDirection))
-_ALLOWED_EVENT_KINDS = frozenset(get_args(EventKind))
-_ALLOWED_BACKPRESSURE = frozenset(get_args(CaptureBackpressurePolicy))
-_ALLOWED_REDACTION_MODES = frozenset(get_args(RedactionMode))
-_ALLOWED_FSYNC_POLICIES = frozenset(get_args(FsyncPolicy))
+_ALLOWED_REDACTION_MODES_VALUES: tuple[RedactionMode, ...] = get_args(RedactionMode)
+_ALLOWED_FSYNC_POLICIES_VALUES: tuple[FsyncPolicy, ...] = get_args(FsyncPolicy)
+
+_ChoiceT = TypeVar("_ChoiceT", bound=str)
 
 
 def _cli_error(
@@ -177,6 +187,10 @@ def _storage_error_hint(exc: BaseException) -> str | None:
         return "Upgrade AERLOG to inspect recordings created with a newer schema version."
     if isinstance(exc, StorageError):
         return "Verify '--data-dir' permissions, path, and free disk space."
+    if isinstance(exc, (ExportError, RegressionFixtureValidationError)):
+        return "Verify the output directory is writable and check '--name' and source files."
+    if isinstance(exc, CassetteValidationError):
+        return "Ensure the cassette file was not modified after creation."
     return None
 
 
@@ -353,14 +367,22 @@ def _execute_executions_list(
     data_dir: Path | None,
     config: Path | None,
 ) -> None:
-    if status is not None and status not in _ALLOWED_COMPLETENESS:
-        allowed = ", ".join(sorted(_ALLOWED_COMPLETENESS))
-        _cli_error(
-            "List option error",
-            f"Invalid --status {status!r}; expected one of: {allowed}",
-            hint="Pass one of the listed status filters or omit '--status' to list all runs.",
-            code=1,
-        )
+    parsed_status: CaptureCompleteness | None = None
+    if status is not None:
+        try:
+            parsed_status = _parse_typed_choice(
+                status,
+                allowed=_ALLOWED_COMPLETENESS_VALUES,
+                flag_name="--status",
+            )
+        except ValueError as exc:
+            _cli_error(
+                "List option error",
+                exc,
+                hint="Pass one of the listed status filters or omit '--status' to list all runs.",
+                code=1,
+                cause=exc,
+            )
 
     resolved_dir = _resolve_data_dir(config_path=config, data_dir=data_dir)
     repo = RecordingRepository(resolved_dir)
@@ -369,14 +391,14 @@ def _execute_executions_list(
             rows: tuple[IndexedExecutionRow, ...] = ()
         elif (resolved_dir / DB_FILE_NAME).exists():
             rows = repo.list_executions(
-                completeness=status,  # type: ignore[arg-type]
+                completeness=parsed_status,
                 limit=limit,
                 offset=offset,
             )
         else:
             rows = _list_unindexed_executions_read_only(
                 resolved_dir,
-                completeness=status,
+                completeness=parsed_status,
                 limit=limit,
                 offset=offset,
             )
@@ -391,18 +413,16 @@ def _execute_executions_list(
         typer.echo(render_executions_list_text(rows), nl=False)
 
 
-def _parse_choice(
+def _parse_typed_choice(
     value: str,
     *,
-    allowed: frozenset[str],
+    allowed: tuple[_ChoiceT, ...],
     flag_name: str,
-) -> str:
+) -> _ChoiceT:
     normalized = value.strip()
-    if normalized in allowed:
-        return normalized
-    lowered = normalized.lower()
-    if lowered in allowed:
-        return lowered
+    for item in allowed:
+        if normalized == item or normalized.lower() == item:
+            return item
     choices = ", ".join(sorted(allowed))
     raise ValueError(f"Invalid {flag_name} {value!r}; expected one of: {choices}")
 
@@ -411,7 +431,7 @@ def _parse_choice(
     "run",
     epilog=(
         "Examples:\n\n"
-        "  aerlog run -- python examples/demo_mcp_server.py\n\n"
+        "  aerlog run -- python path/to/mcp_server.py\n\n"
         "  aerlog run --quiet --backpressure-policy spill -- python srv.py --port 8080\n\n"
         "Note: stdout carries only raw MCP JSON-RPC frames; notices/errors go strictly to stderr."
     ),
@@ -511,27 +531,27 @@ def run_mcp_proxy(
     cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
     try:
         effective_bp: CaptureBackpressurePolicy = (
-            _parse_choice(  # type: ignore[assignment]
+            _parse_typed_choice(
                 backpressure_policy,
-                allowed=_ALLOWED_BACKPRESSURE,
+                allowed=_ALLOWED_BACKPRESSURE_VALUES,
                 flag_name="--backpressure-policy",
             )
             if backpressure_policy is not None
             else cfg.capture.backpressure_policy
         )
         effective_redaction: RedactionMode = (
-            _parse_choice(  # type: ignore[assignment]
+            _parse_typed_choice(
                 redaction_mode,
-                allowed=_ALLOWED_REDACTION_MODES,
+                allowed=_ALLOWED_REDACTION_MODES_VALUES,
                 flag_name="--redaction-mode",
             )
             if redaction_mode is not None
             else cfg.capture.redaction_mode
         )
         effective_fsync: FsyncPolicy = (
-            _parse_choice(  # type: ignore[assignment]
+            _parse_typed_choice(
                 fsync_policy,
-                allowed=_ALLOWED_FSYNC_POLICIES,
+                allowed=_ALLOWED_FSYNC_POLICIES_VALUES,
                 flag_name="--fsync-policy",
             )
             if fsync_policy is not None
@@ -540,6 +560,13 @@ def run_mcp_proxy(
         resolved_exec_id = (
             validate_execution_id(execution_id) if execution_id is not None else new_execution_id()
         )
+        if execution_id is not None and (
+            resolve_execution_dir(resolved_dir, resolved_exec_id).exists()
+        ):
+            raise ValueError(
+                f"Execution ID {resolved_exec_id!r} already exists in {resolved_dir}; "
+                "omit '--execution-id' or provide a new UUID."
+            )
         resolved_cwd = cwd.expanduser() if cwd is not None else None
         if resolved_cwd is not None and not resolved_cwd.is_dir():
             raise ValueError(f"Working directory does not exist: {resolved_cwd}")
@@ -581,7 +608,11 @@ def run_mcp_proxy(
         )
     if not quiet:
         typer.echo(
-            render_run_start_stderr(execution_id=resolved_exec_id, command=proxy_cfg.command),
+            render_run_start_stderr(
+                execution_id=resolved_exec_id,
+                command=proxy_cfg.command,
+                redaction_mode=effective_redaction,
+            ),
             err=True,
             nl=False,
         )
@@ -668,12 +699,12 @@ async def _run_with_diag_stream(
     proxy_cfg: ProxyConfig,
     *,
     observer: CaptureProxyObserver,
-    diag_stream: object,
+    diag_stream: TextIO,
 ) -> ProxyResult:
     from aerlog.proxy.stdio_proxy import StdioProxy
 
     return await StdioProxy(proxy_cfg).run(
-        diag_stream=diag_stream,  # type: ignore[arg-type]
+        diag_stream=diag_stream,
         observer=observer,
     )
 
@@ -824,7 +855,11 @@ def inspect_execution(
                 if stored.header is not None
                 else "standard"
             )
-            event = repo.get_event_by_sequence(execution_id, sequence)
+            event = repo.get_event_by_sequence(
+                execution_id,
+                sequence,
+                strict_integrity=strict,
+            )
             _warn_unredacted_if_applicable(redaction_mode)
             if json_output:
                 typer.echo(single_event_to_json(event, redaction_mode=redaction_mode))
@@ -913,12 +948,20 @@ def view_timeline(
     """Reconstruct and display a chronological timeline for a recorded execution."""
     try:
         validated_direction = (
-            _parse_choice(direction, allowed=_ALLOWED_DIRECTIONS, flag_name="--direction")
+            _parse_typed_choice(
+                direction,
+                allowed=_ALLOWED_DIRECTIONS_VALUES,
+                flag_name="--direction",
+            )
             if direction is not None
             else None
         )
         validated_kind = (
-            _parse_choice(kind, allowed=_ALLOWED_EVENT_KINDS, flag_name="--kind")
+            _parse_typed_choice(
+                kind,
+                allowed=_ALLOWED_EVENT_KINDS_VALUES,
+                flag_name="--kind",
+            )
             if kind is not None
             else None
         )
@@ -1002,7 +1045,10 @@ def diagnose_recorded_execution(
         str | None,
         typer.Option(
             "--fail-on",
-            help="Exit with code 2 if any finding meets or exceeds severity.",
+            help=(
+                "Exit with code 2 if any unfiltered finding meets or exceeds severity "
+                "(info, warning, error, critical)."
+            ),
         ),
     ] = None,
     strict: Annotated[
@@ -1179,6 +1225,7 @@ def cassette_create(
         StorageCorruptionError,
         UnsupportedSchemaVersionError,
         StorageError,
+        ExportError,
         ReplayError,
         ValueError,
     ) as exc:
@@ -1231,7 +1278,9 @@ def cassette_inspect(
     """Inspect and SHA-256 verify an offline replay cassette read-only."""
     _, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
     try:
-        cassette, resolved_path = load_cassette(cassette_id_or_path, data_dir=resolved_dir)
+        candidate = Path(cassette_id_or_path).expanduser()
+        target: str | Path = candidate if candidate.is_file() else cassette_id_or_path
+        cassette, resolved_path = load_cassette(target, data_dir=resolved_dir)
     except (
         InvalidExecutionIdError,
         ReplayError,
@@ -1369,6 +1418,13 @@ def replay_recorded_execution(
             hint="Run 'aerlog list' to find recorded execution UUIDs.",
             code=1,
         )
+    if execution_id is not None and cassette_path is not None:
+        _cli_error(
+            "Replay error",
+            "'execution_id' and '--cassette' are mutually exclusive; specify only one.",
+            hint="Pass either an execution UUID or '--cassette <path>'.",
+            code=1,
+        )
     if serve and json_output:
         _cli_error(
             "Replay error",
@@ -1413,6 +1469,7 @@ def replay_recorded_execution(
         StorageCorruptionError,
         UnsupportedSchemaVersionError,
         StorageError,
+        ExportError,
         ReplayError,
         ValueError,
     ) as exc:
@@ -1432,16 +1489,27 @@ def replay_recorded_execution(
         )
 
     if serve:
-        report = asyncio.run(
-            serve_cassette_stdio(
-                cassette,
-                mode=validated_mode,
-                match_mode=effective_match,
-                unsafe_tool_policy=unsafe_policy,
-                missing_response_policy=effective_missing,
-                require_exact_id=exact_id,
+        try:
+            report = asyncio.run(
+                serve_cassette_stdio(
+                    cassette,
+                    mode=validated_mode,
+                    match_mode=effective_match,
+                    unsafe_tool_policy=unsafe_policy,
+                    missing_response_policy=effective_missing,
+                    require_exact_id=exact_id,
+                )
             )
-        )
+        except KeyboardInterrupt as exc:
+            raise typer.Exit(code=130) from exc
+        except (ReplayError, OSError, ValueError) as exc:
+            _cli_error(
+                "Replay server error",
+                exc,
+                hint="Verify client stdio frames and replay flags before retrying.",
+                code=1,
+                cause=exc,
+            )
     else:
         report = replay_cassette(
             cassette,
@@ -1456,7 +1524,7 @@ def replay_recorded_execution(
     if not no_save_report:
         try:
             saved_report_path = save_replay_report(report, data_dir=resolved_dir)
-        except StorageError as exc:
+        except (StorageError, ReplayError, ValueError) as exc:
             _cli_error(
                 "Replay report persistence error",
                 exc,
@@ -1667,6 +1735,7 @@ def export_test(
         StorageCorruptionError,
         UnsupportedSchemaVersionError,
         StorageError,
+        ExportError,
         ReplayError,
         ValueError,
     ) as exc:

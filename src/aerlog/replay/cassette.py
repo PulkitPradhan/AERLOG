@@ -214,11 +214,20 @@ def parse_untrusted_cassette_dict(raw_data: object) -> Cassette:
     return cassette
 
 
-def _extract_tool_annotations(events: Sequence[ExecutionEvent]) -> dict[str, dict[str, Any]]:
-    """Collect tool annotations advertised in ``tools/list`` responses."""
+def _extract_tool_annotations(
+    events: Sequence[ExecutionEvent],
+    *,
+    tools_list_response_event_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Collect tool annotations strictly from verified ``tools/list`` responses."""
     annotations_by_name: dict[str, dict[str, Any]] = {}
     for ev in events:
         if not isinstance(ev.payload, JsonRpcResponsePayload):
+            continue
+        if (
+            tools_list_response_event_ids is not None
+            and ev.event_id not in tools_list_response_event_ids
+        ):
             continue
         res = ev.payload.result
         if not isinstance(res, Mapping):
@@ -250,7 +259,7 @@ def build_cassette_from_read_result(
     allow_unredacted_cassette: bool = False,
     cassette_id: str | None = None,
 ) -> Cassette:
-    """Build a sealed :class:`Cassette` from a Phase 5 :class:`JsonlReadResult`."""
+    """Build a sealed :class:`Cassette` from a stored :class:`JsonlReadResult`."""
     if strict_integrity and read_result.has_corruptions:
         first = read_result.corruptions[0]
         raise StorageCorruptionError(
@@ -267,7 +276,17 @@ def build_cassette_from_read_result(
 
     events = sorted((item.event for item in read_result.events), key=lambda item: item.sequence)
     events_by_id = {ev.event_id: ev for ev in events}
-    annotations_by_name = _extract_tool_annotations(events)
+    tools_list_response_ids = {
+        sp.response_event_id
+        for sp in timeline.spans
+        if sp.span_kind == "request_exchange"
+        and sp.method == "tools/list"
+        and sp.response_event_id is not None
+    }
+    annotations_by_name = _extract_tool_annotations(
+        events,
+        tools_list_response_event_ids=tools_list_response_ids,
+    )
 
     interactions: list[CassetteInteraction] = []
     span_index_by_req_eid: dict[str, int] = {}
@@ -527,6 +546,8 @@ def load_cassette(
     raw_str = str(target)
     if isinstance(target, Path) or "/" in raw_str or "\\" in raw_str or raw_str.endswith(".json"):
         candidate = Path(target).expanduser()
+        if candidate.is_symlink():
+            raise CassetteValidationError(f"Refusing symlink cassette file: {candidate}")
         if not candidate.is_file():
             raise ReplayMissingCassetteError(f"Cassette file not found: {candidate}")
         resolved_path = candidate.resolve()
@@ -534,6 +555,8 @@ def load_cassette(
         if data_dir is None:
             raise ValueError("data_dir is required when loading a cassette by UUID")
         candidate = resolve_cassette_path(data_dir, raw_str)
+        if candidate.is_symlink():
+            raise CassetteValidationError(f"Refusing symlink cassette file: {candidate}")
         if not candidate.is_file():
             raise ReplayMissingCassetteError(f"Cassette {raw_str!r} not found at {candidate}")
         resolved_path = candidate
@@ -541,7 +564,7 @@ def load_cassette(
     try:
         text = resolved_path.read_text(encoding="utf-8")
         decoded = json.loads(text)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise CassetteValidationError(f"Failed reading cassette {resolved_path}: {exc}") from exc
 
     return parse_untrusted_cassette_dict(decoded), resolved_path

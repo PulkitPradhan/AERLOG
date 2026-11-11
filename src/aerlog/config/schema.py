@@ -108,7 +108,7 @@ class CaptureSettings(BaseModel):
 
 
 class StorageSettings(BaseModel):
-    """Phase 5 local JSONL and SQLite persistence settings."""
+    """Local JSONL and SQLite persistence settings."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -129,7 +129,7 @@ class StorageSettings(BaseModel):
 
 
 class DiagnosticsSettings(BaseModel):
-    """Phase 7 deterministic diagnostics configuration settings."""
+    """Deterministic diagnostics configuration settings."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -151,7 +151,7 @@ class DiagnosticsSettings(BaseModel):
 
 
 class ReplaySettings(BaseModel):
-    """Phase 8 safe offline cassette replay defaults (live replay blocked by default)."""
+    """Safe offline cassette replay defaults (live replay blocked by default)."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -179,7 +179,7 @@ class ReplaySettings(BaseModel):
 
 
 class ExportSettings(BaseModel):
-    """Phase 9 deterministic regression test and fixture export settings."""
+    """Deterministic regression test and fixture export settings."""
 
     model_config = ConfigDict(extra="forbid", validate_default=True)
 
@@ -218,23 +218,23 @@ class AerlogConfig(BaseModel):
     )
     capture: CaptureSettings = Field(
         default_factory=CaptureSettings,
-        description="Phase 4 capture pipeline redaction and durability defaults.",
+        description="Capture pipeline redaction and durability defaults.",
     )
     storage: StorageSettings = Field(
         default_factory=StorageSettings,
-        description="Phase 5 persistent JSONL and SQLite storage settings.",
+        description="Persistent JSONL and SQLite storage settings.",
     )
     diagnostics: DiagnosticsSettings = Field(
         default_factory=DiagnosticsSettings,
-        description="Phase 7 deterministic diagnostic rule thresholds.",
+        description="Deterministic diagnostic rule thresholds.",
     )
     replay: ReplaySettings = Field(
         default_factory=ReplaySettings,
-        description="Phase 8 offline cassette replay and side-effect safety defaults.",
+        description="Offline cassette replay and side-effect safety defaults.",
     )
     export: ExportSettings = Field(
         default_factory=ExportSettings,
-        description="Phase 9 deterministic regression test export settings.",
+        description="Deterministic regression test export settings.",
     )
 
     @field_validator("data_dir", mode="before")

@@ -162,6 +162,9 @@ def _normalize_nested(
                 )
         return out
 
+    if isinstance(value, bytes | bytearray):
+        return value
+
     if isinstance(value, Sequence):
         return [
             _normalize_nested(
@@ -392,6 +395,29 @@ def sanitize_cassette_for_export(
             total_findings += n_find
             clean_emitted.append(clean_n)
 
+        sanitized_tool_name: str | None = slot.tool_name
+        if slot.tool_name is not None:
+            t_res = sanitize_and_normalize_value(
+                slot.tool_name,
+                root_path=f"{prefix}.tool_name",
+                sanitize=sanitize,
+                normalize_volatile=normalize_volatile,
+            )
+            sanitized_tool_name = str(t_res.value)
+            total_findings += t_res.redaction_findings
+            all_vars.extend(t_res.variable_fields)
+            all_cats.update(t_res.normalized_categories)
+
+        reason_res = sanitize_and_normalize_value(
+            slot.side_effect_reason,
+            root_path=f"{prefix}.side_effect_reason",
+            sanitize=sanitize,
+            normalize_volatile=normalize_volatile,
+        )
+        total_findings += reason_res.redaction_findings
+        all_vars.extend(reason_res.variable_fields)
+        all_cats.update(reason_res.normalized_categories)
+
         exact_hash, norm_hash = compute_params_hashes(clean_params, has_params=slot.has_params)
         new_interactions.append(
             slot.model_copy(
@@ -400,6 +426,8 @@ def sanitize_cassette_for_export(
                     "extra_fields": (
                         req_ex_res.value if isinstance(req_ex_res.value, dict) else {}
                     ),
+                    "tool_name": sanitized_tool_name,
+                    "side_effect_reason": str(reason_res.value),
                     "exact_params_sha256": exact_hash,
                     "normalized_params_sha256": norm_hash,
                     "response_result": clean_result,
@@ -421,7 +449,7 @@ def sanitize_cassette_for_export(
             prefix=f"standalone_notifications[{n_idx}]",
             sanitize=sanitize,
             normalize_volatile=normalize_volatile,
-            progress_token_label=None,
+            progress_token_label=f"standalone_{n_idx}_prog",
             all_vars=all_vars,
             all_cats=all_cats,
         )

@@ -9,12 +9,15 @@ Note on identity semantics:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 
 from aerlog.events.types import TraceSource
+
+_MAX_TRACESTATE_CHARS = 512
 
 _TRACEPARENT_RE = re.compile(
     r"^(?P<version>[0-9a-f]{2})-(?P<trace_id>[0-9a-f]{32})-"
@@ -49,8 +52,11 @@ def synthetic_trace_id_for_execution(execution_id: str) -> str:
     This value is strictly an execution-scoped synthetic grouping key and must
     never be represented as an observed wire W3C ``traceparent`` trace ID.
     """
-    parsed = uuid.UUID(execution_id)
-    return parsed.hex
+    try:
+        parsed = uuid.UUID(execution_id)
+        return parsed.hex
+    except ValueError:
+        return hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:32]
 
 
 def parse_w3c_traceparent(value: object) -> W3CTraceparent | None:
@@ -131,7 +137,11 @@ def extract_observed_trace_from_params(
 
     raw_traceparent = meta.get("traceparent")
     raw_tracestate = meta.get("tracestate")
-    tracestate = raw_tracestate if isinstance(raw_tracestate, str) and raw_tracestate else None
+    tracestate = (
+        raw_tracestate[:_MAX_TRACESTATE_CHARS]
+        if isinstance(raw_tracestate, str) and raw_tracestate
+        else None
+    )
 
     if "traceparent" not in meta:
         return ObservedTraceExtraction(

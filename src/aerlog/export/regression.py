@@ -375,11 +375,13 @@ def parse_regression_fixture_dict(raw_data: object) -> RegressionFixture:
 def load_regression_fixture(fixture_path: str | Path) -> RegressionFixture:
     """Read, validate, and SHA-256 verify a ``.fixture.json`` file read-only."""
     resolved = Path(fixture_path).expanduser()
+    if resolved.is_symlink():
+        raise RegressionFixtureValidationError(f"Refusing symlink regression fixture: {resolved}")
     if not resolved.is_file():
         raise RegressionFixtureValidationError(f"Regression fixture file not found: {resolved}")
     try:
         decoded = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise RegressionFixtureValidationError(
             f"Failed reading regression fixture {resolved}: {exc}"
         ) from exc
@@ -387,11 +389,11 @@ def load_regression_fixture(fixture_path: str | Path) -> RegressionFixture:
 
 
 def _step_variable_paths(
-    step_idx: int,
     interaction_idx: int | None,
     all_vars: tuple[str, ...],
     *,
     is_request: bool,
+    notif_prefix: str | None = None,
 ) -> tuple[str, ...]:
     paths: list[str] = []
     if is_request:
@@ -401,10 +403,12 @@ def _step_variable_paths(
         for v in all_vars:
             if v.startswith(prefix):
                 paths.append(v[len(prefix) :])
-    else:
-        c_prefix = f"cancellations[{step_idx}]"
+    elif notif_prefix is not None:
+        dotted = f"{notif_prefix}."
         for v in all_vars:
-            if c_prefix in v:
+            if v.startswith(dotted):
+                paths.append(v[len(dotted) :])
+            elif notif_prefix in v:
                 paths.append(v)
     return tuple(dict.fromkeys(paths))
 
@@ -473,14 +477,21 @@ def build_regression_fixture_from_read_result(
     diag_report = diagnose_jsonl_result(read_result)
     diag_codes = tuple(dict.fromkeys(item.code for item in diag_report.diagnostics))
 
-    # Collect chronological client requests & client cancellation notifications.
-    raw_sequence_items: list[tuple[int, str, Any]] = []
+    # Collect chronological client requests & client notifications paired with sanitizer prefix.
+    raw_sequence_items: list[tuple[int, str, Any, str | None]] = []
     for slot in cassette.interactions:
         if slot.origin_direction == "client_to_server":
-            raw_sequence_items.append((slot.request_sequence, "request", slot))
-    for notif in (*cassette.cancellations, *cassette.standalone_notifications):
+            raw_sequence_items.append((slot.request_sequence, "request", slot, None))
+    for c_idx, notif in enumerate(cassette.cancellations):
         if notif.direction == "client_to_server":
-            raw_sequence_items.append((notif.sequence, "notification", notif))
+            raw_sequence_items.append(
+                (notif.sequence, "notification", notif, f"cancellations[{c_idx}]")
+            )
+    for s_idx, notif in enumerate(cassette.standalone_notifications):
+        if notif.direction == "client_to_server":
+            raw_sequence_items.append(
+                (notif.sequence, "notification", notif, f"standalone_notifications[{s_idx}]")
+            )
     raw_sequence_items.sort(key=lambda entry: entry[0])
 
     matcher = CassetteMatcher(
@@ -494,7 +505,7 @@ def build_regression_fixture_from_read_result(
     # Track normalized sequential request IDs so notifications/cancelled points accurately.
     seq_to_norm_id: dict[int, int] = {}
     next_norm_id = 1
-    for src_seq, item_kind, _ in raw_sequence_items:
+    for src_seq, item_kind, _, _ in raw_sequence_items:
         if item_kind == "request":
             seq_to_norm_id[src_seq] = next_norm_id
             next_norm_id += 1
@@ -506,7 +517,7 @@ def build_regression_fixture_from_read_result(
     unmatched_count = 0
     missing_response_count = 0
 
-    for step_idx, (src_seq, item_kind, item_obj) in enumerate(raw_sequence_items):
+    for step_idx, (src_seq, item_kind, item_obj, notif_prefix) in enumerate(raw_sequence_items):
         if item_kind == "request":
             norm_id = seq_to_norm_id[src_seq]
             decision = matcher.match_request(
@@ -555,7 +566,6 @@ def build_regression_fixture_from_read_result(
                     )
 
             var_fields = _step_variable_paths(
-                step_idx,
                 item_obj.interaction_index,
                 san_res.variable_fields,
                 is_request=True,
@@ -603,10 +613,10 @@ def build_regression_fixture_from_read_result(
             if decision.diverged:
                 diverged_count += 1
             var_fields = _step_variable_paths(
-                step_idx,
                 None,
                 san_res.variable_fields,
                 is_request=False,
+                notif_prefix=notif_prefix,
             )
             steps.append(
                 RegressionStepSpec(
@@ -795,7 +805,7 @@ def export_execution_regression_test(
     if pytest_path is not None and pytest_path.exists():
         overwritten.append(pytest_path)
 
-    fixture_mode = 0o600 if fixture.contains_raw_secrets else 0o644
+    fixture_mode = 0o600 if (fixture.contains_raw_secrets or not sanitize) else 0o644
     fixture_bytes = (fixture.model_dump_json(indent=2) + "\n").encode("utf-8")
     _write_atomic_bytes(fixture_path, fixture_bytes, mode=fixture_mode)
 
@@ -850,8 +860,7 @@ def run_regression_fixture(
     for step in fixture.steps:
         step_failed = False
         if step.kind == "request":
-            _, norm_id_val = classify_jsonrpc_id({"id": step.incoming_request_id})
-            id_type, _ = classify_jsonrpc_id({"id": step.incoming_request_id})
+            id_type, norm_id_val = classify_jsonrpc_id({"id": step.incoming_request_id})
             decision = matcher.match_request(
                 method=step.method,
                 params=step.params,

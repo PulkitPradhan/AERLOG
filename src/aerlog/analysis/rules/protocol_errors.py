@@ -132,6 +132,25 @@ def detect_protocol_and_tool_errors(ctx: DiagnosticContext) -> list[DiagnosticDr
                 target_desc = f" for {method}" if method else ""
                 if tool_name:
                     target_desc += f" (tool={tool_name})"
+                conclusions = [
+                    f"The peer emitted an explicit JSON-RPC error response (code="
+                    f"{err.error_code}) rather than a success result.",
+                ]
+                cannot_conclude = [
+                    "Cannot verify internal server exception details, upstream API states, "
+                    "or whether transient retry would succeed without server logs.",
+                ]
+                if method == "server/discover" and err.error_code == -32601:
+                    conclusions.append(
+                        "When an MCP client probes 'server/discover' in auto mode against a legacy "
+                        "server, a -32601 (Method not found) response can indicate expected "
+                        "handshake fallback to 'initialize'."
+                    )
+                    cannot_conclude.append(
+                        "Cannot distinguish intentional MCP auto-mode fallback from an unexpected "
+                        "server capability defect without checking whether a subsequent "
+                        "'initialize' exchange succeeded."
+                    )
                 drafts.append(
                     ctx.build_draft(
                         code="JSONRPC_ERROR_RESPONSE",
@@ -147,14 +166,8 @@ def detect_protocol_and_tool_errors(ctx: DiagnosticContext) -> list[DiagnosticDr
                         ),
                         evidence=evidence,
                         observed_values=observed_vals,
-                        reasonable_conclusions=(
-                            f"The peer emitted an explicit JSON-RPC error response (code="
-                            f"{err.error_code}) rather than a success result.",
-                        ),
-                        cannot_be_concluded=(
-                            "Cannot verify internal server exception details, upstream API states, "
-                            "or whether transient retry would succeed without server logs.",
-                        ),
+                        reasonable_conclusions=conclusions,
+                        cannot_be_concluded=cannot_conclude,
                         additional_evidence_needed=(
                             "Server stderr/application logs and upstream dependency diagnostics "
                             "corresponding to the same timestamp window.",
