@@ -27,10 +27,14 @@ from aerlog.cli.render import (
     diagnostics_report_to_json,
     execution_inspection_to_json,
     executions_list_to_json,
+    export_bundle_to_json,
+    regression_verify_to_json,
     render_cassette_summary_text,
     render_diagnostics_text,
     render_execution_inspection_text,
     render_executions_list_text,
+    render_export_bundle_text,
+    render_regression_verify_text,
     render_replay_report_text,
     render_single_event_text,
     render_timeline_slice_text,
@@ -39,6 +43,15 @@ from aerlog.cli.render import (
     timeline_slice_to_json,
 )
 from aerlog.config import AerlogConfig, ConfigError, load_config
+from aerlog.export import (
+    ExportFormat,
+    RegressionFixtureValidationError,
+    UnredactedExportRefusedError,
+    export_execution_regression_test,
+    load_regression_fixture,
+    run_regression_fixture,
+    validate_export_slug,
+)
 from aerlog.replay import (
     Cassette,
     MissingResponsePolicy,
@@ -85,6 +98,14 @@ cassette_app = typer.Typer(
     add_completion=False,
 )
 app.add_typer(cassette_app, name="cassette")
+
+export_app = typer.Typer(
+    name="export",
+    help="Export and verify deterministic offline MCP regression tests.",
+    invoke_without_command=True,
+    add_completion=False,
+)
+app.add_typer(export_app, name="export")
 
 
 _ALLOWED_COMPLETENESS = frozenset(
@@ -937,9 +958,276 @@ def replay_recorded_execution(
         raise typer.Exit(code=2)
 
 
+def _parse_export_format(value: str) -> ExportFormat:
+    normalized = value.strip().lower()
+    if normalized == "both":
+        return "both"
+    if normalized == "json":
+        return "json"
+    raise ValueError(f"Invalid --format {value!r}; expected 'both' or 'json'")
+
+
+@export_app.callback()
+def export_root(ctx: typer.Context) -> None:
+    """Offline MCP regression fixture export and verification commands."""
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit(code=0)
+
+
+@export_app.command("test")
+def export_test(
+    execution_id: Annotated[
+        str,
+        typer.Argument(help="Execution UUID to export as a deterministic regression fixture."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Target directory for exported fixture and pytest file.",
+        ),
+    ] = Path("tests/generated"),
+    name: Annotated[
+        str | None,
+        typer.Option(
+            "--name",
+            help=(
+                "Optional lowercase alphanumeric/underscore filename slug "
+                "(defaults to exec_<execution_id>)."
+            ),
+        ),
+    ] = None,
+    export_format: Annotated[
+        str | None,
+        typer.Option(
+            "--format",
+            help="Artifacts to generate: 'both' (.fixture.json + test_*.py) or 'json' only.",
+        ),
+    ] = None,
+    match: Annotated[
+        str | None,
+        typer.Option(
+            "--match", help="Replay match mode pinned in fixture: 'strict' or 'tolerant'."
+        ),
+    ] = None,
+    allow_mutating: Annotated[
+        bool,
+        typer.Option(
+            "--allow-mutating",
+            help=(
+                "Allow offline replay of potentially_mutating and unknown_unsafe tools with audit "
+                "notices."
+            ),
+        ),
+    ] = False,
+    missing_policy: Annotated[
+        str | None,
+        typer.Option(
+            "--missing-policy",
+            help="Behavior pinned when recorded request lacked response: 'error' or 'omit'.",
+        ),
+    ] = None,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help=(
+                "Skip default secret/path/volatile export sanitization (requires "
+                "--allow-unredacted-export)."
+            ),
+        ),
+    ] = False,
+    allow_unredacted_export: Annotated[
+        bool,
+        typer.Option(
+            "--allow-unredacted-export",
+            help="Explicitly confirm opt-in when exporting unredacted '--raw' payloads.",
+        ),
+    ] = False,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict", help="Fail with code 1 if source recording has JSONL corruptions."
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit structured export metadata JSON to stdout."),
+    ] = False,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override AERLOG data directory."),
+    ] = None,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", help="Path to AERLOG configuration TOML file."),
+    ] = None,
+) -> None:
+    """Export an offline SHA-256-sealed regression fixture and pytest module."""
+    cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    try:
+        effective_format: ExportFormat = (
+            _parse_export_format(export_format)
+            if export_format is not None
+            else cfg.export.default_format
+        )
+        effective_match: ReplayMatchMode = (
+            _parse_match_mode(match) if match is not None else cfg.replay.default_match_mode
+        )
+        effective_missing: MissingResponsePolicy = (
+            _parse_missing_policy(missing_policy)
+            if missing_policy is not None
+            else cfg.replay.missing_response_policy
+        )
+        if name is not None:
+            validate_export_slug(name)
+        if raw and not allow_unredacted_export:
+            raise UnredactedExportRefusedError(
+                "Unredacted '--raw' export refused without explicit '--allow-unredacted-export'."
+            )
+    except (ReplayError, ValueError) as exc:
+        typer.echo(f"Export option error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    unsafe_policy: UnsafeToolPolicy = "warn" if allow_mutating else cfg.replay.unsafe_tool_policy
+    effective_sanitize = False if raw else cfg.export.sanitize_by_default
+    effective_normalize = False if raw else cfg.export.normalize_volatile
+
+    repo = RecordingRepository(resolved_dir)
+    try:
+        if not repo.has_existing_storage():
+            raise ExecutionNotFoundError(
+                f"No AERLOG storage found at {resolved_dir}; execution {execution_id!r} not found."
+            )
+        bundle = export_execution_regression_test(
+            repo,
+            execution_id,
+            output_dir=output,
+            slug=name,
+            export_format=effective_format,
+            match_mode=effective_match,
+            unsafe_tool_policy=unsafe_policy,
+            missing_response_policy=effective_missing,
+            sanitize=effective_sanitize,
+            normalize_volatile=effective_normalize,
+            raw=raw,
+            allow_unredacted_export=allow_unredacted_export,
+            strict_integrity=strict,
+        )
+    except (
+        ExecutionNotFoundError,
+        InvalidExecutionIdError,
+        StorageCorruptionError,
+        UnsupportedSchemaVersionError,
+        StorageError,
+        ReplayError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Export error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        repo.close()
+
+    if bundle.sanitized_from_unredacted_source:
+        typer.echo(
+            "WARNING: Source recording used redaction_mode='explicit_unredacted'; default export "
+            "sanitization was applied to strip secrets and normalize volatile fields.",
+            err=True,
+        )
+    if bundle.fixture.contains_raw_secrets:
+        typer.echo(
+            "WARNING: Exported fixture contains raw unredacted payloads "
+            "(contains_raw_secrets=True); restrict access accordingly.",
+            err=True,
+        )
+    if bundle.fixture.source_has_corruptions:
+        typer.echo(
+            "WARNING: Source recording has corruptions; exported fixture covers verified prefix "
+            "events only.",
+            err=True,
+        )
+    for overwritten_path in bundle.overwritten_files:
+        typer.echo(
+            f"NOTICE: Overwrote existing export artifact {overwritten_path}",
+            err=True,
+        )
+
+    if json_output:
+        typer.echo(export_bundle_to_json(bundle))
+    else:
+        typer.echo(render_export_bundle_text(bundle), nl=False)
+
+
+@export_app.command("verify")
+def export_verify(
+    fixture_path: Annotated[
+        Path,
+        typer.Argument(help="Path to an exported .fixture.json file."),
+    ],
+    cassette_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--cassette",
+            help="Optional replacement .cassette.json file to detect changed-server drift.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit structured JSON verification output to stdout."),
+    ] = False,
+) -> None:
+    """Verify an exported regression fixture offline cleanly or against a replacement cassette."""
+    override_cassette: Cassette | None = None
+    try:
+        fixture = load_regression_fixture(fixture_path)
+        if cassette_path is not None:
+            override_cassette, _ = load_cassette(cassette_path)
+        result = run_regression_fixture(fixture, override_cassette=override_cassette)
+    except (
+        RegressionFixtureValidationError,
+        InvalidExecutionIdError,
+        ReplayError,
+        ValueError,
+    ) as exc:
+        typer.echo(f"Verification error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if result.contains_raw_secrets:
+        typer.echo(
+            "WARNING: Verified fixture or override cassette contains raw unredacted payloads "
+            "(contains_raw_secrets=True).",
+            err=True,
+        )
+
+    if json_output:
+        typer.echo(
+            regression_verify_to_json(
+                result,
+                fixture=fixture,
+                fixture_path=fixture_path,
+                cassette_override_path=cassette_path,
+            )
+        )
+    else:
+        typer.echo(
+            render_regression_verify_text(
+                result,
+                fixture=fixture,
+                fixture_path=fixture_path,
+                cassette_override_path=cassette_path,
+            ),
+            nl=False,
+        )
+
+    if not result.passed:
+        raise typer.Exit(code=2)
+
+
 def main() -> None:
     """Console script entry point for ``aerlog``."""
     app()
 
 
-__all__ = ["app", "cassette_app", "executions_app", "main"]
+__all__ = ["app", "cassette_app", "executions_app", "export_app", "main"]

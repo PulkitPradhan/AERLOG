@@ -178,6 +178,27 @@ class ReplaySettings(BaseModel):
     )
 
 
+class ExportSettings(BaseModel):
+    """Phase 9 deterministic regression test and fixture export settings."""
+
+    model_config = ConfigDict(extra="forbid", validate_default=True)
+
+    default_format: Literal["both", "json"] = Field(
+        default="both",
+        description="Default export bundle output ('both' for pytest+json or 'json' only).",
+    )
+    normalize_volatile: bool = Field(
+        default=True,
+        description=("Normalize volatile metadata, timestamps, temp/home paths, and random UUIDs."),
+    )
+    sanitize_by_default: bool = Field(
+        default=True,
+        description=(
+            "Apply standard secret redaction before exporting fixtures, even for raw captures."
+        ),
+    )
+
+
 class AerlogConfig(BaseModel):
     """Validated runtime configuration for AERLOG.
 
@@ -210,6 +231,10 @@ class AerlogConfig(BaseModel):
     replay: ReplaySettings = Field(
         default_factory=ReplaySettings,
         description="Phase 8 offline cassette replay and side-effect safety defaults.",
+    )
+    export: ExportSettings = Field(
+        default_factory=ExportSettings,
+        description="Phase 9 deterministic regression test export settings.",
     )
 
     @field_validator("data_dir", mode="before")

@@ -23,6 +23,11 @@ from aerlog.analysis.timeline import (
 )
 from aerlog.capture.redaction import EventRedactor, RedactionConfig
 from aerlog.events.models import ExecutionEvent
+from aerlog.export.regression import (
+    RegressionExportBundleResult,
+    RegressionFixture,
+    RegressionRunResult,
+)
 from aerlog.replay.cassette import Cassette
 from aerlog.replay.runner import ReplayReport
 from aerlog.storage.database import IndexedExecutionRow
@@ -639,17 +644,217 @@ def replay_report_to_json(
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+def render_export_bundle_text(bundle: RegressionExportBundleResult) -> str:
+    """Render exported regression bundle metadata cleanly for terminal output."""
+    fixture = bundle.fixture
+
+    def _draw(console: Console) -> None:
+        console.print("AERLOG REGRESSION EXPORT")
+        console.print(f"Fixture ID:         {fixture.fixture_id}")
+        console.print(f"Source Execution:   {fixture.source_execution_id}")
+        console.print(f"Slug:               {bundle.slug}")
+        console.print(
+            f"Anchored At:        {fixture.anchored_at.isoformat()} "
+            f"(basis={fixture.timestamp_anchor_basis})"
+        )
+        console.print(f"Format:             {bundle.export_format}")
+        console.print(f"Fixture File:       {bundle.fixture_path}")
+        if bundle.pytest_path is not None:
+            console.print(f"Pytest File:        {bundle.pytest_path}")
+        console.print(f"Fixture SHA-256:    {fixture.fixture_sha256}")
+        console.print(
+            f"Safety State:       sanitized={fixture.sanitized_for_export}, "
+            f"raw_secrets={fixture.contains_raw_secrets}, "
+            f"redacted_placeholders={fixture.contains_redacted_placeholders}, "
+            f"findings={fixture.redaction_findings_count}"
+        )
+        console.print(
+            f"Pinned Replay Mode: match={fixture.match_mode}, "
+            f"unsafe_policy={fixture.unsafe_tool_policy}, "
+            f"missing_policy={fixture.missing_response_policy}"
+        )
+        diag_text = (
+            ", ".join(fixture.source_diagnostic_codes)
+            if fixture.source_diagnostic_codes
+            else "none"
+        )
+        console.print(f"Source Diagnostics: {diag_text}")
+        cats = (
+            ", ".join(fixture.normalization.normalized_categories)
+            if fixture.normalization.normalized_categories
+            else "none"
+        )
+        console.print(
+            f"Normalization:      volatile={fixture.normalization.normalize_volatile}, "
+            f"categories=[{cats}], variable_paths={len(fixture.normalization.variable_fields)}"
+        )
+
+        if fixture.steps:
+            table = Table(box=box.SIMPLE_HEAVY, show_lines=False)
+            table.add_column("STEP", justify="right", no_wrap=True)
+            table.add_column("SEQ", justify="right", no_wrap=True)
+            table.add_column("KIND", no_wrap=True)
+            table.add_column("METHOD", no_wrap=True)
+            table.add_column("TOOL", no_wrap=True)
+            table.add_column("EXPECTED OUTCOME")
+            table.add_column("ERR / IS_ERR", no_wrap=True)
+            for step in fixture.steps:
+                exp = step.expected
+                detail_parts: list[str] = []
+                if exp.expected_error_code is not None:
+                    detail_parts.append(f"code={exp.expected_error_code}")
+                if exp.expected_tool_is_error is not None:
+                    detail_parts.append(f"isError={exp.expected_tool_is_error}")
+                detail = ", ".join(detail_parts) if detail_parts else "-"
+                table.add_row(
+                    str(step.step_index),
+                    str(step.source_sequence),
+                    step.kind,
+                    step.method,
+                    step.tool_name or "-",
+                    exp.expected_outcome_kind,
+                    detail,
+                )
+            console.print(table)
+
+        console.print("\nEXPORT LIMITATIONS")
+        for lim in fixture.limitations:
+            console.print(f"  - {lim}")
+
+    return _render_to_str(_draw)
+
+
+def export_bundle_to_json(bundle: RegressionExportBundleResult) -> str:
+    """Serialize export bundle metadata safely to JSON without echoing raw secret payloads."""
+    fixture = bundle.fixture
+    payload = {
+        "fixture_schema_version": fixture.fixture_schema_version,
+        "fixture_id": fixture.fixture_id,
+        "fixture_sha256": fixture.fixture_sha256,
+        "source_execution_id": fixture.source_execution_id,
+        "slug": bundle.slug,
+        "export_format": bundle.export_format,
+        "output_dir": str(bundle.output_dir),
+        "fixture_path": str(bundle.fixture_path),
+        "pytest_path": str(bundle.pytest_path) if bundle.pytest_path is not None else None,
+        "overwritten_files": [str(p) for p in bundle.overwritten_files],
+        "anchored_at": fixture.anchored_at.isoformat(),
+        "timestamp_anchor_basis": fixture.timestamp_anchor_basis,
+        "source_capture_completeness": fixture.source_capture_completeness,
+        "source_redaction_mode": fixture.source_redaction_mode,
+        "source_unclean_shutdown": fixture.source_unclean_shutdown,
+        "source_has_corruptions": fixture.source_has_corruptions,
+        "source_diagnostic_codes": list(fixture.source_diagnostic_codes),
+        "sanitized_for_export": fixture.sanitized_for_export,
+        "sanitized_from_unredacted_source": bundle.sanitized_from_unredacted_source,
+        "contains_raw_secrets": fixture.contains_raw_secrets,
+        "contains_redacted_placeholders": fixture.contains_redacted_placeholders,
+        "redaction_findings_count": fixture.redaction_findings_count,
+        "match_mode": fixture.match_mode,
+        "unsafe_tool_policy": fixture.unsafe_tool_policy,
+        "missing_response_policy": fixture.missing_response_policy,
+        "normalization": fixture.normalization.model_dump(mode="json"),
+        "expected_overall_status": fixture.expected_overall_status,
+        "step_count": len(fixture.steps),
+        "steps": [
+            {
+                "step_index": step.step_index,
+                "source_sequence": step.source_sequence,
+                "kind": step.kind,
+                "method": step.method,
+                "tool_name": step.tool_name,
+                "side_effect_class": step.side_effect_class,
+                "variable_fields": list(step.variable_fields),
+                "constant_fields": list(step.constant_fields),
+                "expected": step.expected.model_dump(mode="json"),
+            }
+            for step in fixture.steps
+        ],
+        "limitations": list(fixture.limitations),
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def render_regression_verify_text(
+    result: RegressionRunResult,
+    *,
+    fixture: RegressionFixture,
+    fixture_path: Path,
+    cassette_override_path: Path | None = None,
+) -> str:
+    """Render offline :class:`RegressionRunResult` verification summary for terminal output."""
+
+    def _draw(console: Console) -> None:
+        status_label = "PASSED" if result.passed else "FAILED"
+        console.print("AERLOG REGRESSION VERIFICATION")
+        console.print(f"Status:             {status_label}")
+        console.print(f"Fixture ID:         {result.fixture_id}")
+        console.print(f"Fixture File:       {fixture_path}")
+        console.print(f"Source Execution:   {result.source_execution_id}")
+        console.print(f"Target Cassette:    {result.replay_cassette_id}")
+        if cassette_override_path is not None:
+            console.print(f"Cassette Override:  {cassette_override_path}")
+        console.print(
+            f"Steps:              total={result.total_steps}, passed={result.passed_steps}, "
+            f"failed={result.failed_steps}"
+        )
+        console.print(
+            f"Counts:             matched={result.matched_count}, "
+            f"diverged={result.diverged_count}, blocked={result.blocked_count}, "
+            f"unmatched={result.unmatched_count}, missing={result.missing_response_count}"
+        )
+        if fixture.source_diagnostic_codes:
+            console.print(f"Source Diagnostics: {', '.join(fixture.source_diagnostic_codes)}")
+
+        if result.failures:
+            console.print("\nREGRESSION FAILURES")
+            for fail in result.failures:
+                step_lbl = f"step #{fail.step_index}" if fail.step_index is not None else "session"
+                seq_lbl = (
+                    f"seq #{fail.source_sequence}" if fail.source_sequence is not None else "-"
+                )
+                target = fail.method or "-"
+                if fail.tool_name:
+                    target += f" ({fail.tool_name})"
+                console.print(f"  - {step_lbl} ({seq_lbl}) {target} [{fail.field}]: {fail.message}")
+                console.print(f"      expected: {fail.expected!r}")
+                console.print(f"      actual:   {fail.actual!r}")
+
+    return _render_to_str(_draw)
+
+
+def regression_verify_to_json(
+    result: RegressionRunResult,
+    *,
+    fixture: RegressionFixture,
+    fixture_path: Path,
+    cassette_override_path: Path | None = None,
+) -> str:
+    """Serialize :class:`RegressionRunResult` cleanly to JSON for stdout."""
+    payload = result.model_dump(mode="json")
+    payload["fixture_path"] = str(fixture_path)
+    payload["cassette_override_path"] = (
+        str(cassette_override_path) if cassette_override_path is not None else None
+    )
+    payload["source_diagnostic_codes"] = list(fixture.source_diagnostic_codes)
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 __all__ = [
     "cassette_summary_to_json",
     "diagnostics_report_to_json",
     "execution_inspection_to_json",
     "executions_list_to_json",
+    "export_bundle_to_json",
     "format_duration_ns",
     "format_offset_ns",
+    "regression_verify_to_json",
     "render_cassette_summary_text",
     "render_diagnostics_text",
     "render_execution_inspection_text",
     "render_executions_list_text",
+    "render_export_bundle_text",
+    "render_regression_verify_text",
     "render_replay_report_text",
     "render_single_event_text",
     "render_timeline_slice_text",
