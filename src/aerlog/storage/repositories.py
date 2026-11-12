@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+import os
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,6 +37,7 @@ from aerlog.storage.event_log import (
     EVENTS_FILE_NAME,
     EXECUTION_FILE_NAME,
     EXECUTIONS_DIR_NAME,
+    MANIFEST_FILE_NAME,
     STORAGE_SCHEMA_VERSION,
     CorruptRecordReport,
     ExecutionManifest,
@@ -41,12 +45,18 @@ from aerlog.storage.event_log import (
     JsonlEventLogReader,
     JsonlEventLogWriter,
     JsonlReadResult,
+    TailPolicy,
+    TailRecoveryResult,
     WrittenEventSlice,
+    _parse_jsonl_line,
+    compute_file_sha256,
+    quarantine_tail_bytes,
     relative_recording_dir,
     resolve_execution_dir,
     sanitize_header_for_persistence,
     sanitize_summary_for_persistence,
     validate_execution_id,
+    write_atomic_private_json,
 )
 from aerlog.storage.exceptions import (
     ExecutionNotFoundError,
@@ -479,9 +489,208 @@ class RecordingRepository:
             missing_jsonl_execution_ids=tuple(missing_execs),
         )
 
+    def recover_tail(
+        self,
+        execution_id: str,
+        *,
+        tail_policy: TailPolicy = "quarantine",
+    ) -> TailRecoveryResult:
+        """Inspect and recover an incomplete, malformed, or inconsistent JSONL tail safely.
+
+        - If the tail is a valid JSONL record missing only the trailing newline, appends
+          the newline, validates manifest consistency, updates the manifest, and indexes it.
+        - If the tail is incomplete, malformed, or violates sequence continuity or event_id
+          uniqueness:
+          - Under 'reject', raises StorageCorruptionError leaving the log untouched.
+          - Under 'quarantine', spills the raw corrupted bytes to a 0o600 quarantine artifact
+            with companion forensic JSON metadata, rewinds events.jsonl to the verified prefix,
+            and marks the manifest status as 'incomplete'.
+        """
+        clean_id = validate_execution_id(execution_id)
+        exec_dir = resolve_execution_dir(self._data_dir, clean_id)
+        events_path = exec_dir / EVENTS_FILE_NAME
+        manifest_path = exec_dir / MANIFEST_FILE_NAME
+
+        if not events_path.exists() or events_path.stat().st_size == 0:
+            return TailRecoveryResult(
+                execution_id=clean_id,
+                action_taken="none",
+                recovered_event=None,
+                quarantined_report=None,
+                quarantine_path=None,
+                bytes_recovered=0,
+                prior_line_count=0,
+                final_line_count=0,
+                prior_last_sequence=0,
+                final_last_sequence=0,
+            )
+
+        file_bytes = events_path.read_bytes()
+        prior = self._reader.read_execution(clean_id, strict=False, verify_checksums=True)
+        prior_line_count = len(prior.events)
+        prior_last_seq = prior.last_valid_sequence
+
+        if file_bytes.endswith(b"\n"):
+            if prior.corruptions and tail_policy == "reject":
+                raise StorageCorruptionError(
+                    f"Corruption detected in {clean_id}: {prior.corruptions[0].details}"
+                )
+            return TailRecoveryResult(
+                execution_id=clean_id,
+                action_taken="none",
+                recovered_event=None,
+                quarantined_report=None,
+                quarantine_path=None,
+                bytes_recovered=0,
+                prior_line_count=prior_line_count,
+                final_line_count=prior_line_count,
+                prior_last_sequence=prior_last_seq,
+                final_last_sequence=prior_last_seq,
+            )
+
+        last_nl = file_bytes.rfind(b"\n")
+        prefix_len = last_nl + 1 if last_nl >= 0 else 0
+        raw_tail = file_bytes[prefix_len:]
+        tail_offset = prefix_len
+
+        decoded, issue = _parse_jsonl_line(
+            execution_id=clean_id,
+            raw_line=raw_tail + b"\n",
+            line_number=prior_line_count + 1,
+            byte_offset=tail_offset,
+            verify_checksum=True,
+        )
+
+        is_consistent = False
+        if issue is None and decoded is not None:
+            expected_seq = prior_last_seq + 1
+            existing_ids = {e.event.event_id for e in prior.events}
+            if decoded.sequence == expected_seq and decoded.event_id not in existing_ids:
+                is_consistent = True
+            elif decoded.sequence != expected_seq:
+                issue = CorruptRecordReport(
+                    execution_id=clean_id,
+                    line_number=prior_line_count + 1,
+                    byte_offset=tail_offset,
+                    byte_length=len(raw_tail),
+                    issue_kind="sequence_gap",
+                    excerpt_sha256=hashlib.sha256(raw_tail).hexdigest(),
+                    details=f"Sequence gap: expected {expected_seq}, got {decoded.sequence}",
+                )
+            else:
+                issue = CorruptRecordReport(
+                    execution_id=clean_id,
+                    line_number=prior_line_count + 1,
+                    byte_offset=tail_offset,
+                    byte_length=len(raw_tail),
+                    issue_kind="event_validation_failed",
+                    excerpt_sha256=hashlib.sha256(raw_tail).hexdigest(),
+                    details=f"Duplicate event_id: {decoded.event_id!r}",
+                )
+
+        if is_consistent and decoded is not None:
+            with events_path.open("ab") as f:
+                f.write(b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+            new_size = len(file_bytes) + 1
+            new_line_count = prior_line_count + 1
+            new_last_seq = decoded.sequence
+            file_sha = compute_file_sha256(events_path)
+
+            status: Literal["finalized", "incomplete"] = (
+                "finalized"
+                if prior.summary and prior.summary.capture_completeness == "complete"
+                else "incomplete"
+            )
+            manifest = ExecutionManifest(
+                execution_id=clean_id,
+                recording_dir=relative_recording_dir(clean_id),
+                status=status,
+                created_at=prior.header.started_at if prior.header else datetime.now(UTC),
+                finalized_at=prior.manifest.finalized_at if prior.manifest else None,
+                byte_size=new_size,
+                line_count=new_line_count,
+                last_sequence=new_last_seq,
+                events_file_sha256=file_sha,
+                corruption_count=0,
+            )
+            write_atomic_private_json(manifest_path, manifest.model_dump(mode="json"), fsync=True)
+            self._store.initialize()
+            self._reconcile_internal(clean_id)
+
+            return TailRecoveryResult(
+                execution_id=clean_id,
+                action_taken="completed_newline",
+                recovered_event=decoded,
+                quarantined_report=None,
+                quarantine_path=None,
+                bytes_recovered=len(raw_tail),
+                prior_line_count=prior_line_count,
+                final_line_count=new_line_count,
+                prior_last_sequence=prior_last_seq,
+                final_last_sequence=new_last_seq,
+            )
+
+        if tail_policy == "reject":
+            details = issue.details if issue else "Inconsistent tail"
+            raise StorageCorruptionError(f"Inconsistent tail in {clean_id}: {details}")
+
+        q_path, _, q_report = quarantine_tail_bytes(
+            exec_dir=exec_dir,
+            execution_id=clean_id,
+            raw_tail=raw_tail,
+            byte_offset=tail_offset,
+            reason=issue.details if issue else "Inconsistent tail",
+            issue_kind=issue.issue_kind if issue else "invalid_json",
+        )
+        tmp_events = exec_dir / f".events.jsonl.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        fd = os.open(tmp_events, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            if prefix_len > 0:
+                os.write(fd, file_bytes[:prefix_len])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp_events, events_path)
+        os.chmod(events_path, 0o600)
+
+        corr_count = (prior.manifest.corruption_count + 1) if prior.manifest else 1
+        manifest = ExecutionManifest(
+            execution_id=clean_id,
+            recording_dir=relative_recording_dir(clean_id),
+            status="incomplete",
+            created_at=prior.header.started_at if prior.header else datetime.now(UTC),
+            byte_size=prefix_len,
+            line_count=prior_line_count,
+            last_sequence=prior_last_seq,
+            events_file_sha256=compute_file_sha256(events_path) if prefix_len > 0 else None,
+            corruption_count=corr_count,
+        )
+        write_atomic_private_json(manifest_path, manifest.model_dump(mode="json"), fsync=True)
+        self._store.initialize()
+        self._reconcile_internal(clean_id)
+
+        return TailRecoveryResult(
+            execution_id=clean_id,
+            action_taken="quarantined",
+            recovered_event=None,
+            quarantined_report=q_report,
+            quarantine_path=q_path,
+            bytes_recovered=0,
+            prior_line_count=prior_line_count,
+            final_line_count=prior_line_count,
+            prior_last_sequence=prior_last_seq,
+            final_last_sequence=prior_last_seq,
+        )
+
     def reconcile_execution(self, execution_id: str) -> JsonlReadResult | None:
         """Rebuild SQLite index state for one execution from authoritative ``events.jsonl``."""
         clean_id = validate_execution_id(execution_id)
+        return self._reconcile_internal(clean_id)
+
+    def _reconcile_internal(self, clean_id: str) -> JsonlReadResult | None:
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         events_path = exec_dir / EVENTS_FILE_NAME
         has_disk = exec_dir.exists() and (
@@ -559,6 +768,7 @@ class RecordingRepository:
         *,
         redaction_mode: RedactionMode = "standard",
         fsync_policy: FsyncPolicy = "lifecycle",
+        tail_policy: TailPolicy = "quarantine",
     ) -> SpoolImportReport:
         """Validate, redact, deduplicate, and import a ``0o600`` local recovery spool."""
         if spool_path.is_symlink():
@@ -709,24 +919,137 @@ class RecordingRepository:
         existing_seqs: set[int] = set()
         existing_header: ExecutionHeader | None = None
         existing_summary: ExecutionSummary | None = None
+        prior_line_count = 0
+        prior_last_seq = 0
+        extra_corruptions: list[CorruptRecordReport] = []
+
+        if (exec_dir / EVENTS_FILE_NAME).exists():
+            tail_res = self.recover_tail(exec_id, tail_policy=tail_policy)
+            if tail_res.quarantined_report is not None:
+                extra_corruptions.append(tail_res.quarantined_report)
+
         if (exec_dir / EVENTS_FILE_NAME).exists() or (exec_dir / EXECUTION_FILE_NAME).exists():
             prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
             existing_header = prior.header
             existing_summary = prior.summary
             existing_events_ids = {item.event.event_id for item in prior.events}
             existing_seqs = {item.event.sequence for item in prior.events}
+            prior_line_count = len(prior.events)
+            prior_last_seq = prior.last_valid_sequence
 
         new_events: list[ExecutionEvent] = []
         skipped_dups = 0
         for ev in parsed_events:
-            if ev.event_id in existing_events_ids or ev.sequence in existing_seqs:
+            if ev.event_id in existing_events_ids and ev.sequence in existing_seqs:
                 skipped_dups += 1
                 continue
+            if ev.event_id in existing_events_ids:
+                if tail_policy == "reject":
+                    raise StorageCorruptionError(
+                        f"Duplicate event_id {ev.event_id!r} with conflicting sequence in spool"
+                    )
+                _, _, q_report = quarantine_tail_bytes(
+                    exec_dir=exec_dir,
+                    execution_id=exec_id,
+                    raw_tail=json.dumps(ev.model_dump(mode="json")).encode("utf-8"),
+                    byte_offset=0,
+                    reason=f"Duplicate event_id {ev.event_id!r} conflicts with existing record",
+                    issue_kind="event_validation_failed",
+                )
+                extra_corruptions.append(q_report)
+                continue
+
+            if ev.sequence in existing_seqs:
+                if tail_policy == "reject":
+                    raise StorageCorruptionError(
+                        f"Duplicate sequence {ev.sequence} with conflicting event_id in spool"
+                    )
+                _, _, q_report = quarantine_tail_bytes(
+                    exec_dir=exec_dir,
+                    execution_id=exec_id,
+                    raw_tail=json.dumps(ev.model_dump(mode="json")).encode("utf-8"),
+                    byte_offset=0,
+                    reason=f"Duplicate sequence {ev.sequence} conflicts with existing record",
+                    issue_kind="sequence_gap",
+                )
+                extra_corruptions.append(q_report)
+                continue
+
             existing_events_ids.add(ev.event_id)
             existing_seqs.add(ev.sequence)
             new_events.append(ev)
 
         new_events.sort(key=lambda e: e.sequence)
+
+        # Validate sequence continuity before accepting new events
+        if new_events:
+            expected_seq = prior_last_seq + 1
+            if new_events[0].sequence != expected_seq:
+                if tail_policy == "reject":
+                    raise StorageCorruptionError(
+                        f"Sequence gap in recovery spool: expected {expected_seq}, "
+                        f"got {new_events[0].sequence}"
+                    )
+                q_bytes = b"".join(
+                    (json.dumps(e.model_dump(mode="json")) + "\n").encode("utf-8")
+                    for e in new_events
+                )
+                _, _, q_report = quarantine_tail_bytes(
+                    exec_dir=exec_dir,
+                    execution_id=exec_id,
+                    raw_tail=q_bytes,
+                    byte_offset=0,
+                    reason=(
+                        f"Sequence gap in spool: expected {expected_seq}, "
+                        f"got {new_events[0].sequence}"
+                    ),
+                    issue_kind="sequence_gap",
+                )
+                extra_corruptions.append(q_report)
+                new_events = []
+            else:
+                valid_contiguous_prefix = [new_events[0]]
+                for prev, curr in itertools.pairwise(new_events):
+                    if curr.sequence != prev.sequence + 1:
+                        if tail_policy == "reject":
+                            raise StorageCorruptionError(
+                                f"Sequence gap in spool: expected {prev.sequence + 1}, "
+                                f"got {curr.sequence}"
+                            )
+                        discontinuous = new_events[len(valid_contiguous_prefix) :]
+                        q_bytes = b"".join(
+                            (json.dumps(e.model_dump(mode="json")) + "\n").encode("utf-8")
+                            for e in discontinuous
+                        )
+                        _, _, q_report = quarantine_tail_bytes(
+                            exec_dir=exec_dir,
+                            execution_id=exec_id,
+                            raw_tail=q_bytes,
+                            byte_offset=0,
+                            reason=(
+                                f"Sequence gap within spool: expected {prev.sequence + 1}, "
+                                f"got {curr.sequence}"
+                            ),
+                            issue_kind="sequence_gap",
+                        )
+                        extra_corruptions.append(q_report)
+                        break
+                    valid_contiguous_prefix.append(curr)
+                new_events = valid_contiguous_prefix
+
+        all_corruptions = fixed_corruptions + tuple(extra_corruptions)
+        if not new_events and parsed_summary is None:
+            final_row = self._store.get_execution_row(exec_id)
+            final_status = final_row.capture_completeness if final_row else "incomplete"
+            if all_corruptions:
+                final_status = "incomplete"
+            return SpoolImportReport(
+                execution_id=exec_id,
+                imported_events=0,
+                skipped_duplicates=skipped_dups,
+                corrupt_lines=all_corruptions,
+                final_status=final_status,
+            )
 
         if parsed_header is None:
             if existing_header is not None:
@@ -754,13 +1077,18 @@ class RecordingRepository:
             fsync_policy=fsync_policy,
             redaction_mode=redaction_mode,
             persist_cwd=self._persist_cwd,
+            tail_policy=tail_policy,
+            seed_line_count=prior_line_count,
+            seed_last_sequence=prior_last_seq,
+            created_at=existing_header.started_at if existing_header else None,
         )
         writer.open(parsed_header)
         if new_events:
             writer.append_events(new_events)
+        all_corruptions = fixed_corruptions + tuple(extra_corruptions)
         if parsed_summary is not None:
             final_summary = parsed_summary
-            if fixed_corruptions:
+            if all_corruptions:
                 final_summary = parsed_summary.model_copy(
                     update={"capture_completeness": "incomplete"}
                 )
@@ -774,11 +1102,13 @@ class RecordingRepository:
 
         final_row = self._store.get_execution_row(exec_id)
         final_status = final_row.capture_completeness if final_row else "incomplete"
+        if all_corruptions:
+            final_status = "incomplete"
         return SpoolImportReport(
             execution_id=exec_id,
             imported_events=len(new_events),
             skipped_duplicates=skipped_dups,
-            corrupt_lines=fixed_corruptions,
+            corrupt_lines=all_corruptions,
             final_status=final_status,
         )
 

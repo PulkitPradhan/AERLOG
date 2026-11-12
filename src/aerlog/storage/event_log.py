@@ -35,6 +35,7 @@ from aerlog.storage.exceptions import (
 STORAGE_SCHEMA_VERSION = "1.0.0"
 
 FsyncPolicy = Literal["lifecycle", "every_batch", "none"]
+TailPolicy = Literal["quarantine", "reject"]
 CorruptionIssueKind = Literal[
     "missing_newline",
     "invalid_utf8",
@@ -291,6 +292,74 @@ class JsonlReadResult:
         return bool(self.corruptions)
 
 
+@dataclass(frozen=True, slots=True)
+class TailRecoveryResult:
+    """Outcome of inspecting and recovering the tail of an events.jsonl file."""
+
+    execution_id: str
+    action_taken: Literal["none", "completed_newline", "quarantined", "retained"]
+    recovered_event: ExecutionEvent | None
+    quarantined_report: CorruptRecordReport | None
+    quarantine_path: Path | None
+    bytes_recovered: int
+    prior_line_count: int
+    final_line_count: int
+    prior_last_sequence: int
+    final_last_sequence: int
+
+
+def quarantine_tail_bytes(
+    exec_dir: Path,
+    execution_id: str,
+    raw_tail: bytes,
+    byte_offset: int,
+    *,
+    reason: str,
+    issue_kind: CorruptionIssueKind = "invalid_json",
+) -> tuple[Path, Path, CorruptRecordReport]:
+    """Safely persist exact corrupted tail bytes and companion JSON metadata with 0o600 mode."""
+    _ensure_private_dir(exec_dir)
+    digest = hashlib.sha256(raw_tail).hexdigest()
+    short_hash = digest[:12]
+    quarantine_name = f"corrupted_tail_offset_{byte_offset}_{short_hash}.quarantine"
+    meta_name = f"corrupted_tail_offset_{byte_offset}_{short_hash}.meta.json"
+
+    quarantine_path = exec_dir / quarantine_name
+    meta_path = exec_dir / meta_name
+
+    tmp_q = exec_dir / f".{quarantine_name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    fd = os.open(tmp_q, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, raw_tail)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_q, quarantine_path)
+    os.chmod(quarantine_path, 0o600)
+
+    meta_payload = {
+        "execution_id": execution_id,
+        "byte_offset": byte_offset,
+        "byte_length": len(raw_tail),
+        "sha256": digest,
+        "issue_kind": issue_kind,
+        "reason": reason,
+        "quarantined_at": datetime.now(UTC).isoformat(),
+    }
+    write_atomic_private_json(meta_path, meta_payload, fsync=True)
+
+    report = CorruptRecordReport(
+        execution_id=execution_id,
+        line_number=-1,
+        byte_offset=byte_offset,
+        byte_length=len(raw_tail),
+        issue_kind=issue_kind,
+        excerpt_sha256=digest,
+        details=f"Quarantined tail: {reason}",
+    )
+    return quarantine_path, meta_path, report
+
+
 def _check_major_version(found: object, *, expected: str, label: str) -> None:
     if not isinstance(found, str) or "." not in found:
         raise UnsupportedSchemaVersionError(f"Invalid {label}: {found!r}")
@@ -322,12 +391,17 @@ class JsonlEventLogWriter:
         fsync_policy: FsyncPolicy = "lifecycle",
         redaction_mode: RedactionMode = "standard",
         persist_cwd: bool = False,
+        tail_policy: TailPolicy = "quarantine",
+        seed_line_count: int | None = None,
+        seed_last_sequence: int | None = None,
+        created_at: datetime | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._execution_id = validate_execution_id(execution_id)
         self._fsync_policy: FsyncPolicy = fsync_policy
         self._redaction_mode: RedactionMode = redaction_mode
         self._persist_cwd = persist_cwd
+        self._tail_policy: TailPolicy = tail_policy
 
         self._exec_dir = resolve_execution_dir(data_dir, self._execution_id)
         self._events_path = self._exec_dir / EVENTS_FILE_NAME
@@ -336,9 +410,14 @@ class JsonlEventLogWriter:
 
         self._fd: int | None = None
         self._byte_offset = 0
-        self._line_count = 0
-        self._last_sequence = 0
-        self._created_at: datetime | None = None
+        self._line_count = seed_line_count or 0
+        self._last_sequence = seed_last_sequence or 0
+        self._created_at: datetime | None = created_at
+        self._seed_line_count = seed_line_count
+        self._seed_last_sequence = seed_last_sequence
+
+        self._retained_tail: bytes = b""
+        self._retained_tail_offset: int = 0
 
     @property
     def execution_id(self) -> str:
@@ -360,6 +439,16 @@ class JsonlEventLogWriter:
         """Current append byte offset within ``events.jsonl``."""
         return self._byte_offset
 
+    @property
+    def line_count(self) -> int:
+        """Current number of appended lines within ``events.jsonl``."""
+        return self._line_count
+
+    @property
+    def last_sequence(self) -> int:
+        """Maximum sequence number observed and persisted by this writer."""
+        return self._last_sequence
+
     def open(self, header: ExecutionHeader) -> ExecutionManifest:
         """Create ``0o700`` dir, open ``0o600`` JSONL file, and write initial metadata."""
         if header.execution_id != self._execution_id:
@@ -370,8 +459,31 @@ class JsonlEventLogWriter:
         _ensure_private_dir(self._data_dir / EXECUTIONS_DIR_NAME)
         _ensure_private_dir(self._exec_dir)
 
+        # Inspect pre-existing events file if present before opening
+        if self._events_path.exists() and self._events_path.stat().st_size > 0:
+            file_bytes = self._events_path.read_bytes()
+            if not file_bytes.endswith(b"\n"):
+                last_nl = file_bytes.rfind(b"\n")
+                prefix_len = last_nl + 1 if last_nl >= 0 else 0
+                raw_tail = file_bytes[prefix_len:]
+                self._retained_tail_offset = prefix_len
+                self._retained_tail = raw_tail
+
+            if (
+                self._seed_line_count is None or self._seed_last_sequence is None
+            ) and self._manifest_path.exists():
+                try:
+                    raw_m = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+                    if isinstance(raw_m, dict):
+                        if self._seed_line_count is None:
+                            self._line_count = int(raw_m.get("line_count", 0))
+                        if self._seed_last_sequence is None:
+                            self._last_sequence = int(raw_m.get("last_sequence", 0))
+                except Exception:
+                    pass
+
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(self._events_path, flags, 0o600)
@@ -387,12 +499,12 @@ class JsonlEventLogWriter:
             safe_header.model_dump(mode="json"),
             fsync=self._fsync_policy != "none",
         )
-        self._created_at = header.started_at
+        self._created_at = self._created_at or header.started_at
         manifest = ExecutionManifest(
             execution_id=self._execution_id,
             recording_dir=relative_recording_dir(self._execution_id),
             status="recording",
-            created_at=header.started_at,
+            created_at=self._created_at,
             byte_size=self._byte_offset,
             line_count=self._line_count,
             last_sequence=self._last_sequence,
@@ -434,12 +546,119 @@ class JsonlEventLogWriter:
             line_bytes = (json.dumps(wrapper, ensure_ascii=False) + "\n").encode("utf-8")
             encoded_records.append((safe_event, line_bytes))
 
-        combined = b"".join(line for _, line in encoded_records)
-        base_offset = self._byte_offset
+        to_write: list[bytes] = []
+        slices: list[WrittenEventSlice] = []
+
+        if self._retained_tail:
+            first_event, first_line = encoded_records[0]
+            if first_line.startswith(self._retained_tail):
+                suffix = first_line[len(self._retained_tail) :]
+                to_write.append(suffix)
+                slices.append(
+                    WrittenEventSlice(
+                        event=first_event,
+                        byte_offset=self._retained_tail_offset,
+                        byte_length=len(first_line),
+                    )
+                )
+                cursor = self._retained_tail_offset + len(first_line)
+                self._retained_tail = b""
+                self._line_count += 1
+                if first_event.sequence > self._last_sequence:
+                    self._last_sequence = first_event.sequence
+
+                for safe_event, line_bytes in encoded_records[1:]:
+                    to_write.append(line_bytes)
+                    slices.append(
+                        WrittenEventSlice(
+                            event=safe_event,
+                            byte_offset=cursor,
+                            byte_length=len(line_bytes),
+                        )
+                    )
+                    cursor += len(line_bytes)
+                    self._line_count += 1
+                    if safe_event.sequence > self._last_sequence:
+                        self._last_sequence = safe_event.sequence
+            else:
+                if self._tail_policy == "reject":
+                    raise StorageCorruptionError(
+                        f"Cannot append to {self._events_path}: incomplete trailing bytes "
+                        f"do not match next append event"
+                    )
+                quarantine_tail_bytes(
+                    exec_dir=self._exec_dir,
+                    execution_id=self._execution_id,
+                    raw_tail=self._retained_tail,
+                    byte_offset=self._retained_tail_offset,
+                    reason="Incomplete tail bytes mismatched next append event",
+                    issue_kind="invalid_json",
+                )
+                os.ftruncate(self._fd, self._retained_tail_offset)
+                os.lseek(self._fd, self._retained_tail_offset, os.SEEK_SET)
+                self._byte_offset = self._retained_tail_offset
+                self._retained_tail = b""
+
+                cursor = self._byte_offset
+                for safe_event, line_bytes in encoded_records:
+                    to_write.append(line_bytes)
+                    slices.append(
+                        WrittenEventSlice(
+                            event=safe_event,
+                            byte_offset=cursor,
+                            byte_length=len(line_bytes),
+                        )
+                    )
+                    cursor += len(line_bytes)
+                    self._line_count += 1
+                    if safe_event.sequence > self._last_sequence:
+                        self._last_sequence = safe_event.sequence
+        else:
+            cursor = self._byte_offset
+            for safe_event, line_bytes in encoded_records:
+                to_write.append(line_bytes)
+                slices.append(
+                    WrittenEventSlice(
+                        event=safe_event,
+                        byte_offset=cursor,
+                        byte_length=len(line_bytes),
+                    )
+                )
+                cursor += len(line_bytes)
+                self._line_count += 1
+                if safe_event.sequence > self._last_sequence:
+                    self._last_sequence = safe_event.sequence
+
+        combined = b"".join(to_write)
+        if combined:
+            try:
+                view = memoryview(combined)
+                written = 0
+                while written < len(combined):
+                    n = os.write(self._fd, view[written:])
+                    if n <= 0:
+                        raise StorageWriteError(f"Zero-byte write to {self._events_path}")
+                    written += n
+                if self._fsync_policy == "every_batch":
+                    os.fsync(self._fd)
+            except OSError as exc:
+                raise _translate_os_error(exc, context=f"appending to {self._events_path}") from exc
+
+        self._byte_offset = cursor
+        return tuple(slices)
+
+    def append_tail_fragment(self, fragment: bytes) -> WrittenEventSlice | None:
+        """Combine an incoming byte fragment with the retained incomplete tail."""
+        if self._fd is None:
+            raise StorageWriteError("JsonlEventLogWriter is not open")
+        if not fragment:
+            return None
+
+        combined = self._retained_tail + fragment
         try:
-            view = memoryview(combined)
+            view = memoryview(fragment)
             written = 0
-            while written < len(combined):
+            while written < len(fragment):
                 n = os.write(self._fd, view[written:])
                 if n <= 0:
                     raise StorageWriteError(f"Zero-byte write to {self._events_path}")
@@ -447,24 +666,48 @@ class JsonlEventLogWriter:
             if self._fsync_policy == "every_batch":
                 os.fsync(self._fd)
         except OSError as exc:
-            raise _translate_os_error(exc, context=f"appending to {self._events_path}") from exc
+            raise _translate_os_error(
+                exc, context=f"appending fragment to {self._events_path}"
+            ) from exc
 
-        slices: list[WrittenEventSlice] = []
-        cursor = base_offset
-        for safe_event, line_bytes in encoded_records:
-            slices.append(
-                WrittenEventSlice(
-                    event=safe_event,
-                    byte_offset=cursor,
-                    byte_length=len(line_bytes),
-                )
+        self._byte_offset += len(fragment)
+
+        if combined.endswith(b"\n"):
+            decoded, issue = _parse_jsonl_line(
+                execution_id=self._execution_id,
+                raw_line=combined,
+                line_number=self._line_count + 1,
+                byte_offset=self._retained_tail_offset,
+                verify_checksum=True,
             )
-            cursor += len(line_bytes)
+            if issue is not None or decoded is None:
+                if self._tail_policy == "reject":
+                    reason = issue.details if issue else "invalid record"
+                    raise StorageCorruptionError(f"Combined tail fragment invalid: {reason}")
+                quarantine_tail_bytes(
+                    exec_dir=self._exec_dir,
+                    execution_id=self._execution_id,
+                    raw_tail=combined,
+                    byte_offset=self._retained_tail_offset,
+                    reason=issue.details if issue else "invalid record",
+                    issue_kind=issue.issue_kind if issue else "invalid_json",
+                )
+                self._retained_tail = b""
+                return None
+
             self._line_count += 1
-            if safe_event.sequence > self._last_sequence:
-                self._last_sequence = safe_event.sequence
-        self._byte_offset = cursor
-        return tuple(slices)
+            if decoded.sequence > self._last_sequence:
+                self._last_sequence = decoded.sequence
+            slice_res = WrittenEventSlice(
+                event=decoded,
+                byte_offset=self._retained_tail_offset,
+                byte_length=len(combined),
+            )
+            self._retained_tail = b""
+            return slice_res
+        else:
+            self._retained_tail = combined
+            return None
 
     def flush(self) -> None:
         """Flush buffered writes cleanly if ``fsync_policy != 'none'``."""
@@ -473,6 +716,31 @@ class JsonlEventLogWriter:
                 os.fsync(self._fd)
             except OSError as exc:
                 raise _translate_os_error(exc, context=f"fsyncing {self._events_path}") from exc
+
+        if self._manifest_path.exists():
+            try:
+                raw_m = json.loads(self._manifest_path.read_text(encoding="utf-8"))
+                if isinstance(raw_m, dict):
+                    status = raw_m.get("status", "recording")
+                    manifest = ExecutionManifest(
+                        execution_id=self._execution_id,
+                        recording_dir=relative_recording_dir(self._execution_id),
+                        status=status,
+                        created_at=self._created_at or datetime.now(UTC),
+                        finalized_at=raw_m.get("finalized_at"),
+                        byte_size=self._byte_offset,
+                        line_count=self._line_count,
+                        last_sequence=self._last_sequence,
+                        events_file_sha256=raw_m.get("events_file_sha256"),
+                        corruption_count=int(raw_m.get("corruption_count", 0)),
+                    )
+                    write_atomic_private_json(
+                        self._manifest_path,
+                        manifest.model_dump(mode="json"),
+                        fsync=self._fsync_policy != "none",
+                    )
+            except Exception:
+                pass
 
     def finalize(self, summary: ExecutionSummary) -> ExecutionManifest:
         """Atomically persist final summary and verified manifest metadata."""
@@ -496,8 +764,11 @@ class JsonlEventLogWriter:
         )
 
         file_sha = compute_file_sha256(self._events_path) if self._events_path.exists() else None
+        corruption_count = len(list(self._exec_dir.glob("corrupted_tail_*.quarantine")))
         status: Literal["finalized", "incomplete"] = (
-            "finalized" if summary.capture_completeness == "complete" else "incomplete"
+            "finalized"
+            if (summary.capture_completeness == "complete" and corruption_count == 0)
+            else "incomplete"
         )
         manifest = ExecutionManifest(
             execution_id=self._execution_id,
@@ -509,7 +780,7 @@ class JsonlEventLogWriter:
             line_count=self._line_count,
             last_sequence=self._last_sequence,
             events_file_sha256=file_sha,
-            corruption_count=0,
+            corruption_count=corruption_count,
         )
         write_atomic_private_json(
             self._manifest_path,
@@ -521,6 +792,7 @@ class JsonlEventLogWriter:
     def close(self) -> None:
         """Close the underlying JSONL file descriptor cleanly."""
         if self._fd is not None:
+            self.flush()
             fd = self._fd
             self._fd = None
             os.close(fd)
@@ -932,10 +1204,13 @@ __all__ = [
     "JsonlEventLogReader",
     "JsonlEventLogWriter",
     "JsonlReadResult",
+    "TailPolicy",
+    "TailRecoveryResult",
     "WrittenEventSlice",
     "canonical_event_sha256",
     "compute_file_sha256",
     "iter_jsonl_slices_from_events",
+    "quarantine_tail_bytes",
     "relative_recording_dir",
     "resolve_execution_dir",
     "sanitize_event_for_persistence",
