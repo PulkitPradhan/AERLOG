@@ -203,6 +203,8 @@ class EventNormalizer:
         )
 
         self._sequence = 0
+        self._final_sequence: int | None = None
+        self._final_event_id: str | None = None
         self._degraded_events = 0
         self._warning_count = 0
         self._gap_count = 0
@@ -1096,9 +1098,15 @@ class EventNormalizer:
         else:
             completeness = "complete"
 
-        final_seq = self._next_sequence()
+        if self._final_sequence is None or self._final_event_id is None:
+            self._final_sequence = self._next_sequence()
+            self._final_event_id = new_event_id()
+        final_seq = self._final_sequence
+        final_id = self._final_event_id
+        assert final_id is not None
+
         finished_event = ExecutionEvent(
-            event_id=new_event_id(),
+            event_id=final_id,
             execution_id=self._execution_id,
             sequence=final_seq,
             timestamp=ended_at,
