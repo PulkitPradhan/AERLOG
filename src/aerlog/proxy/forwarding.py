@@ -20,6 +20,26 @@ STDERR_LINE_MAX_BUFFER_BYTES = 262_144
 StreamDirection = Literal["client_to_server", "server_to_client"]
 
 
+class WritableByteStream(Protocol):
+    """Minimal async byte writer interface satisfied by ``asyncio.StreamWriter``."""
+
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        """Buffer bytes to be written to the underlying stream."""
+        ...
+
+    async def drain(self) -> None:
+        """Apply flow-control backpressure until buffered bytes flush."""
+        ...
+
+    def close(self) -> None:
+        """Initiate orderly stream closure after buffered writes flush."""
+        ...
+
+    async def wait_closed(self) -> None:
+        """Wait until stream closure and underlying resource release finish."""
+        ...
+
+
 class ProxyObserver(Protocol):
     """Structural observer protocol notified read-only of proxy wire and lifecycle events."""
 
@@ -119,7 +139,7 @@ class StreamForwardResult:
 async def forward_protocol_stream(
     direction: StreamDirection,
     reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
+    writer: WritableByteStream,
     sink: DiagnosticSink,
     *,
     max_frame_bytes: int,
