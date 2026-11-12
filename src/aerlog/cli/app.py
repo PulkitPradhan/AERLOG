@@ -73,6 +73,7 @@ from aerlog.replay import (
     CassetteValidationError,
     MissingResponsePolicy,
     ReplayError,
+    ReplayInterruptedError,
     ReplayMatchMode,
     UnsafeToolPolicy,
     build_cassette_from_execution,
@@ -1500,6 +1501,8 @@ def replay_recorded_execution(
                     require_exact_id=exact_id,
                 )
             )
+        except ReplayInterruptedError as exc:
+            raise typer.Exit(code=exc.exit_code) from exc
         except KeyboardInterrupt as exc:
             raise typer.Exit(code=130) from exc
         except (ReplayError, OSError, ValueError) as exc:

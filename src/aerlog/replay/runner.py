@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import sys
+import signal
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from aerlog.events.models import classify_jsonrpc_id
 from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES, FrameAccumulator, FrameTooLargeError
+from aerlog.proxy.forwarding import WritableByteStream
+from aerlog.proxy.stdio_proxy import _OwnedStdinStream, open_stdin_stream, open_stdout_stream
 from aerlog.replay.cassette import Cassette, verify_cassette_integrity
 from aerlog.replay.matcher import (
     CassetteMatcher,
@@ -26,12 +28,16 @@ from aerlog.replay.matcher import (
 )
 from aerlog.replay.safety import (
     CassetteValidationError,
+    ReplayInterruptedError,
     SafetyAuditNotice,
     SideEffectClass,
     UnsafeToolPolicy,
     ensure_replay_mode_allowed,
 )
 from aerlog.storage.event_log import validate_execution_id, write_atomic_private_json
+
+_T = TypeVar("_T")
+_SERVE_CHUNK_SIZE = 65_536
 
 REPLAY_SCHEMA_VERSION: Final[Literal["1.0.0"]] = "1.0.0"
 REPLAYS_DIR_NAME: Final[str] = "replays"
@@ -400,9 +406,13 @@ async def serve_cassette_stdio(
 ) -> ReplayReport:
     """Run an offline cassette-backed MCP stdio mock server over newline JSON-RPC frames.
 
-    Reads client JSON-RPC requests/notifications from stdin (never spawning any server
-    process or making network calls) and writes matching recorded notifications and
-    responses to stdout cleanly until EOF.
+    Reads client JSON-RPC requests/notifications from stdin via event-loop stream
+    transports (never spawning any server process or making network calls) and writes
+    matching recorded notifications and responses to stdout cleanly until EOF or signal.
+
+    Raises:
+        ReplayInterruptedError: When interrupted by ``SIGINT`` (exit code ``130``) or
+            ``SIGTERM`` (exit code ``143``).
     """
     ensure_replay_mode_allowed(mode)
     session = CassetteReplaySession(
@@ -415,69 +425,203 @@ async def serve_cassette_stdio(
         replay_id=replay_id,
     )
 
-    stdin_fd = sys.stdin.buffer.fileno() if read_chunk is None else -1
-    stdout_fd = sys.stdout.buffer.fileno() if write_frame is None else -1
-
-    def _default_read() -> bytes:
-        return os.read(stdin_fd, 65_536)
-
-    def _default_write(data: bytes) -> None:
-        view = memoryview(data)
-        sent = 0
-        while sent < len(data):
-            sent += os.write(stdout_fd, view[sent:])
-
-    reader = _default_read if read_chunk is None else read_chunk
-    writer = _default_write if write_frame is None else write_frame
+    loop = asyncio.get_running_loop()
     accumulator = FrameAccumulator("client_to_server", DEFAULT_MAX_FRAME_BYTES)
 
-    while True:
-        chunk = await asyncio.to_thread(reader)
-        if not chunk:
-            break
-        try:
-            frames = accumulator.feed(chunk)
-        except FrameTooLargeError as exc:
-            err_reply = _encode_json_frame(
-                {
-                    "jsonrpc": "2.0",
-                    "id": None,
-                    "error": {"code": -32600, "message": str(exc)},
-                }
+    stdin_handle: _OwnedStdinStream | None = None
+    stdout_writer: WritableByteStream | None = None
+    registered_signals: list[signal.Signals] = []
+    signal_event = asyncio.Event()
+    received_signal: signal.Signals | None = None
+    active_op_task: asyncio.Task[Any] | None = None
+    sig_wait_task: asyncio.Task[bool] | None = None
+    primary_cancel: asyncio.CancelledError | None = None
+    primary_exc: BaseException | None = None
+    teardown_task: asyncio.Task[None] | None = None
+
+    def _on_signal(sig: signal.Signals) -> None:
+        nonlocal received_signal
+        if received_signal is None:
+            received_signal = sig
+            signal_event.set()
+
+    def _raise_if_signaled() -> None:
+        if received_signal is not None:
+            raise ReplayInterruptedError(
+                signal_num=received_signal.value,
+                signal_name=received_signal.name,
             )
-            await asyncio.to_thread(writer, err_reply)
-            break
 
-        for frame in frames:
+    async def _run_interruptible(coro: Coroutine[Any, Any, _T]) -> _T:
+        nonlocal active_op_task
+        if received_signal is not None:
+            with suppress(Exception):
+                coro.close()
+            _raise_if_signaled()
+        assert sig_wait_task is not None
+        op_task = asyncio.create_task(coro)
+        active_op_task = op_task
+        try:
+            done, _ = await asyncio.wait(
+                {op_task, sig_wait_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if received_signal is not None or sig_wait_task in done:
+                if not op_task.done():
+                    op_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await op_task
+                sig = signal.SIGINT if received_signal is None else received_signal
+                raise ReplayInterruptedError(signal_num=sig.value, signal_name=sig.name)
+            return op_task.result()
+        finally:
+            active_op_task = None
+
+    async def _write_output(data: bytes) -> None:
+        if write_frame is not None:
+            await _run_interruptible(asyncio.to_thread(write_frame, data))
+            return
+        assert stdout_writer is not None
+        _raise_if_signaled()
+        stdout_writer.write(data)
+        await _run_interruptible(stdout_writer.drain())
+
+    async def _cleanup_once() -> None:
+        errors: list[BaseException] = []
+        if active_op_task is not None and not active_op_task.done():
+            active_op_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await active_op_task
+        if sig_wait_task is not None and not sig_wait_task.done():
+            sig_wait_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await sig_wait_task
+
+        for sig in registered_signals:
+            with suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(sig)
+        registered_signals.clear()
+
+        if stdin_handle is not None:
             try:
-                decoded = json.loads(frame.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                await stdin_handle.aclose()
+            except (Exception, asyncio.CancelledError) as exc:
+                errors.append(exc)
+
+        if stdout_writer is not None:
+            try:
+                stdout_writer.close()
+                await stdout_writer.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except (Exception, asyncio.CancelledError) as exc:
+                errors.append(exc)
+
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Replay server cleanup failed", errors)
+
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _on_signal, sig)
+                registered_signals.append(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        if read_chunk is None:
+            stdin_handle = await open_stdin_stream(loop, _SERVE_CHUNK_SIZE)
+        if write_frame is None:
+            stdout_writer = await open_stdout_stream(loop, _SERVE_CHUNK_SIZE)
+
+        sig_wait_task = asyncio.create_task(signal_event.wait())
+
+        while True:
+            _raise_if_signaled()
+            if read_chunk is None:
+                assert stdin_handle is not None
+                chunk = await _run_interruptible(stdin_handle.reader.read(_SERVE_CHUNK_SIZE))
+            else:
+                chunk = await _run_interruptible(asyncio.to_thread(read_chunk))
+            if not chunk:
+                _raise_if_signaled()
+                break
+
+            try:
+                frames = accumulator.feed(chunk)
+            except FrameTooLargeError as exc:
                 err_reply = _encode_json_frame(
                     {
                         "jsonrpc": "2.0",
                         "id": None,
-                        "error": {"code": -32700, "message": f"Invalid JSON frame: {exc}"},
+                        "error": {"code": -32600, "message": str(exc)},
                     }
                 )
-                await asyncio.to_thread(writer, err_reply)
-                continue
+                await _write_output(err_reply)
+                break
 
-            if not isinstance(decoded, Mapping):
-                err_reply = _encode_json_frame(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32600, "message": "Expected JSON-RPC object frame"},
-                    }
-                )
-                await asyncio.to_thread(writer, err_reply)
-                continue
+            for frame in frames:
+                _raise_if_signaled()
+                try:
+                    decoded = json.loads(frame.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    err_reply = _encode_json_frame(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {"code": -32700, "message": f"Invalid JSON frame: {exc}"},
+                        }
+                    )
+                    await _write_output(err_reply)
+                    continue
 
-            emitted_notifs, reply_obj = session.process_incoming_object(decoded)
-            for notif_obj in emitted_notifs:
-                await asyncio.to_thread(writer, _encode_json_frame(notif_obj))
-            if reply_obj is not None:
-                await asyncio.to_thread(writer, _encode_json_frame(reply_obj))
+                if not isinstance(decoded, Mapping):
+                    err_reply = _encode_json_frame(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": None,
+                            "error": {"code": -32600, "message": "Expected JSON-RPC object frame"},
+                        }
+                    )
+                    await _write_output(err_reply)
+                    continue
+
+                emitted_notifs, reply_obj = session.process_incoming_object(decoded)
+                for notif_obj in emitted_notifs:
+                    await _write_output(_encode_json_frame(notif_obj))
+                if reply_obj is not None:
+                    await _write_output(_encode_json_frame(reply_obj))
+
+        _raise_if_signaled()
+    except asyncio.CancelledError as exc:
+        primary_cancel = exc
+        raise
+    except BaseException as exc:
+        primary_exc = exc
+        raise
+    finally:
+        if teardown_task is None:
+            teardown_task = asyncio.create_task(_cleanup_once())
+        teardown_cancel: asyncio.CancelledError | None = None
+        while not teardown_task.done():
+            try:
+                await asyncio.shield(teardown_task)
+            except asyncio.CancelledError as exc:
+                if teardown_cancel is None:
+                    teardown_cancel = exc
+        cleanup_exc = teardown_task.exception()
+        if cleanup_exc is not None:
+            if primary_cancel is not None:
+                primary_cancel.add_note(f"Replay cleanup failed: {cleanup_exc!r}")
+            elif primary_exc is not None:
+                primary_exc.add_note(f"Replay cleanup failed: {cleanup_exc!r}")
+            elif teardown_cancel is not None:
+                teardown_cancel.add_note(f"Replay cleanup failed: {cleanup_exc!r}")
+            else:
+                raise cleanup_exc
+        if teardown_cancel is not None and primary_cancel is None and primary_exc is None:
+            raise teardown_cancel
 
     return session.finalize()
 

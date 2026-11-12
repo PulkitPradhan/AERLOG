@@ -120,6 +120,16 @@ class ReplayMissingCassetteError(ReplayError):
     """Raised when a requested cassette file or source execution cannot be located."""
 
 
+class ReplayInterruptedError(ReplayError):
+    """Raised when ``serve_cassette_stdio`` is interrupted cleanly by an OS signal."""
+
+    def __init__(self, *, signal_num: int, signal_name: str) -> None:
+        self.signal_num = signal_num
+        self.signal_name = signal_name
+        self.exit_code = 128 + signal_num
+        super().__init__(f"Replay server interrupted by {signal_name} (exit_code={self.exit_code})")
+
+
 class ToolSideEffectAssessment(BaseModel):
     """Conservative side-effect classification attached to a recorded interaction."""
 
@@ -257,6 +267,7 @@ __all__ = [
     "CassetteValidationError",
     "LiveReplayBlockedError",
     "ReplayError",
+    "ReplayInterruptedError",
     "ReplayMissingCassetteError",
     "ReplayMode",
     "SafetyAuditNotice",
