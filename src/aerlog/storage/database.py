@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from collections.abc import Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -36,6 +37,20 @@ from aerlog.storage.migrations import LATEST_DB_SCHEMA_VERSION, apply_migrations
 
 DB_FILE_NAME = "aerlog.db"
 SqliteSynchronousMode = Literal["NORMAL", "FULL"]
+
+
+def _is_transient_sqlite_lock_error(exc: sqlite3.Error) -> bool:
+    """Determine whether a SQLite error represents a transient lock/busy collision."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (5, 6)
+
+    name = getattr(exc, "sqlite_errorname", None)
+    if isinstance(name, str):
+        return name in ("SQLITE_BUSY", "SQLITE_LOCKED")
+
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg
 
 
 def _translate_sqlite_error(exc: sqlite3.Error, *, context: str) -> StorageWriteError:
@@ -177,28 +192,40 @@ class SQLiteMetadataStore:
         else:
             os.chmod(self._db_path, 0o600)
 
-        conn = sqlite3.connect(
-            str(self._db_path),
-            timeout=self._busy_timeout_ms / 1000.0,
-            isolation_level=None,
-            check_same_thread=False,
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute(f"PRAGMA synchronous = {self._synchronous}")
+        max_attempts = 5
+        backoffs = (0.02, 0.04, 0.08, 0.16)
 
-        try:
-            apply_migrations(conn)
-        except Exception:
-            conn.close()
+        for attempt in range(max_attempts):
+            conn = sqlite3.connect(
+                str(self._db_path),
+                timeout=self._busy_timeout_ms / 1000.0,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute(f"PRAGMA busy_timeout = {int(self._busy_timeout_ms)}")
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute(f"PRAGMA synchronous = {self._synchronous}")
+                apply_migrations(conn)
+            except sqlite3.Error as exc:
+                conn.close()
+                self._restrict_sqlite_files()
+                if _is_transient_sqlite_lock_error(exc) and attempt < max_attempts - 1:
+                    time.sleep(backoffs[attempt])
+                    continue
+                raise
+            except Exception:
+                conn.close()
+                self._restrict_sqlite_files()
+                raise
+
+            self._conn = conn
             self._restrict_sqlite_files()
-            raise
+            return conn
 
-        self._conn = conn
-        self._restrict_sqlite_files()
-        return conn
+        raise StorageWriteError("Failed to initialize SQLite connection after retry exhaustion")
 
     def initialize(self) -> int:
         """Open connection, configure WAL/permissions, apply migrations, and return version."""

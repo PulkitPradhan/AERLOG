@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
+import sqlite3
 import threading
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +16,26 @@ from aerlog.events.models import ExecutionEvent, ExecutionHeader, ExecutionSumma
 from aerlog.events.types import RedactionMode
 from aerlog.storage.database import SQLiteMetadataStore, SqliteSynchronousMode
 from aerlog.storage.event_log import FsyncPolicy, JsonlEventLogWriter
-from aerlog.storage.exceptions import StorageWriteError
+from aerlog.storage.exceptions import (
+    StorageDiskFullError,
+    StorageWriteError,
+    UnsupportedSchemaVersionError,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _is_sqlite_metadata_error(exc: BaseException) -> bool:
+    """Return True if exc represents a recognized SQLite error or wrapper.
+
+    Specifically handles ``sqlite3.Error``, ``UnsupportedSchemaVersionError``,
+    or ``StorageWriteError``/``StorageDiskFullError`` wrapping a ``sqlite3.Error``.
+    """
+    if isinstance(exc, (sqlite3.Error, UnsupportedSchemaVersionError)):
+        return True
+    if isinstance(exc, (StorageWriteError, StorageDiskFullError)):
+        return isinstance(exc.__cause__, sqlite3.Error)
+    return False
 
 
 class PersistentCaptureSink:
@@ -99,7 +121,6 @@ class PersistentCaptureSink:
         return asyncio.wrap_future(cf_future, loop=loop)
 
     def _on_start_sync(self, header: ExecutionHeader) -> None:
-        self._store.initialize()
         if (
             header.redaction_mode != self._redaction_mode
             and self._redaction_mode != "explicit_unredacted"
@@ -119,10 +140,23 @@ class PersistentCaptureSink:
         self._writer = writer
         self._execution_id = header.execution_id
         try:
+            self._store.initialize()
             self._store.insert_execution_start(header)
-        except Exception:
-            self._sqlite_diverged = True
-            raise
+        except Exception as exc:
+            if _is_sqlite_metadata_error(exc):
+                self._sqlite_diverged = True
+                logger.warning(
+                    "SQLite metadata store failed during startup for %s; "
+                    "continuing with primary JSONL: %s",
+                    header.execution_id,
+                    exc,
+                )
+            else:
+                with suppress(Exception):
+                    writer.close()
+                self._writer = None
+                self._execution_id = None
+                raise
 
     def _emit_events_sync(self, events: Sequence[ExecutionEvent]) -> None:
         if not events:
@@ -130,26 +164,42 @@ class PersistentCaptureSink:
         if self._writer is None or self._execution_id is None:
             raise StorageWriteError("PersistentCaptureSink.on_start() must precede emit_events()")
         slices = self._writer.append_events(events)
-        try:
-            self._store.insert_event_slices(self._execution_id, slices)
-        except Exception:
-            self._sqlite_diverged = True
-            raise
+        if not self._sqlite_diverged:
+            try:
+                self._store.insert_event_slices(self._execution_id, slices)
+            except Exception as exc:
+                if _is_sqlite_metadata_error(exc):
+                    self._sqlite_diverged = True
+                    logger.warning(
+                        "SQLite event index insertion failed for %s; marking diverged: %s",
+                        self._execution_id,
+                        exc,
+                    )
+                else:
+                    raise
 
     def _on_finish_sync(self, summary: ExecutionSummary) -> None:
         if self._writer is None or self._execution_id is None:
             raise StorageWriteError("PersistentCaptureSink.on_start() must precede on_finish()")
         manifest = self._writer.finalize(summary)
-        try:
-            self._store.update_execution_finish(
-                summary,
-                jsonl_byte_offset=manifest.byte_size,
-                jsonl_sha256=manifest.events_file_sha256,
-                index_status="diverged" if self._sqlite_diverged else "indexed",
-            )
-        except Exception:
-            self._sqlite_diverged = True
-            raise
+        if not self._sqlite_diverged:
+            try:
+                self._store.update_execution_finish(
+                    summary,
+                    jsonl_byte_offset=manifest.byte_size,
+                    jsonl_sha256=manifest.events_file_sha256,
+                    index_status="indexed",
+                )
+            except Exception as exc:
+                if _is_sqlite_metadata_error(exc):
+                    self._sqlite_diverged = True
+                    logger.warning(
+                        "SQLite execution finish update failed for %s; marking diverged: %s",
+                        self._execution_id,
+                        exc,
+                    )
+                else:
+                    raise
 
     def _flush_sync(self) -> None:
         if self._writer is not None:
