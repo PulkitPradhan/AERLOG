@@ -844,6 +844,13 @@ class SQLiteMetadataStore:
         )
 
 
+def _decode_index_text_array(row: sqlite3.Row, column: str) -> tuple[str, ...]:
+    value = json.loads(str(row[column]))
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"SQLite index column {column} must contain a JSON array of strings")
+    return tuple(value)
+
+
 def _row_to_execution(row: sqlite3.Row) -> IndexedExecutionRow:
     return IndexedExecutionRow(
         execution_id=str(row["execution_id"]),
@@ -852,7 +859,7 @@ def _row_to_execution(row: sqlite3.Row) -> IndexedExecutionRow:
         started_at=datetime.fromisoformat(str(row["started_at"])),
         ended_at=datetime.fromisoformat(str(row["ended_at"])) if row["ended_at"] else None,
         duration_ns=int(row["duration_ns"]) if row["duration_ns"] is not None else None,
-        command=tuple(json.loads(str(row["command_json"]))),
+        command=_decode_index_text_array(row, "command_json"),
         cwd=str(row["cwd"]) if row["cwd"] is not None else None,
         transport=str(row["transport"]),
         redaction_mode=str(row["redaction_mode"]),
@@ -868,9 +875,9 @@ def _row_to_execution(row: sqlite3.Row) -> IndexedExecutionRow:
         degraded_events=int(row["degraded_events"]),
         warning_count=int(row["warning_count"]),
         gap_count=int(row["gap_count"]),
-        unanswered_request_ids=tuple(json.loads(str(row["unanswered_request_ids_json"]))),
-        observed_trace_ids=tuple(json.loads(str(row["observed_trace_ids_json"]))),
-        observed_mcp_versions=tuple(json.loads(str(row["observed_mcp_versions_json"]))),
+        unanswered_request_ids=_decode_index_text_array(row, "unanswered_request_ids_json"),
+        observed_trace_ids=_decode_index_text_array(row, "observed_trace_ids_json"),
+        observed_mcp_versions=_decode_index_text_array(row, "observed_mcp_versions_json"),
         recording_dir=str(row["recording_dir"]),
         jsonl_byte_offset=int(row["jsonl_byte_offset"]),
         jsonl_sha256=str(row["jsonl_sha256"]) if row["jsonl_sha256"] is not None else None,

@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import stat
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from aerlog.capture.normalizer import EventNormalizer, RawWireFrameInput
+from aerlog.capture.redaction import RedactionConfig
+from aerlog.capture.sinks import RecoverySpool
 from aerlog.events import new_event_id, new_execution_id
 from aerlog.events.models import (
+    CaptureGapPayload,
+    CorrelationInfo,
     ExecutionEvent,
     ExecutionFinishedPayload,
     ExecutionHeader,
+    ExecutionStartedPayload,
     ExecutionSummary,
     JsonRpcRequestPayload,
     RedactionSummary,
+    TraceContext,
+    WireFrameInfo,
 )
+from aerlog.events.types import RedactionMode
 from aerlog.storage import (
     EVENTS_FILE_NAME,
     MANIFEST_FILE_NAME,
@@ -28,8 +40,9 @@ from aerlog.storage import (
     RecordingRepository,
     StorageCorruptionError,
     StorageWriteError,
+    UnsupportedSchemaVersionError,
 )
-from aerlog.storage.event_log import resolve_execution_dir
+from aerlog.storage.event_log import TailPolicy, resolve_execution_dir, write_atomic_private_json
 
 
 def _make_header(exec_id: str, started_at: datetime | None = None) -> ExecutionHeader:
@@ -448,11 +461,12 @@ def test_valid_spool_compatibility_unaffected_by_tail_logic(tmp_path: Path) -> N
     header = _make_header(exec_id)
     ev1 = _make_event(exec_id, 1)
     ev2 = _make_event(exec_id, 2)
+    summary = _make_summary(exec_id).model_copy(update={"returncode": 0})
     ev3 = ExecutionEvent(
         execution_id=exec_id,
         sequence=3,
         event_id=new_event_id(),
-        timestamp=datetime(2026, 11, 13, 4, 0, 3, tzinfo=UTC),
+        timestamp=summary.ended_at,
         monotonic_time_ns=3_000_000,
         direction="proxy",
         kind="execution_finished",
@@ -464,8 +478,6 @@ def test_valid_spool_compatibility_unaffected_by_tail_logic(tmp_path: Path) -> N
             completeness="complete",
         ),
     )
-    summary = _make_summary(exec_id)
-
     # Event 1 already written
     writer = JsonlEventLogWriter(tmp_path, exec_id)
     writer.open(header)
@@ -500,6 +512,11 @@ def test_valid_spool_compatibility_unaffected_by_tail_logic(tmp_path: Path) -> N
 
     events_res = repo.get_execution_events(exec_id)
     assert [e.event.sequence for e in events_res.events] == [1, 2, 3]
+    original = _stored_bytes(tmp_path, exec_id)
+    retry = repo.import_recovery_spool(spool_path)
+    assert retry.imported_events == 0
+    assert retry.skipped_duplicates == 3
+    assert _stored_bytes(tmp_path, exec_id) == original
     repo.close()
 
 
@@ -591,3 +608,1579 @@ def test_failure_safety_atomic_manifest_and_tail_preservation(tmp_path: Path) ->
     # Verify events.jsonl still preserves the tail bytes
     assert events_path.read_bytes() == corrupted_total
     repo.close()
+
+
+def _write_event_spool(
+    path: Path, *events: ExecutionEvent | dict[str, Any], summary: ExecutionSummary | None = None
+) -> Path:
+    records = [
+        {
+            "record_type": "event",
+            "data": event.model_dump(mode="json") if isinstance(event, ExecutionEvent) else event,
+        }
+        for event in events
+    ]
+    if summary is not None:
+        records.append({"record_type": "summary", "data": summary.model_dump(mode="json")})
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    return path
+
+
+def _stored_bytes(data_dir: Path, execution_id: str) -> dict[str, bytes]:
+    return {
+        name: (data_dir / "executions" / execution_id / name).read_bytes()
+        for name in (EVENTS_FILE_NAME, "execution.json", MANIFEST_FILE_NAME)
+    }
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+@pytest.mark.parametrize(
+    "change",
+    ["cross-pair", "different-id", "payload", "timing", "wire", "trace", "correlation", "outcome"],
+)
+def test_import_conflicting_persisted_event(
+    tmp_path: Path, policy: TailPolicy, change: str
+) -> None:
+    eid = new_execution_id()
+    first = _make_event(eid, 1).model_copy(
+        update={"wire": WireFrameInfo(byte_length=10, line_ending="lf", sha256="a" * 64)}
+    )
+    second = ExecutionEvent(
+        execution_id=eid,
+        sequence=2,
+        timestamp=first.timestamp,
+        monotonic_time_ns=2_000_000,
+        direction="proxy",
+        kind="execution_finished",
+        payload=ExecutionFinishedPayload(
+            termination_reason="clean_exit", exit_code=0, total_events=2, completeness="complete"
+        ),
+    )
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, second])
+    summary = _make_summary(eid).model_copy(update={"total_events": 2})
+    writer.finalize(summary)
+    writer.close()
+
+    edits: dict[str, dict[str, Any]] = {
+        "cross-pair": {"sequence": 2},
+        "different-id": {"event_id": new_event_id()},
+        "payload": {"payload": first.payload.model_copy(update={"method": "changed"})},
+        "timing": {"monotonic_time_ns": 100},
+        "wire": {"wire": WireFrameInfo(byte_length=10, line_ending="lf", sha256="b" * 64)},
+        "trace": {"trace": TraceContext(synthetic_execution_trace_id="changed")},
+        "correlation": {
+            "correlation": CorrelationInfo(status="invalid_id", confidence="none", basis="changed")
+        },
+        "outcome": {"payload": second.payload.model_copy(update={"exit_code": 77})},
+    }
+    original_event = second if change == "outcome" else first
+    spool = _write_event_spool(
+        tmp_path / "events.spool", original_event.model_copy(update=edits[change]), summary=summary
+    )
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        original = _stored_bytes(tmp_path, eid)
+        row = repo.store.get_execution_row(eid)
+        rows = repo.store.query_event_index(execution_id=eid)
+        if policy == "reject":
+            db = tmp_path / "aerlog.db"
+            wal = tmp_path / "aerlog.db-wal"
+            before_db = {p: p.read_bytes() for p in (db, wal) if p.exists()}
+            with pytest.raises(StorageCorruptionError, match="conflict"):
+                repo.import_recovery_spool(spool, tail_policy=policy)
+            assert {p: p.read_bytes() for p in before_db} == before_db
+        else:
+            report = repo.import_recovery_spool(spool, tail_policy=policy)
+            assert (report.imported_events, report.skipped_duplicates, report.final_status) == (
+                0,
+                0,
+                "incomplete",
+            )
+            assert len(report.corrupt_lines) == 1
+            assert list(writer.execution_dir.glob("*.quarantine"))
+        assert _stored_bytes(tmp_path, eid) == original
+        assert repo.store.get_execution_row(eid) == row
+        assert repo.store.query_event_index(execution_id=eid) == rows
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+def test_import_duplicate_and_conflict_within_spool(tmp_path: Path, policy: TailPolicy) -> None:
+    eid = new_execution_id()
+    event = _make_event(eid, 1)
+    changed = event.model_copy(update={"payload": event.payload.model_copy(update={"id": 99})})
+    spool = _write_event_spool(tmp_path / "events.spool", event, event, changed)
+    repo = RecordingRepository(tmp_path)
+    try:
+        if policy == "reject":
+            with pytest.raises(StorageCorruptionError, match="conflict"):
+                repo.import_recovery_spool(spool, tail_policy=policy)
+            assert not resolve_execution_dir(tmp_path, eid).exists()
+            assert not repo.store.db_path.exists()
+        else:
+            report = repo.import_recovery_spool(spool, tail_policy=policy)
+            assert (
+                report.imported_events
+                == report.skipped_duplicates
+                == len(report.corrupt_lines)
+                == 1
+            )
+            assert report.final_status == "incomplete"
+            assert [item.event for item in repo.get_execution_events(eid).events] == [event]
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("unterminated", [False, True])
+@pytest.mark.parametrize("repeated", ["id", "sequence"])
+def test_import_refuses_ambiguous_destination_identity(
+    tmp_path: Path, repeated: str, unterminated: bool
+) -> None:
+    eid = new_execution_id()
+    first = _make_event(eid, 1)
+    second = (
+        _make_event(eid, 2, event_id=first.event_id) if repeated == "id" else _make_event(eid, 1)
+    )
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, second])
+    writer.close()
+    if unterminated:
+        writer.events_path.write_bytes(writer.events_path.read_bytes()[:-1])
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", first)
+    repo = RecordingRepository(tmp_path)
+    try:
+        with pytest.raises(StorageCorruptionError, match="Ambiguous"):
+            repo.import_recovery_spool(spool)
+        assert _stored_bytes(tmp_path, eid) == original
+        assert not repo.store.db_path.exists()
+    finally:
+        repo.close()
+
+
+def test_import_reports_missing_explicit_event_identity(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    event = _make_event(eid, 1)
+    missing_id = event.model_dump(mode="json", exclude={"event_id"})
+    spool = _write_event_spool(tmp_path / "events.spool", missing_id, event)
+    repo = RecordingRepository(tmp_path)
+    try:
+        report = repo.import_recovery_spool(spool)
+        assert report.imported_events == 1
+        assert report.skipped_duplicates == 0
+        assert report.final_status == "incomplete"
+        assert len(report.corrupt_lines) == 1
+        issue = report.corrupt_lines[0]
+        assert issue.line_number == 1
+        assert "event_id" in issue.details
+        assert repo.get_execution_events(eid).events[0].event.event_id == event.event_id
+    finally:
+        repo.close()
+
+
+def test_import_preflights_valid_unterminated_tail(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    first, tail = _make_event(eid, 1), _make_event(eid, 2)
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, tail])
+    writer.close()
+    before = writer.events_path.read_bytes()
+    writer.events_path.write_bytes(before[:-1])
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(
+        tmp_path / "events.spool", tail.model_copy(update={"monotonic_time_ns": 99})
+    )
+    repo = RecordingRepository(tmp_path)
+    try:
+        with pytest.raises(StorageCorruptionError, match="conflict"):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert _stored_bytes(tmp_path, eid) == original
+        assert not repo.store.db_path.exists()
+
+        report = repo.import_recovery_spool(_write_event_spool(spool, tail), tail_policy="reject")
+        assert report.skipped_duplicates == 1
+        assert report.imported_events == 0
+        assert writer.events_path.read_bytes() == before
+        assert len(repo.store.query_event_index(execution_id=eid)) == 2
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "import_mode"),
+    [
+        ("standard", "standard"),
+        ("strict_hash_only", "strict_hash_only"),
+        ("strict_hash_only", "standard"),
+    ],
+)
+def test_import_retry_matches_real_redacted_spool(
+    tmp_path: Path, mode: RedactionMode, import_mode: RedactionMode
+) -> None:
+    eid = new_execution_id()
+    header = _make_header(eid)
+    t0 = header.started_at
+    config = RedactionConfig(mode=mode)
+    norm = EventNormalizer(
+        execution_id=eid,
+        started_at=t0,
+        monotonic_start_ns=1,
+        command=("test-server",),
+        redaction_config=config,
+    )
+    (event,) = norm.normalize(
+        RawWireFrameInput(
+            t0,
+            2,
+            "client_to_server",
+            b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"token":"fake","value":"test"}}\n',
+        )
+    )
+    writer = JsonlEventLogWriter(tmp_path, eid, redaction_mode=mode)
+    writer.open(header.model_copy(update={"redaction_mode": mode}))
+    writer.append_events([event])
+    writer.close()
+    spool = RecoverySpool(tmp_path / "events.spool", redaction_config=config)
+    spool.write_events([event])
+    spool.close()
+    repo = RecordingRepository(tmp_path)
+    try:
+        report = repo.import_recovery_spool(
+            spool.path, tail_policy="reject", redaction_mode=import_mode
+        )
+        assert report.skipped_duplicates == 1
+        assert report.imported_events == 0
+        assert not report.corrupt_lines
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("append_event", [True, False])
+def test_import_exact_retry_repairs_stale_index(tmp_path: Path, append_event: bool) -> None:
+    eid = new_execution_id()
+    first, second = _make_event(eid, 1), _make_event(eid, 2)
+    summary = None if append_event else _make_summary(eid).model_copy(update={"total_events": 1})
+    if summary is not None:
+        first = ExecutionEvent(
+            execution_id=eid,
+            sequence=1,
+            timestamp=summary.ended_at,
+            monotonic_time_ns=summary.duration_ns,
+            direction="proxy",
+            kind="execution_finished",
+            payload=ExecutionFinishedPayload(
+                termination_reason="clean_exit",
+                exit_code=0,
+                total_events=1,
+                completeness="complete",
+            ),
+        )
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first])
+    writer.close()
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        events = [first, second] if append_event else [first]
+        spool = _write_event_spool(tmp_path / "events.spool", *events, summary=summary)
+        with (
+            patch.object(repo.store, "replace_execution_index", side_effect=StorageWriteError),
+            pytest.raises(StorageWriteError),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        original = _stored_bytes(tmp_path, eid)
+        assert len(repo.store.query_event_index(execution_id=eid)) == 1
+
+        report = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert report.skipped_duplicates == len(events)
+        assert report.imported_events == 0
+        row = repo.store.get_execution_row(eid)
+        assert row is not None
+        assert row.ended_at == (summary.ended_at if summary is not None else None)
+        assert sorted(row.sequence for row in repo.store.query_event_index(execution_id=eid)) == [
+            event.sequence for event in events
+        ]
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+def test_conflict_only_quarantine_cannot_finalize_existing_recording(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    event = _make_event(eid, 1)
+    changed = event.model_copy(update={"monotonic_time_ns": 99})
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([event])
+    writer.close()
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", changed, summary=_make_summary(eid))
+    repo = RecordingRepository(tmp_path)
+    try:
+        report = repo.import_recovery_spool(spool)
+        assert report.imported_events == report.skipped_duplicates == 0
+        assert len(report.corrupt_lines) == 2
+        assert any("summary conflicts" in issue.details for issue in report.corrupt_lines)
+        assert report.final_status == "incomplete"
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+def test_import_rejects_mismatched_destination_header_before_tail_repair(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    event = _make_event(eid, 1)
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([event])
+    writer.close()
+    writer.events_path.write_bytes(writer.events_path.read_bytes()[:-1])
+    (writer.execution_dir / "execution.json").write_text(
+        _make_header(new_execution_id()).model_dump_json(), encoding="utf-8"
+    )
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", event)
+    repo = RecordingRepository(tmp_path)
+    try:
+        with pytest.raises(StorageCorruptionError, match="Destination metadata"):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert _stored_bytes(tmp_path, eid) == original
+        assert not repo.store.db_path.exists()
+    finally:
+        repo.close()
+
+
+def test_import_torn_spool_retry_repairs_index_without_appending(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    first, second = _make_event(eid, 1), _make_event(eid, 2)
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first])
+    writer.close()
+    spool = _write_event_spool(tmp_path / "events.spool", first, second)
+    with spool.open("ab") as handle:
+        handle.write(b"{")
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        with (
+            patch.object(repo.store, "replace_execution_index", side_effect=StorageWriteError),
+            pytest.raises(StorageWriteError),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        original = _stored_bytes(tmp_path, eid)
+        prior = repo.get_execution_events(eid)
+        assert [item.event for item in prior.events] == [first, second]
+        assert prior.summary is None
+        assert prior.manifest is not None and prior.manifest.status == "recording"
+        assert [row.sequence for row in repo.store.query_event_index(execution_id=eid)] == [1]
+
+        retry = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert (retry.imported_events, retry.skipped_duplicates, retry.final_status) == (
+            0,
+            2,
+            "incomplete",
+        )
+        assert [issue.issue_kind for issue in retry.corrupt_lines] == ["missing_newline"]
+        assert [row.sequence for row in repo.store.query_event_index(execution_id=eid)] == [1, 2]
+        assert _stored_bytes(tmp_path, eid) == original
+        assert spool.read_bytes().endswith(b"{")
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected_status"),
+    [
+        ("complete", "finalized"),
+        ("incomplete", "incomplete"),
+        ("different_outcome", "recording"),
+        ("different_outcome_unterminated", "recording"),
+        ("different_count", "recording"),
+        ("gap_event", "recording"),
+        ("missing_terminal_event", "recording"),
+    ],
+)
+def test_import_event_only_retries_pending_manifest(
+    tmp_path: Path, evidence: str, expected_status: str
+) -> None:
+    eid = new_execution_id()
+    completeness = "incomplete" if evidence == "incomplete" else "complete"
+    summary = _make_summary(eid, completeness=completeness).model_copy(update={"total_events": 2})
+    first = _make_event(eid, 1)
+    if evidence == "gap_event":
+        first = ExecutionEvent(
+            execution_id=eid,
+            sequence=1,
+            timestamp=first.timestamp,
+            monotonic_time_ns=first.monotonic_time_ns,
+            direction="system",
+            kind="capture_gap",
+            payload=CaptureGapPayload(
+                dropped_count=1,
+                reason="test gap",
+                first_gap_monotonic_ns=first.monotonic_time_ns,
+                last_gap_monotonic_ns=first.monotonic_time_ns,
+            ),
+        )
+    last = (
+        _make_event(eid, 2)
+        if evidence == "missing_terminal_event"
+        else ExecutionEvent(
+            execution_id=eid,
+            sequence=2,
+            timestamp=summary.ended_at,
+            monotonic_time_ns=10_000_000_000,
+            direction="proxy",
+            kind="execution_finished",
+            payload=ExecutionFinishedPayload(
+                termination_reason="clean_exit",
+                exit_code=1 if evidence.startswith("different_outcome") else 0,
+                total_events=3 if evidence == "different_count" else 2,
+                completeness="incomplete" if evidence == "incomplete" else "complete",
+            ),
+        )
+    )
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, last])
+
+    def fail_manifest(path: Path, data: dict[str, Any], *, fsync: bool) -> None:
+        if path.name == MANIFEST_FILE_NAME:
+            raise StorageWriteError("injected manifest failure")
+        write_atomic_private_json(path, data, fsync=fsync)
+
+    with (
+        patch("aerlog.storage.event_log.write_atomic_private_json", side_effect=fail_manifest),
+        pytest.raises(StorageWriteError, match="injected manifest failure"),
+    ):
+        writer.finalize(summary)
+    writer.close()
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", first, last)
+    assert b'"record_type": "summary"' not in spool.read_bytes()
+    repo = RecordingRepository(tmp_path)
+    try:
+        prior = repo.reconcile_execution(eid)
+        assert prior is not None and prior.summary == summary
+        assert prior.manifest is not None and prior.manifest.status == "recording"
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "incomplete"
+
+        # A rejected conflict must not trigger pending manifest repair or touch SQLite.
+        rejected_spool = _write_event_spool(
+            tmp_path / "conflict.spool", first, last.model_copy(update={"monotonic_time_ns": 99})
+        )
+        before_hashes = {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in (tmp_path / "aerlog.db", tmp_path / "aerlog.db-wal", writer.events_path)
+            if path.exists()
+        }
+        before_hashes.update(
+            {
+                writer.execution_dir / name: hashlib.sha256(data).hexdigest()
+                for name, data in original.items()
+            }
+        )
+        with pytest.raises(StorageCorruptionError, match="Content conflict"):
+            repo.import_recovery_spool(rejected_spool, tail_policy="reject")
+        assert {
+            path: hashlib.sha256(path.read_bytes()).hexdigest() for path in before_hashes
+        } == before_hashes
+
+        if evidence.endswith("_unterminated"):
+            writer.events_path.write_bytes(original[EVENTS_FILE_NAME][:-1])
+        retry = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert retry.imported_events == 0 and retry.skipped_duplicates == 2
+        assert not retry.corrupt_lines
+        result = repo.get_execution_events(eid)
+        assert result.summary == summary
+        assert result.manifest is not None and result.manifest.status == expected_status
+        assert result.unclean_shutdown is (expected_status == "recording")
+        if expected_status != "recording":
+            assert result.manifest.events_file_sha256 == result.events_file_sha256
+            assert result.manifest.byte_size == len(original[EVENTS_FILE_NAME])
+            assert result.manifest.line_count == result.manifest.last_sequence == 2
+        assert [item.event for item in result.events] == [first, last]
+        assert writer.events_path.read_bytes() == original[EVENTS_FILE_NAME]
+        assert (writer.execution_dir / "execution.json").read_bytes() == original["execution.json"]
+        assert [row.sequence for row in repo.store.query_event_index(execution_id=eid)] == [1, 2]
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.ended_at == summary.ended_at
+        assert row.capture_completeness == retry.final_status
+        assert retry.final_status == (
+            "complete" if expected_status == "finalized" else "incomplete"
+        )
+    finally:
+        repo.close()
+
+
+def test_import_event_only_retries_interrupted_tail_manifest(tmp_path: Path) -> None:
+    eid = new_execution_id()
+    event = _make_event(eid, 1)
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([event])
+    writer.close()
+    original = _stored_bytes(tmp_path, eid)
+    writer.events_path.write_bytes(original[EVENTS_FILE_NAME][:-1])
+    (writer.execution_dir / MANIFEST_FILE_NAME).unlink()
+    spool = _write_event_spool(tmp_path / "events.spool", event)
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        with (
+            patch(
+                "aerlog.storage.repositories.write_atomic_private_json",
+                side_effect=StorageWriteError("injected manifest failure"),
+            ),
+            pytest.raises(StorageWriteError, match="injected manifest failure"),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert writer.events_path.read_bytes() == original[EVENTS_FILE_NAME]
+
+        retry = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert (retry.imported_events, retry.skipped_duplicates, retry.final_status) == (
+            0,
+            1,
+            "incomplete",
+        )
+        assert not retry.corrupt_lines
+        stored = repo.get_execution_events(eid)
+        assert stored.summary is None
+        assert stored.manifest is not None and stored.manifest.status == "incomplete"
+        assert stored.manifest.events_file_sha256 == stored.events_file_sha256
+        assert writer.events_path.read_bytes() == original[EVENTS_FILE_NAME]
+        assert (writer.execution_dir / "execution.json").read_bytes() == original["execution.json"]
+        assert [row.sequence for row in repo.store.query_event_index(execution_id=eid)] == [1]
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "event_id", "sequence", "offset", "length", "method"]
+)
+def test_import_exact_retry_checks_event_index_projection(tmp_path: Path, damage: str) -> None:
+    eid = new_execution_id()
+    first, second = _make_event(eid, 1), _make_event(eid, 2)
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, second])
+    writer.close()
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", first, second)
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        execution = repo.store.get_execution_row(eid)
+        expected = repo.store.query_event_index(execution_id=eid)
+        statements = {
+            "missing": "DELETE FROM events_index",
+            "event_id": "UPDATE events_index SET event_id = 'different'",
+            "sequence": "UPDATE events_index SET sequence = 3",
+            "offset": "UPDATE events_index SET jsonl_byte_offset = jsonl_byte_offset + 1",
+            "length": "UPDATE events_index SET jsonl_byte_length = jsonl_byte_length + 1",
+            "method": "UPDATE events_index SET method = 'different'",
+        }
+        with sqlite3.connect(repo.store.db_path) as conn:
+            conn.execute(statements[damage] + " WHERE execution_id = ? AND sequence = 2", (eid,))
+        assert repo.store.get_execution_row(eid) == execution
+
+        report = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert report.imported_events == 0 and report.skipped_duplicates == 2
+        assert repo.store.query_event_index(execution_id=eid) == expected
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("material_change", [False, True])
+def test_import_retry_compares_decoded_unicode_index_metadata(
+    tmp_path: Path, material_change: bool
+) -> None:
+    eid = new_execution_id()
+    first = _make_event(eid, 1)
+    command = ("tést-server", "例")
+    header = _make_header(eid).model_copy(update={"command": command})
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(header)
+    writer.append_events([first])
+    writer.close()
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "events.spool", first)
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        with sqlite3.connect(repo.store.db_path) as conn:
+            (stored_json,) = conn.execute(
+                "SELECT command_json FROM executions WHERE execution_id = ?", (eid,)
+            ).fetchone()
+            assert "例" in stored_json
+            edited = json.dumps((*command, "changed") if material_change else command)
+            assert r"\u4f8b" in edited
+            conn.execute(
+                "UPDATE executions SET command_json = ? WHERE execution_id = ?", (edited, eid)
+            )
+
+        with patch.object(
+            repo.store, "replace_execution_index", wraps=repo.store.replace_execution_index
+        ) as rebuild:
+            retry = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert retry.imported_events == 0 and retry.skipped_duplicates == 1
+        assert rebuild.call_count == int(material_change)
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.command == command
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "payload", "trace", "wire", "identity", "outcome", "provenance", "pending"]
+)
+def test_import_retry_legacy_strict_spool_under_standard_provenance(
+    tmp_path: Path, change: str
+) -> None:
+    eid = new_execution_id()
+    header = _make_header(eid)
+    config = RedactionConfig(mode="strict_hash_only")
+    normalizer = EventNormalizer(
+        execution_id=eid,
+        started_at=header.started_at,
+        monotonic_start_ns=1,
+        command=header.command,
+        redaction_config=config,
+    )
+    (event,) = normalizer.normalize(
+        RawWireFrameInput(
+            header.started_at,
+            2,
+            "client_to_server",
+            b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"token":"fixture"}}\n',
+        )
+    )
+    finished, summary = normalizer.finalize_execution(
+        ended_at=header.started_at, monotonic_end_ns=3, termination_reason="clean_exit", exit_code=0
+    )
+    # The pre-A1 default importer stored this withheld event under standard provenance.
+    legacy_redaction = event.redaction.model_copy(
+        update={"mode": "standard", "payload_mode": "redacted"}
+    )
+    legacy = event.model_copy(update={"redaction": legacy_redaction})
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(header)
+    writer.append_events(
+        [
+            legacy,
+            finished.model_copy(
+                update={
+                    "redaction": finished.redaction.model_copy(
+                        update={"mode": "standard", "payload_mode": "redacted"}
+                    )
+                }
+            ),
+        ]
+    )
+    writer.close()
+    if change == "pending":
+        write_atomic_private_json(
+            writer.execution_dir / "execution.json", summary.model_dump(mode="json")
+        )
+    original = _stored_bytes(tmp_path, eid)
+    changes: dict[str, dict[str, Any]] = {
+        "none": {},
+        "pending": {},
+        "payload": {"payload": event.payload.model_copy(update={"method": "other"})},
+        "trace": {"trace": TraceContext(synthetic_execution_trace_id="different")},
+        "wire": {"wire": WireFrameInfo(byte_length=10, line_ending="lf", sha256="b" * 64)},
+        "identity": {"event_id": new_event_id()},
+        "provenance": {
+            "redaction": event.redaction.model_copy(update={"payload_mode": "redacted"})
+        },
+    }
+    if change == "provenance":
+        # Bypass spool normalization only for the incorrectly labelled fixture.
+        spool = _write_event_spool(
+            tmp_path / "events.spool", event.model_copy(update=changes[change])
+        )
+    else:
+        recovery = RecoverySpool(tmp_path / "events.spool", redaction_config=config)
+        changed = (
+            finished.model_copy(
+                update={"payload": finished.payload.model_copy(update={"exit_code": 1})}
+            )
+            if change == "outcome"
+            else event.model_copy(update=changes[change])
+        )
+        recovery.write_events([changed, finished] if change == "pending" else [changed])
+        recovery.close()
+        spool = recovery.path
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        if change in ("none", "pending"):
+            result = repo.import_recovery_spool(spool, tail_policy="reject")
+            assert (result.imported_events, result.skipped_duplicates) == (
+                0,
+                2 if change == "pending" else 1,
+            )
+            assert not result.corrupt_lines
+            assert repo.get_execution_events(eid).events[0].event.redaction == legacy_redaction
+        else:
+            with pytest.raises(StorageCorruptionError, match="conflict"):
+                repo.import_recovery_spool(spool, tail_policy="reject")
+        after = _stored_bytes(tmp_path, eid)
+        if change == "pending":
+            actual = repo.get_execution_events(eid)
+            assert actual.summary == summary
+            assert actual.manifest is not None and actual.manifest.status == "finalized"
+            assert (row := repo.store.get_execution_row(eid)) is not None
+            assert row.capture_completeness == "complete"
+            assert after[EVENTS_FILE_NAME] == original[EVENTS_FILE_NAME]
+            assert after["execution.json"] == original["execution.json"]
+        else:
+            assert after == original
+    finally:
+        repo.close()
+
+
+def _finished_recording(
+    data: Path, *, finalized: bool
+) -> tuple[JsonlEventLogWriter, ExecutionEvent, ExecutionEvent, ExecutionSummary]:
+    eid = new_execution_id()
+    first = _make_event(eid, 1)
+    summary = _make_summary(eid).model_copy(update={"total_events": 2})
+    last = ExecutionEvent(
+        execution_id=eid,
+        sequence=2,
+        timestamp=summary.ended_at,
+        monotonic_time_ns=summary.duration_ns,
+        direction="proxy",
+        kind="execution_finished",
+        payload=ExecutionFinishedPayload(
+            termination_reason="clean_exit", exit_code=0, total_events=2, completeness="complete"
+        ),
+    )
+    writer = JsonlEventLogWriter(data, eid)
+    writer.open(_make_header(eid))
+    writer.append_events([first, last])
+    if finalized:
+        writer.finalize(summary)
+    else:
+        with (
+            patch(
+                "aerlog.storage.event_log.write_atomic_private_json",
+                side_effect=StorageWriteError("summary write interrupted"),
+            ),
+            pytest.raises(StorageWriteError, match="summary write interrupted"),
+        ):
+            writer.finalize(summary)
+    writer.close()
+    return writer, first, last, summary
+
+
+def _index_file_hashes(data: Path) -> dict[str, str]:
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (data / "aerlog.db", data / "aerlog.db-wal")
+        if path.exists()
+    }
+
+
+@pytest.mark.parametrize("finalized", [True, False])
+@pytest.mark.parametrize(
+    "change",
+    ["exit", "count", "outcome", "execution", "completeness", "metadata", "torn", "duplicate"],
+)
+def test_recovery_preflights_supplied_summary(tmp_path: Path, finalized: bool, change: str) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=finalized)
+    eid = first.execution_id
+    changes: dict[str, dict[str, Any]] = {
+        "exit": {"exit_code": 7},
+        "count": {"total_events": 12},
+        "outcome": {"termination_reason": "unexpected_exit"},
+        "execution": {"execution_id": new_execution_id()},
+        "completeness": {"capture_completeness": "spilled"},
+        "metadata": {"command": ("different-command",)},
+        "torn": {"exit_code": 7},
+        "duplicate": {"exit_code": 7},
+    }
+    spool = _write_event_spool(
+        tmp_path / "retry.spool", first, last, summary=summary.model_copy(update=changes[change])
+    )
+    if change in ("torn", "duplicate"):
+        with spool.open("ab") as handle:
+            handle.write(
+                b"{"
+                if change == "torn"
+                else (
+                    json.dumps({"record_type": "summary", "data": summary.model_dump(mode="json")})
+                    + "\n"
+                ).encode()
+            )
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
+        with pytest.raises(StorageCorruptionError):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert (_stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)) == before
+        if change != "execution":
+            report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+            assert report.imported_events == 0
+            assert report.final_status == "incomplete"
+            assert report.corrupt_lines and list(writer.execution_dir.glob("*.quarantine"))
+            assert _stored_bytes(tmp_path, eid) == before[0]
+            actual = repo.get_execution_events(eid)
+            assert actual.summary == (summary if finalized else None)
+            assert actual.manifest is not None
+            assert actual.manifest.status == ("finalized" if finalized else "recording")
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("evidence", ["valid", "missing_terminal", "invalid_summary"])
+def test_recovery_after_interrupted_summary_write(tmp_path: Path, evidence: str) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    if evidence == "missing_terminal":
+        writer.events_path.write_bytes(writer.events_path.read_bytes().splitlines(keepends=True)[0])
+    original = _stored_bytes(tmp_path, eid)
+    repo = RecordingRepository(tmp_path)
+    try:
+        spool = _write_event_spool(
+            tmp_path / "retry.spool",
+            *((first,) if evidence == "missing_terminal" else (first, last)),
+        )
+        assert repo.import_recovery_spool(spool, tail_policy="reject").final_status == "incomplete"
+        assert _stored_bytes(tmp_path, eid) == original
+        if evidence == "invalid_summary":
+            with spool.open("ab") as handle:
+                handle.write(b'{"record_type":"summary","data":{}}\n')
+        else:
+            _write_event_spool(
+                spool,
+                *((first,) if evidence == "missing_terminal" else (first, last)),
+                summary=summary,
+            )
+        if evidence != "valid":
+            with pytest.raises(StorageCorruptionError):
+                repo.import_recovery_spool(spool, tail_policy="reject")
+            assert _stored_bytes(tmp_path, eid) == original
+        else:
+            report = repo.import_recovery_spool(spool, tail_policy="reject")
+            assert report.final_status == "complete"
+            actual = repo.get_execution_events(eid)
+            assert actual.summary == summary
+            assert actual.manifest is not None and actual.manifest.status == "finalized"
+            assert (row := repo.store.get_execution_row(eid)) is not None
+            assert row.capture_completeness == "complete" and row.total_events == 2
+            assert writer.events_path.read_bytes() == original[EVENTS_FILE_NAME]
+            after = _stored_bytes(tmp_path, eid)
+            assert repo.import_recovery_spool(spool, tail_policy="reject").imported_events == 0
+            assert _stored_bytes(tmp_path, eid) == after
+    finally:
+        repo.close()
+
+
+def test_recovery_keeps_tail_quarantine_incomplete_across_retries(tmp_path: Path) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    original = writer.events_path.read_bytes()
+    writer.events_path.write_bytes(original + b"{broken-tail")
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    repo = RecordingRepository(tmp_path)
+    try:
+        for attempt in range(3):
+            if attempt == 2:
+                writer.events_path.write_bytes(original[:-1])
+                with sqlite3.connect(repo.store.db_path) as conn:
+                    conn.execute("DELETE FROM events_index WHERE sequence = 2")
+            report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+            assert report.skipped_duplicates == 2 and report.imported_events == 0
+            assert report.final_status == "incomplete"
+            result = repo.get_execution_events(eid)
+            assert result.summary == summary
+            assert result.manifest is not None and result.manifest.status == "incomplete"
+            assert result.manifest.corruption_count == 1
+            assert writer.events_path.read_bytes() == original
+            assert len(list(writer.execution_dir.glob("*.quarantine"))) == 1
+            assert (row := repo.store.get_execution_row(eid)) is not None
+            assert row.capture_completeness == "incomplete"
+            assert [x.event_id for x in repo.store.query_event_index(execution_id=eid)] == [
+                first.event_id,
+                last.event_id,
+            ]
+    finally:
+        repo.close()
+
+
+def test_recovery_preserves_verified_manifest_when_restoring_newline(tmp_path: Path) -> None:
+    writer, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    original = _stored_bytes(tmp_path, eid)
+    writer.events_path.write_bytes(original[EVENTS_FILE_NAME][:-1])
+    # Filename alone provides no evidence that this artifact came from the destination log.
+    (writer.execution_dir / "corrupted_tail_offset_0_stale.quarantine").write_bytes(b"unrelated")
+    bad_digest = "f" * 64
+    stem = f"corrupted_tail_offset_1_{bad_digest[:12]}"
+    (writer.execution_dir / f"{stem}.quarantine").write_bytes(b"unrelated")
+    write_atomic_private_json(
+        writer.execution_dir / f"{stem}.meta.json",
+        {
+            "execution_id": eid,
+            "byte_offset": 1,
+            "byte_length": len(b"unrelated"),
+            "sha256": bad_digest,
+            "reason": "Destination log tail: invalid test evidence",
+        },
+    )
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    repo = RecordingRepository(tmp_path)
+    try:
+        assert repo.import_recovery_spool(spool).final_status == "complete"
+        assert _stored_bytes(tmp_path, eid) == original
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "complete"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "timestamp", "command", "multiple", "offset", "length"]
+)
+def test_recovery_rebuilds_damaged_index(tmp_path: Path, damage: str) -> None:
+    _, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        expected_row = repo.store.get_execution_row(eid)
+        expected_events = repo.store.query_event_index(execution_id=eid)
+        with sqlite3.connect(repo.store.db_path) as conn:
+            if damage == "missing":
+                conn.execute("DELETE FROM events_index WHERE sequence = 2")
+            if damage in ("offset", "length"):
+                field = "jsonl_byte_offset" if damage == "offset" else "jsonl_byte_length"
+                conn.execute(f"UPDATE events_index SET {field} = {field} + 1 WHERE sequence = 2")
+            if damage in ("timestamp", "multiple"):
+                conn.execute("UPDATE events_index SET timestamp = 'invalid timestamp'")
+            if damage in ("command", "multiple"):
+                conn.execute("UPDATE executions SET command_json = '['")
+        damaged = _index_file_hashes(tmp_path)
+        with (
+            patch.object(repo.store, "replace_execution_index", side_effect=StorageWriteError),
+            pytest.raises(StorageWriteError),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert _stored_bytes(tmp_path, eid) == original
+        assert _index_file_hashes(tmp_path) == damaged
+
+        with patch.object(
+            repo.store, "replace_execution_index", wraps=repo.store.replace_execution_index
+        ) as rebuild:
+            for _ in range(2):
+                report = repo.import_recovery_spool(spool, tail_policy="reject")
+                assert report.final_status == "complete" and report.imported_events == 0
+            assert rebuild.call_count == 1
+        assert repo.store.get_execution_row(eid) == expected_row
+        assert repo.store.query_event_index(execution_id=eid) == expected_events
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_recovery_repairs_verified_index_with_quarantined_candidate(
+    tmp_path: Path, malformed: bool
+) -> None:
+    writer, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    conflicting = first.model_copy(update={"monotonic_time_ns": 13})
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last, conflicting)
+    original = _stored_bytes(tmp_path, eid)
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        with sqlite3.connect(repo.store.db_path) as conn:
+            conn.execute("DELETE FROM events_index WHERE sequence = 2")
+            conn.execute("UPDATE executions SET total_events = 99")
+            if malformed:
+                conn.execute("UPDATE executions SET command_json = '['")
+        damaged = _index_file_hashes(tmp_path)
+        with pytest.raises(StorageCorruptionError):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert _index_file_hashes(tmp_path) == damaged
+        assert _stored_bytes(tmp_path, eid) == original
+        with patch.object(
+            repo.store, "replace_execution_index", wraps=repo.store.replace_execution_index
+        ) as rebuild:
+            for _ in range(2):
+                report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+                assert (report.skipped_duplicates, report.imported_events, report.final_status) == (
+                    2,
+                    0,
+                    "incomplete",
+                )
+                assert len(report.corrupt_lines) == 1
+            assert rebuild.call_count == 1
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.total_events == 2
+        assert [x.event_id for x in repo.store.query_event_index(execution_id=eid)] == [
+            first.event_id,
+            last.event_id,
+        ]
+        assert len(list(writer.execution_dir.glob("*.quarantine"))) == 1
+        assert _stored_bytes(tmp_path, eid) == original
+    finally:
+        repo.close()
+
+
+def test_recovery_repairs_retained_summary_after_quarantining_candidate(tmp_path: Path) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    write_atomic_private_json(
+        writer.execution_dir / "execution.json", summary.model_dump(mode="json")
+    )
+    original = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(
+        tmp_path / "retry.spool", first, last, first.model_copy(update={"monotonic_time_ns": 13})
+    )
+    repo = RecordingRepository(tmp_path)
+    try:
+        report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+        assert report.final_status == "incomplete" and report.corrupt_lines
+        assert _stored_bytes(tmp_path, eid) == original
+        assert len(list(writer.execution_dir.glob("*.quarantine"))) == 1
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "incomplete" and row.total_events == 2
+
+        _write_event_spool(spool, first, last)
+        retry = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert (retry.imported_events, retry.skipped_duplicates, retry.final_status) == (
+            0,
+            2,
+            "complete",
+        )
+        after = _stored_bytes(tmp_path, eid)
+        assert after[EVENTS_FILE_NAME] == original[EVENTS_FILE_NAME]
+        assert after["execution.json"] == original["execution.json"]
+        actual = repo.get_execution_events(eid)
+        assert actual.manifest is not None and actual.manifest.status == "finalized"
+        assert actual.manifest.corruption_count == 0
+        assert len(list(writer.execution_dir.glob("*.quarantine"))) == 1
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "complete"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.OperationalError("disk I/O error"),
+        sqlite3.DatabaseError("database disk image is malformed"),
+        TypeError("unexpected programming error"),
+    ],
+)
+def test_recovery_propagates_nondecoding_index_errors(tmp_path: Path, error: Exception) -> None:
+    _, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
+        with (
+            patch.object(repo.store, "query_event_index", side_effect=error),
+            patch.object(repo.store, "replace_execution_index") as rebuild,
+            pytest.raises(type(error), match=str(error)),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        rebuild.assert_not_called()
+        assert (_stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)) == before
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("damage", ["seal", "summary", "version"])
+def test_recovery_refuses_unverified_authoritative_metadata(tmp_path: Path, damage: str) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    manifest_path = writer.execution_dir / MANIFEST_FILE_NAME
+    if damage == "summary":
+        (writer.execution_dir / "execution.json").write_text("[]", encoding="utf-8")
+    else:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if damage == "seal":
+            manifest["events_file_sha256"] = "a" * 64
+        else:
+            manifest["storage_schema_version"] = "99.0.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last, summary=summary)
+    repo = RecordingRepository(tmp_path)
+    try:
+        error = UnsupportedSchemaVersionError if damage == "version" else StorageCorruptionError
+        with (
+            patch.object(repo.store, "replace_execution_index") as rebuild,
+            pytest.raises(error),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        rebuild.assert_not_called()
+        assert _stored_bytes(tmp_path, eid) == before
+        assert not repo.store.db_path.exists()
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("failure", ["append", "manifest"])
+def test_recovery_preserves_quarantine_when_append_fails(tmp_path: Path, failure: str) -> None:
+    _, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    events_path = resolve_execution_dir(tmp_path, eid) / EVENTS_FILE_NAME
+    prefix = events_path.read_bytes().splitlines(keepends=True)[0]
+    events_path.write_bytes(prefix + b"{interrupted")
+    spool = _write_event_spool(tmp_path / "retry.spool", first)
+    repo = RecordingRepository(tmp_path)
+    try:
+        assert (
+            repo.import_recovery_spool(spool, tail_policy="quarantine").final_status == "incomplete"
+        )
+        _write_event_spool(spool, first, last, summary=summary)
+        fault = (
+            patch.object(JsonlEventLogWriter, "append_events", side_effect=StorageWriteError)
+            if failure == "append"
+            else patch(
+                "aerlog.storage.repositories.write_atomic_private_json",
+                side_effect=StorageWriteError,
+            )
+        )
+        with fault, pytest.raises(StorageWriteError):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        after_failure = repo.get_execution_events(eid)
+        assert after_failure.manifest is not None
+        if failure == "append":
+            assert after_failure.manifest.corruption_count == 1
+        assert events_path.read_bytes() == prefix
+
+        report = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert report.imported_events == 1 and report.final_status == "incomplete"
+        actual = repo.get_execution_events(eid)
+        assert actual.summary == summary
+        assert actual.manifest is not None and actual.manifest.status == "incomplete"
+        assert actual.manifest.corruption_count == 1
+        assert [item.event for item in actual.events] == [first, last]
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "incomplete"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+@pytest.mark.parametrize("indexed", [True, False])
+def test_recovery_reconciles_verified_summary_only_retry(
+    tmp_path: Path, policy: TailPolicy, indexed: bool
+) -> None:
+    _, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    spool = _write_event_spool(tmp_path / "summary.spool", summary=summary)
+    repo = RecordingRepository(tmp_path)
+    try:
+        if indexed:
+            repo.reconcile_execution(eid)
+        old_index = repo.store.get_execution_row(eid)
+        if indexed:
+            assert old_index is not None and old_index.ended_at is None
+        else:
+            assert old_index is None
+        with (
+            patch.object(repo.store, "replace_execution_index", side_effect=StorageWriteError),
+            pytest.raises(StorageWriteError),
+        ):
+            repo.import_recovery_spool(spool, tail_policy=policy)
+        assert repo.store.get_execution_row(eid) == old_index
+        finalized = _stored_bytes(tmp_path, eid)
+
+        with patch.object(
+            repo.store, "replace_execution_index", wraps=repo.store.replace_execution_index
+        ) as rebuild:
+            for _ in range(2):
+                report = repo.import_recovery_spool(spool, tail_policy=policy)
+                assert (report.imported_events, report.skipped_duplicates, report.final_status) == (
+                    0,
+                    0,
+                    "complete",
+                )
+        assert rebuild.call_count == 1
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "complete" and row.ended_at == summary.ended_at
+        assert [item.event_id for item in repo.store.query_event_index(execution_id=eid)] == [
+            first.event_id,
+            last.event_id,
+        ]
+        assert _stored_bytes(tmp_path, eid) == finalized
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+@pytest.mark.parametrize("persisted_terminal", [True, False])
+def test_recovery_preflights_after_terminal(
+    tmp_path: Path, policy: TailPolicy, persisted_terminal: bool
+) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    if not persisted_terminal:
+        writer.events_path.write_bytes(writer.events_path.read_bytes().splitlines(keepends=True)[0])
+    suffix = _make_event(eid, 3)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last, suffix, summary=summary)
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
+        if policy == "reject":
+            with pytest.raises(StorageCorruptionError, match="terminal"):
+                repo.import_recovery_spool(spool, tail_policy=policy)
+            assert (_stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)) == before
+        else:
+            for _ in range(2):
+                report = repo.import_recovery_spool(spool, tail_policy=policy)
+                assert report.final_status == "incomplete"
+                assert any("terminal" in issue.details for issue in report.corrupt_lines)
+                result = repo.get_execution_events(eid)
+                assert [item.event for item in result.events] == [first, last]
+                assert [
+                    item.event_id for item in repo.store.query_event_index(execution_id=eid)
+                ] == [first.event_id, last.event_id]
+            after = _stored_bytes(tmp_path, eid)[EVENTS_FILE_NAME]
+            if persisted_terminal:
+                assert after == before[0][EVENTS_FILE_NAME]
+            archived = list(writer.execution_dir.glob("*.quarantine"))
+            assert len(archived) == 1 and suffix.event_id.encode() in archived[0].read_bytes()
+    finally:
+        repo.close()
+
+
+def test_recovery_detects_unterminated_suffix_after_persisted_terminal(tmp_path: Path) -> None:
+    writer, first, last, _ = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    sealed_prefix = writer.events_path.read_bytes()
+    suffix = _make_event(eid, 3)
+    fixture = JsonlEventLogWriter(tmp_path / "fixture", eid)
+    fixture.open(_make_header(eid))
+    fixture.append_events([suffix])
+    fixture.close()
+    raw_suffix = fixture.events_path.read_bytes()[:-1]
+    writer.events_path.write_bytes(sealed_prefix + raw_suffix)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    before = _stored_bytes(tmp_path, eid)
+    repo = RecordingRepository(tmp_path)
+    try:
+        with pytest.raises(StorageCorruptionError, match="terminal"):
+            repo.import_recovery_spool(spool, tail_policy="reject")
+        assert _stored_bytes(tmp_path, eid) == before and not repo.store.db_path.exists()
+        report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+        assert report.final_status == "incomplete" and report.imported_events == 0
+        assert writer.events_path.read_bytes() == sealed_prefix
+        assert [item.sequence for item in repo.store.query_event_index(execution_id=eid)] == [1, 2]
+        archives = list(writer.execution_dir.glob("*.quarantine"))
+        assert len(archives) == 1 and archives[0].read_bytes() == raw_suffix
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+@pytest.mark.parametrize("recorded_start", [False, True])
+def test_recovery_distinguishes_placeholder_from_recorded_command(
+    tmp_path: Path, policy: TailPolicy, recorded_start: bool
+) -> None:
+    _, first, last, summary = _finished_recording(tmp_path / "source", finalized=False)
+    eid = first.execution_id
+    if recorded_start:
+        # This is a real command with the same text as the synthetic spelling.
+        first = first.model_copy(
+            update={
+                "kind": "execution_started",
+                "direction": "proxy",
+                "payload": ExecutionStartedPayload(
+                    command=("recovered-spool",),
+                    redaction_mode="standard",
+                    backpressure_policy="spill",
+                ),
+            }
+        )
+        summary = summary.model_copy(
+            update={
+                "started_at": first.timestamp,
+                "duration_ns": last.monotonic_time_ns - first.monotonic_time_ns,
+                "backpressure_policy": "spill",
+            }
+        )
+    root = tmp_path / "destination"
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    repo = RecordingRepository(root)
+    try:
+        repo.import_recovery_spool(spool, tail_policy=policy)
+        before = _stored_bytes(root, eid), _index_file_hashes(root)
+        _write_event_spool(spool, first, last, summary=summary)
+        if recorded_start:
+            if policy == "reject":
+                with pytest.raises(StorageCorruptionError, match="summary conflicts"):
+                    repo.import_recovery_spool(spool, tail_policy=policy)
+                assert _index_file_hashes(root) == before[1]
+            else:
+                assert (
+                    repo.import_recovery_spool(spool, tail_policy=policy).final_status
+                    == "incomplete"
+                )
+            assert _stored_bytes(root, eid) == before[0]
+            return
+        for _ in range(2):
+            result = repo.import_recovery_spool(spool, tail_policy=policy)
+            assert result.final_status == "complete" and result.imported_events == 0
+        assert _stored_bytes(root, eid)[EVENTS_FILE_NAME] == before[0][EVENTS_FILE_NAME]
+        read = repo.get_execution_events(eid)
+        assert (
+            read.summary == summary
+            and read.manifest is not None
+            and read.manifest.status == "finalized"
+        )
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.command == summary.command and row.capture_completeness == "complete"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+@pytest.mark.parametrize("persisted_summary", [False, True])
+def test_recovery_refuses_summary_with_contradictory_terminal_time(
+    tmp_path: Path, policy: TailPolicy, persisted_summary: bool
+) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=False)
+    eid = first.execution_id
+    later = summary.model_copy(update={"ended_at": summary.ended_at + timedelta(days=1)})
+    if persisted_summary:
+        write_atomic_private_json(
+            writer.execution_dir / "execution.json", later.model_dump(mode="json")
+        )
+    spool = _write_event_spool(
+        tmp_path / "retry.spool", first, last, summary=None if persisted_summary else later
+    )
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
+        if not persisted_summary and policy == "reject":
+            with pytest.raises(StorageCorruptionError, match="summary conflicts"):
+                repo.import_recovery_spool(spool, tail_policy=policy)
+            assert _index_file_hashes(tmp_path) == before[1]
+        else:
+            report = repo.import_recovery_spool(spool, tail_policy=policy)
+            assert report.final_status == "incomplete"
+            if not persisted_summary:
+                assert report.corrupt_lines
+        assert _stored_bytes(tmp_path, eid) == before[0]
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "incomplete"
+    finally:
+        repo.close()
+
+
+def test_recovery_keeps_matching_legacy_sealed_summary_on_retry(tmp_path: Path) -> None:
+    writer, first, last, summary = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    older = summary.model_copy(update={"ended_at": summary.ended_at + timedelta(seconds=1)})
+    write_atomic_private_json(
+        writer.execution_dir / "execution.json", older.model_dump(mode="json")
+    )
+    before = _stored_bytes(tmp_path, eid)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last, summary=older)
+    repo = RecordingRepository(tmp_path)
+    try:
+        report = repo.import_recovery_spool(spool, tail_policy="reject")
+        assert report.final_status == "complete" and report.imported_events == 0
+        assert _stored_bytes(tmp_path, eid) == before
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.ended_at == older.ended_at
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid"),
+    [
+        ("command_json", "null"),
+        ("command_json", "17"),
+        ("command_json", '["test-server",17]'),
+        ("unanswered_request_ids_json", '{"invalid":"shape"}'),
+        ("observed_trace_ids_json", '"not-an-array"'),
+        ("observed_mcp_versions_json", "false"),
+    ],
+)
+def test_recovery_rebuilds_wrong_shaped_index_json(
+    tmp_path: Path, column: str, invalid: str
+) -> None:
+    _, first, last, summary = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    before = _stored_bytes(tmp_path, eid)
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        expected = repo.store.get_execution_row(eid)
+        with sqlite3.connect(repo.store.db_path) as conn:
+            conn.execute(f"UPDATE executions SET {column}=? WHERE execution_id=?", (invalid, eid))
+        with patch.object(
+            repo.store, "replace_execution_index", wraps=repo.store.replace_execution_index
+        ) as rebuild:
+            for _ in range(2):
+                assert (
+                    repo.import_recovery_spool(spool, tail_policy="reject").final_status
+                    == "complete"
+                )
+        assert rebuild.call_count == 1
+        assert repo.store.get_execution_row(eid) == expected
+        assert _stored_bytes(tmp_path, eid) == before
+        assert (
+            row := repo.store.get_execution_row(eid)
+        ) is not None and row.ended_at == summary.ended_at
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("same_tail", [True, False])
+def test_recovery_reuses_only_matching_quarantine_after_failed_rename(
+    tmp_path: Path, same_tail: bool
+) -> None:
+    writer, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    prefix = writer.events_path.read_bytes()
+    torn = b"{initial"
+    writer.events_path.write_bytes(prefix + torn)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    real_replace = os.replace
+
+    def fail_tail_rename(src: Path, dst: Path) -> None:
+        if Path(dst) == writer.events_path:
+            raise OSError("tail rename interrupted")
+        real_replace(src, dst)
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        with (
+            patch("aerlog.storage.repositories.os.replace", side_effect=fail_tail_rename),
+            pytest.raises(OSError, match="tail rename interrupted"),
+        ):
+            repo.import_recovery_spool(spool, tail_policy="quarantine")
+        interrupted = repo.get_execution_events(eid)
+        assert interrupted.manifest is not None and interrupted.manifest.corruption_count == 1
+        assert writer.events_path.read_bytes() == prefix + torn
+        (initial_artifact,) = writer.execution_dir.glob("*.quarantine")
+        initial_sidecar = initial_artifact.with_suffix(".meta.json")
+        initial_evidence = initial_artifact.read_bytes(), initial_sidecar.read_bytes()
+        if not same_tail:
+            writer.events_path.write_bytes(prefix + b"{different")
+        report = repo.import_recovery_spool(spool, tail_policy="quarantine")
+        assert report.final_status == "incomplete" and len(report.corrupt_lines) == 1
+        assert writer.events_path.read_bytes() == prefix
+        result = repo.get_execution_events(eid)
+        assert result.manifest is not None
+        assert result.manifest.corruption_count == (1 if same_tail else 2)
+        assert (initial_artifact.read_bytes(), initial_sidecar.read_bytes()) == initial_evidence
+        assert {path.read_bytes() for path in writer.execution_dir.glob("*.quarantine")} == (
+            {torn} if same_tail else {torn, b"{different"}
+        )
+        assert (row := repo.store.get_execution_row(eid)) is not None
+        assert row.capture_completeness == "incomplete"
+    finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("wrong_command", [False, True])
+def test_recovery_compares_recorded_start_after_strict_redaction(
+    tmp_path: Path, wrong_command: bool
+) -> None:
+    eid = new_execution_id()
+    started_at = _make_header(eid).started_at
+    norm = EventNormalizer(
+        execution_id=eid,
+        started_at=started_at,
+        monotonic_start_ns=1,
+        command=("test-server", "--ordinary"),
+        redaction_config=RedactionConfig(mode="standard"),
+    )
+    start_events = norm.start_execution()
+    finished, summary = norm.finalize_execution(
+        ended_at=started_at + timedelta(seconds=1),
+        monotonic_end_ns=1_000_000_001,
+        termination_reason="clean_exit",
+        exit_code=0,
+    )
+    if wrong_command:
+        summary = summary.model_copy(update={"command": ("different-server", "--ordinary")})
+    path = _write_event_spool(tmp_path / "retry.spool", *start_events, finished, summary=summary)
+    repo = RecordingRepository(tmp_path)
+    try:
+        if wrong_command:
+            with pytest.raises(StorageCorruptionError, match="summary conflicts"):
+                repo.import_recovery_spool(
+                    path, redaction_mode="strict_hash_only", tail_policy="reject"
+                )
+            assert not resolve_execution_dir(tmp_path, eid).exists()
+            assert not repo.store.db_path.exists()
+        else:
+            report = repo.import_recovery_spool(
+                path, redaction_mode="strict_hash_only", tail_policy="reject"
+            )
+            assert report.final_status == "complete"
+            read = repo.get_execution_events(eid)
+            assert read.events[0].event.payload == start_events[0].payload.model_copy(
+                update={"command": ("test-server", "[REDACTED_ARGS]")}
+            )
+            assert read.summary == summary
+            before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
+            retry = repo.import_recovery_spool(
+                path, redaction_mode="strict_hash_only", tail_policy="reject"
+            )
+            assert retry.final_status == "complete" and retry.imported_events == 0
+            assert (_stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)) == before
+    finally:
+        repo.close()
+
+
+def test_recovery_never_reuses_conflicting_quarantine_artifact(tmp_path: Path) -> None:
+    writer, first, last, _ = _finished_recording(tmp_path, finalized=True)
+    eid = first.execution_id
+    prefix = writer.events_path.read_bytes()
+    tail = b"{corrupt"
+    writer.events_path.write_bytes(prefix + tail)
+    spool = _write_event_spool(tmp_path / "retry.spool", first, last)
+    digest = hashlib.sha256(tail).hexdigest()
+    artifact = (
+        writer.execution_dir / f"corrupted_tail_offset_{len(prefix)}_{digest[:12]}.quarantine"
+    )
+    artifact.write_bytes(b"other retained evidence")
+    before = _stored_bytes(tmp_path, eid)
+    repo = RecordingRepository(tmp_path)
+    try:
+        with pytest.raises(StorageCorruptionError, match="artifact conflicts"):
+            repo.import_recovery_spool(spool, tail_policy="quarantine")
+        assert _stored_bytes(tmp_path, eid) == before
+        assert artifact.read_bytes() == b"other retained evidence"
+        assert not repo.store.db_path.exists()
+    finally:
+        repo.close()
