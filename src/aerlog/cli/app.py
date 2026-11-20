@@ -25,6 +25,7 @@ from aerlog.analysis.timeline import (
     slice_timeline,
 )
 from aerlog.capture import CaptureConfig, CaptureProxyObserver
+from aerlog.capture.sinks import default_spool_path
 from aerlog.cli.render import (
     cassette_summary_to_json,
     diagnostics_report_to_json,
@@ -530,6 +531,7 @@ def run_mcp_proxy(
         )
 
     cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
+    spill_dir = resolved_dir / "spool"
     try:
         effective_bp: CaptureBackpressurePolicy = (
             _parse_typed_choice(
@@ -568,6 +570,11 @@ def run_mcp_proxy(
                 f"Execution ID {resolved_exec_id!r} already exists in {resolved_dir}; "
                 "omit '--execution-id' or provide a new UUID."
             )
+        if execution_id is not None and default_spool_path(resolved_exec_id, spill_dir).exists():
+            raise ValueError(
+                f"A recovery spool already exists for execution ID {resolved_exec_id!r}; "
+                "omit '--execution-id' or provide a new UUID."
+            )
         resolved_cwd = cwd.expanduser() if cwd is not None else None
         if resolved_cwd is not None and not resolved_cwd.is_dir():
             raise ValueError(f"Working directory does not exist: {resolved_cwd}")
@@ -589,7 +596,7 @@ def run_mcp_proxy(
         redaction_mode=effective_redaction,
         max_queue_events=cfg.capture.max_queue_events,
         max_queue_bytes=cfg.capture.max_queue_bytes,
-        spill_dir=resolved_dir / "spool",
+        spill_dir=spill_dir,
         spill_write_timeout_s=cfg.capture.spill_write_timeout_s,
         drain_timeout_s=cfg.capture.drain_timeout_s,
     )

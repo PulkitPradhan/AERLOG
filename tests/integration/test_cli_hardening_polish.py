@@ -227,6 +227,45 @@ def test_cli_run_strict_hash_only_stderr_redaction_and_exec_id_collision(
     assert "already exists" in dup.stderr
 
 
+def test_cli_run_preserves_spool_for_reused_execution_id(
+    isolated_xdg: IsolatedXdgPaths, tmp_path: Path
+) -> None:
+    env = _xdg_env(isolated_xdg)
+    data_dir = tmp_path / "spool_only"
+    data_dir.mkdir()
+    # Prevent primary recording creation while leaving recovery spool storage writable.
+    (data_dir / EXECUTIONS_DIR_NAME).write_text("simulated unavailable recording directory")
+    execution_id = new_execution_id()
+    args = (
+        "run",
+        "--backpressure-policy",
+        "spill",
+        "--execution-id",
+        execution_id,
+        "--data-dir",
+        str(data_dir),
+        "--",
+        _PYTHON,
+        str(_REPO_ROOT / "examples" / "quickstart_server.py"),
+    )
+
+    first = _run_cli(*args, env=env, stdin_text='{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n')
+    assert first.returncode == 0, first.stderr
+    assert json.loads(first.stdout)["id"] == 1
+    assert not (data_dir / EXECUTIONS_DIR_NAME / execution_id).exists()
+    spool = data_dir / "spool" / f"{execution_id}.ndjson.spool"
+    original = spool.read_bytes()
+    records = [json.loads(line) for line in original.splitlines()]
+    assert records[0]["record_type"] == "header"
+    assert records[-1]["record_type"] == "summary"
+
+    retry = _run_cli(*args, env=env, stdin_text='{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n')
+    assert retry.returncode == 1, retry.stderr
+    assert "recovery spool" in retry.stderr
+    assert retry.stdout == ""
+    assert spool.read_bytes() == original
+
+
 def test_cli_replay_serve_keyboard_interrupt_exits_130(
     isolated_xdg: IsolatedXdgPaths,
     tmp_path: Path,
