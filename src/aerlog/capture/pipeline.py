@@ -17,7 +17,6 @@ import logging
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -153,8 +152,9 @@ class CapturePipeline:
         self._start_lock = asyncio.Lock()
         self._finalize_lock = asyncio.Lock()
         self._started = False
-        self._finalized = False
         self._summary: ExecutionSummary | None = None
+        self._capture_error: BaseException | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
         self._spilled = False
         self._force_incomplete = False
@@ -403,21 +403,26 @@ class CapturePipeline:
             if self._started:
                 return
 
-            header = self._normalizer.build_header()
-            ok = await self._call_primary_sink_with_spill_guard(self._sink.on_start(header))
-            if ok:
-                self._sink_delivered_header = True
-            elif self._config.backpressure_policy == "spill" and self._spilled:
-                # Header already written inside _activate_spill.
-                pass
+            if self._capture_error is not None:
+                raise self._capture_error
+            try:
+                header = self._normalizer.build_header()
+                ok = await self._call_primary_sink_with_spill_guard(self._sink.on_start(header))
+                if ok:
+                    self._sink_delivered_header = True
 
-            startup_events = self._normalizer.start_execution()
-            await self._deliver_events(startup_events)
-            self._worker_task = asyncio.create_task(self._consumer_loop())
-            self._started = True
+                startup_events = self._normalizer.start_execution()
+                await self._deliver_events(startup_events)
+                self._worker_task = asyncio.create_task(self._consumer_loop())
+                self._started = True
+            except BaseException as exc:
+                await self._close_after_error(exc)
+                raise
 
     async def enqueue(self, raw_input: RawCaptureInput) -> None:
         """Enqueue a raw observation strictly honoring configured backpressure semantics."""
+        if self._closed_for_input:
+            return
         if not self._started:
             await self.start()
         if self._closed_for_input:
@@ -495,96 +500,153 @@ class CapturePipeline:
             if entry.item is None:
                 break
 
-            gap_events = self._flush_pending_gap_events()
-            if gap_events:
-                await self._deliver_events(gap_events)
+            try:
+                gap_events = self._flush_pending_gap_events()
+                if gap_events:
+                    await self._deliver_events(gap_events)
 
-            normalized = self._normalizer.normalize(entry.item)
-            await self._deliver_events(normalized)
+                normalized = self._normalizer.normalize(entry.item)
+                await self._deliver_events(normalized)
+            except Exception:
+                self._record_gap_span(
+                    entry.item.monotonic_time_ns, reason="capture_consumer_failed"
+                )
+                async with self._condition:
+                    self._closed_for_input = True
+                    self._condition.notify_all()
+                raise
 
-    async def finalize(
-        self,
-        *,
-        termination_reason: str,
-        exit_code: int,
-        returncode: int | None = None,
-    ) -> ExecutionSummary:
-        """Drain buffered inputs, emit ``execution_finished``, flush sinks, and return summary."""
-        async with self._finalize_lock:
-            if self._finalized and self._summary is not None:
-                return self._summary
+    async def _drain_worker(self) -> None:
+        worker = self._worker_task
+        if worker is None:
+            return
 
-            if not self._started:
-                await self.start()
+        done, _ = await asyncio.wait({worker}, timeout=self._config.drain_timeout_s)
+        if done:
+            await worker
+            return
 
-            async with self._condition:
-                self._closed_for_input = True
-                self._queue.append(_QueuedEntry(item=None, byte_cost=0))
-                self._condition.notify_all()
-
-            if self._worker_task is not None:
-                try:
-                    await asyncio.wait_for(self._worker_task, timeout=self._config.drain_timeout_s)
-                except TimeoutError:
-                    self._sink_timed_out = True
-                    self._worker_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await self._worker_task
-                    async with self._condition:
-                        remaining = [entry.item for entry in self._queue if entry.item is not None]
-                        self._queue.clear()
-                        self._queued_bytes = 0
-                    self._force_incomplete = True
-                    if remaining:
-                        if self._config.backpressure_policy == "spill":
-                            self._activate_spill("drain_timeout", "Worker drain timeout reached")
-                            if not self._spilled:
-                                self._record_gap_span(
-                                    remaining[-1].monotonic_time_ns,
-                                    count=len(remaining),
-                                    reason="drain_timeout_spill_failed",
-                                )
-                            else:
-                                for raw_rem in remaining:
-                                    try:
-                                        self._spool.write_events(
-                                            self._normalizer.normalize(raw_rem)
-                                        )
-                                    except OSError as exc:
-                                        self._spool_error = repr(exc)
-                                        self._record_gap_span(
-                                            raw_rem.monotonic_time_ns,
-                                            count=1,
-                                            reason="recovery_spool_write_failed",
-                                        )
-                        else:
+        self._sink_timed_out = True
+        worker.cancel()
+        await asyncio.wait({worker})
+        if not worker.cancelled():
+            worker.result()
+        async with self._condition:
+            remaining = [entry.item for entry in self._queue if entry.item is not None]
+            self._queue.clear()
+            self._queued_bytes = 0
+        self._force_incomplete = True
+        if remaining:
+            if self._config.backpressure_policy == "spill":
+                self._activate_spill("drain_timeout", "Worker drain timeout reached")
+                if not self._spilled:
+                    self._record_gap_span(
+                        remaining[-1].monotonic_time_ns,
+                        count=len(remaining),
+                        reason="drain_timeout_spill_failed",
+                    )
+                else:
+                    for raw_rem in remaining:
+                        try:
+                            self._spool.write_events(self._normalizer.normalize(raw_rem))
+                        except OSError as exc:
+                            self._spool_error = repr(exc)
                             self._record_gap_span(
-                                remaining[-1].monotonic_time_ns,
-                                count=len(remaining),
-                                reason="drain_timeout",
+                                raw_rem.monotonic_time_ns,
+                                count=1,
+                                reason="recovery_spool_write_failed",
                             )
-
-            # Deliver any trailing gap markers before emitting execution_finished.
-            trailing_gaps = self._flush_pending_gap_events()
-            if trailing_gaps and (self._spilled or self._sink_error is None):
-                await self._deliver_events(trailing_gaps)
-
-            ended_at = datetime.now(UTC)
-            monotonic_end_ns = time.monotonic_ns()
-
-            def _build_final() -> tuple[ExecutionEvent, ExecutionSummary]:
-                return self._normalizer.finalize_execution(
-                    ended_at=ended_at,
-                    monotonic_end_ns=monotonic_end_ns,
-                    termination_reason=termination_reason,
-                    exit_code=exit_code,
-                    returncode=returncode,
-                    spilled=self._spilled,
-                    force_incomplete=self._force_incomplete,
-                    spool_file=str(self._spool.path) if self._spilled else None,
+            else:
+                self._record_gap_span(
+                    remaining[-1].monotonic_time_ns,
+                    count=len(remaining),
+                    reason="drain_timeout",
                 )
 
-            finished_event, summary = _build_final()
+    async def _finish_capture(
+        self, *, termination_reason: str, exit_code: int, returncode: int | None
+    ) -> ExecutionSummary:
+        # Deliver any trailing gap markers before emitting execution_finished.
+        trailing_gaps = self._flush_pending_gap_events()
+        if trailing_gaps and (self._spilled or self._sink_error is None):
+            await self._deliver_events(trailing_gaps)
+
+        ended_at = datetime.now(UTC)
+        monotonic_end_ns = time.monotonic_ns()
+
+        def _build_final() -> tuple[ExecutionEvent, ExecutionSummary]:
+            return self._normalizer.finalize_execution(
+                ended_at=ended_at,
+                monotonic_end_ns=monotonic_end_ns,
+                termination_reason=termination_reason,
+                exit_code=exit_code,
+                returncode=returncode,
+                spilled=self._spilled,
+                force_incomplete=self._force_incomplete,
+                spool_file=str(self._spool.path) if self._spilled else None,
+            )
+
+        finished_event, summary = _build_final()
+
+        if self._spilled:
+            try:
+                self._spool.write_events([finished_event])
+                self._spool.write_summary(summary)
+                self._spool.flush()
+            except OSError as exc:
+                self._spool_error = repr(exc)
+                self._force_incomplete = True
+                summary = summary.model_copy(update={"capture_completeness": "incomplete"})
+        elif self._sink_error is None and not self._sink_timed_out:
+            try:
+                ok = await asyncio.wait_for(
+                    self._call_primary_sink_with_spill_guard(
+                        self._sink.emit_events([finished_event])
+                    ),
+                    timeout=self._config.drain_timeout_s,
+                )
+            except TimeoutError as exc:
+                self._sink_timed_out = True
+                self._sink_error = repr(exc)
+                ok = False
+
+            if not ok:
+                if self._config.backpressure_policy == "spill":
+                    self._activate_spill("finalize_emit_failed", self._sink_error)
+                if self._spilled:
+                    finished_event, summary = _build_final()
+                else:
+                    self._force_incomplete = True
+                    summary = summary.model_copy(update={"capture_completeness": "incomplete"})
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._sink.on_finish(summary),
+                        timeout=self._config.drain_timeout_s,
+                    )
+                    await asyncio.wait_for(
+                        self._sink.flush(),
+                        timeout=self._config.drain_timeout_s,
+                    )
+                except TimeoutError as exc:
+                    self._sink_timed_out = True
+                    self._sink_error = repr(exc)
+                    if self._config.backpressure_policy == "spill":
+                        self._activate_spill("finalize_sink_timeout", repr(exc))
+                        if not self._spilled:
+                            self._force_incomplete = True
+                    else:
+                        self._force_incomplete = True
+                    finished_event, summary = _build_final()
+                except Exception as exc:
+                    self._sink_error = repr(exc)
+                    if self._config.backpressure_policy == "spill":
+                        self._activate_spill("finalize_sink_failed", repr(exc))
+                        if not self._spilled:
+                            self._force_incomplete = True
+                    else:
+                        self._force_incomplete = True
+                    finished_event, summary = _build_final()
 
             if self._spilled:
                 try:
@@ -595,81 +657,103 @@ class CapturePipeline:
                     self._spool_error = repr(exc)
                     self._force_incomplete = True
                     summary = summary.model_copy(update={"capture_completeness": "incomplete"})
-            elif self._sink_error is None and not self._sink_timed_out:
-                try:
-                    ok = await asyncio.wait_for(
-                        self._call_primary_sink_with_spill_guard(
-                            self._sink.emit_events([finished_event])
-                        ),
-                        timeout=self._config.drain_timeout_s,
-                    )
-                except TimeoutError as exc:
-                    self._sink_timed_out = True
-                    self._sink_error = repr(exc)
-                    ok = False
+        else:
+            self._force_incomplete = True
+            summary = summary.model_copy(update={"capture_completeness": "incomplete"})
 
-                if not ok:
-                    if self._config.backpressure_policy == "spill":
-                        self._activate_spill("finalize_emit_failed", self._sink_error)
-                    if self._spilled:
-                        finished_event, summary = _build_final()
-                    else:
-                        self._force_incomplete = True
-                        summary = summary.model_copy(update={"capture_completeness": "incomplete"})
-                else:
-                    try:
-                        await asyncio.wait_for(
-                            self._sink.on_finish(summary),
-                            timeout=self._config.drain_timeout_s,
-                        )
-                        await asyncio.wait_for(
-                            self._sink.flush(),
-                            timeout=self._config.drain_timeout_s,
-                        )
-                    except TimeoutError as exc:
-                        self._sink_timed_out = True
-                        self._sink_error = repr(exc)
-                        if self._config.backpressure_policy == "spill":
-                            self._activate_spill("finalize_sink_timeout", repr(exc))
-                            if not self._spilled:
-                                self._force_incomplete = True
-                        else:
-                            self._force_incomplete = True
-                        finished_event, summary = _build_final()
-                    except Exception as exc:
-                        self._sink_error = repr(exc)
-                        if self._config.backpressure_policy == "spill":
-                            self._activate_spill("finalize_sink_failed", repr(exc))
-                            if not self._spilled:
-                                self._force_incomplete = True
-                        else:
-                            self._force_incomplete = True
-                        finished_event, summary = _build_final()
+        return summary
 
-                if self._spilled:
-                    try:
-                        self._spool.write_events([finished_event])
-                        self._spool.write_summary(summary)
-                        self._spool.flush()
-                    except OSError as exc:
-                        self._spool_error = repr(exc)
-                        self._force_incomplete = True
-                        summary = summary.model_copy(update={"capture_completeness": "incomplete"})
-            else:
-                self._force_incomplete = True
-                summary = summary.model_copy(update={"capture_completeness": "incomplete"})
+    async def _close_resources(self) -> None:
+        async with self._condition:
+            self._closed_for_input = True
+            self._queue.clear()
+            self._queued_bytes = 0
+            self._condition.notify_all()
 
-            try:
-                await asyncio.wait_for(
-                    self._sink.close(), timeout=min(1.0, self._config.drain_timeout_s)
-                )
-            except Exception as exc:
-                _LOGGER.warning("Failed to close capture sink %r: %s", self._sink, exc)
+        if self._worker_task is not None:
+            if not self._worker_task.done():
+                self._worker_task.cancel()
+            await asyncio.gather(self._worker_task, return_exceptions=True)
 
+        try:
+            await asyncio.wait_for(
+                self._sink.close(), timeout=min(1.0, self._config.drain_timeout_s)
+            )
+        except Exception as exc:
+            _LOGGER.warning("Failed to close capture sink %r: %s", self._sink, exc)
+        finally:
             self._spool.close()
 
-            self._finalized = True
-            self._summary = summary
+    async def _wait_for_close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_resources())
+        await asyncio.shield(self._close_task)
+
+    async def _close_after_error(self, error: BaseException) -> None:
+        self._capture_error = error
+        try:
+            await self._wait_for_close()
+        except (Exception, asyncio.CancelledError) as close_error:
+            if close_error is not error:
+                error.add_note(f"Failed to close capture resources: {close_error}")
+
+    async def finalize(
+        self,
+        *,
+        termination_reason: str,
+        exit_code: int,
+        returncode: int | None = None,
+    ) -> ExecutionSummary:
+        """Drain buffered inputs, emit ``execution_finished``, flush sinks, and return summary."""
+        async with self._finalize_lock:
+            if self._capture_error is not None:
+                raise self._capture_error
+            if self._summary is not None:
+                return self._summary
+
+            try:
+                if not self._started:
+                    await self.start()
+
+                async with self._condition:
+                    self._closed_for_input = True
+                    self._queue.append(_QueuedEntry(item=None, byte_cost=0))
+                    self._condition.notify_all()
+
+                consumer_error: Exception | None = None
+                try:
+                    await self._drain_worker()
+                except Exception as exc:
+                    consumer_error = exc
+                    self._force_incomplete = True
+                    for entry in self._queue:
+                        if entry.item is not None:
+                            self._record_gap_span(
+                                entry.item.monotonic_time_ns, reason="capture_consumer_failed"
+                            )
+                    self._queue.clear()
+                    self._queued_bytes = 0
+
+                try:
+                    summary = await self._finish_capture(
+                        termination_reason=termination_reason,
+                        exit_code=exit_code,
+                        returncode=returncode,
+                    )
+                except Exception as exc:
+                    if consumer_error is None:
+                        raise
+                    consumer_error.add_note(f"Failed to finalize incomplete capture: {exc}")
+                    raise consumer_error from None
+                self._summary = summary
+                if consumer_error is not None:
+                    raise consumer_error
+
+                await self._wait_for_close()
+            except BaseException as exc:
+                await self._close_after_error(exc)
+                raise
+
             return summary
 
 

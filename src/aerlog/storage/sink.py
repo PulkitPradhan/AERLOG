@@ -8,7 +8,6 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Sequence
-from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -142,7 +141,7 @@ class PersistentCaptureSink:
         try:
             self._store.initialize()
             self._store.insert_execution_start(header)
-        except Exception as exc:
+        except BaseException as exc:
             if _is_sqlite_metadata_error(exc):
                 self._sqlite_diverged = True
                 logger.warning(
@@ -152,10 +151,13 @@ class PersistentCaptureSink:
                     exc,
                 )
             else:
-                with suppress(Exception):
+                try:
                     writer.close()
-                self._writer = None
-                self._execution_id = None
+                except Exception as close_error:
+                    exc.add_note(f"Failed to close writer after sink startup: {close_error}")
+                finally:
+                    self._writer = None
+                    self._execution_id = None
                 raise
 
     def _emit_events_sync(self, events: Sequence[ExecutionEvent]) -> None:
@@ -206,12 +208,12 @@ class PersistentCaptureSink:
             self._writer.flush()
 
     def _close_sync(self) -> None:
-        errors: list[Exception] = []
+        errors: list[BaseException] = []
         try:
             if self._writer is not None:
                 try:
                     self._writer.close()
-                except Exception as exc:
+                except BaseException as exc:
                     errors.append(exc)
                 finally:
                     self._writer = None
@@ -219,15 +221,16 @@ class PersistentCaptureSink:
             try:
                 if self._owns_store:
                     self._store.close()
-            except Exception as exc:
+            except BaseException as exc:
                 errors.append(exc)
             finally:
                 self._executor.shutdown(wait=False)
 
-        if len(errors) == 1:
-            raise errors[0]
         if errors:
-            raise ExceptionGroup("PersistentCaptureSink.close failed", errors)
+            primary, *secondary = errors
+            for close_error in secondary:
+                primary.add_note(f"Failed to close SQLite metadata store: {close_error}")
+            raise primary
 
     async def on_start(self, header: ExecutionHeader) -> None:
         """Initialize execution log files and insert initial ``executions`` index row."""

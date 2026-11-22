@@ -126,7 +126,7 @@ def write_atomic_private_json(
     tmp_name = f".{target_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     tmp_path = target_path.parent / tmp_name
 
-    fd = -1
+    fd: int | None = None
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.chmod(fd, 0o600)
@@ -139,17 +139,19 @@ def write_atomic_private_json(
             written += n
         if fsync:
             os.fsync(fd)
-        os.close(fd)
-        fd = -1
+        fd_to_close, fd = fd, None
+        os.close(fd_to_close)
         os.replace(tmp_path, target_path)
         os.chmod(target_path, 0o600)
-    except OSError as exc:
-        if fd >= 0:
+    except BaseException as exc:
+        if fd is not None:
             with suppress(OSError):
                 os.close(fd)
         with suppress(OSError):
             tmp_path.unlink(missing_ok=True)
-        raise _translate_os_error(exc, context=f"writing {target_path.name}") from exc
+        if isinstance(exc, OSError):
+            raise _translate_os_error(exc, context=f"writing {target_path.name}") from exc
+        raise
 
 
 def sanitize_event_for_persistence(
@@ -449,8 +451,10 @@ class JsonlEventLogWriter:
         """Maximum sequence number observed and persisted by this writer."""
         return self._last_sequence
 
-    def open(self, header: ExecutionHeader) -> ExecutionManifest:
-        """Create ``0o700`` dir, open ``0o600`` JSONL file, and write initial metadata."""
+    def open(self, header: ExecutionHeader, *, preserve_summary: bool = False) -> ExecutionManifest:
+        """Open the private log and write initial metadata, retaining a summary during recovery."""
+        if self._fd is not None:
+            raise StorageWriteError("JsonlEventLogWriter is already open")
         if header.execution_id != self._execution_id:
             raise InvalidExecutionIdError(
                 f"Header execution_id {header.execution_id!r} != {self._execution_id!r}"
@@ -483,37 +487,44 @@ class JsonlEventLogWriter:
                     pass
 
         try:
-            flags = os.O_RDWR | os.O_CREAT
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(self._events_path, flags, 0o600)
-            os.chmod(fd, 0o600)
-            self._fd = fd
-            self._byte_offset = os.lseek(fd, 0, os.SEEK_END)
-        except OSError as exc:
-            raise _translate_os_error(exc, context=f"opening {self._events_path}") from exc
+            try:
+                flags = os.O_RDWR | os.O_CREAT
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                self._fd = os.open(self._events_path, flags, 0o600)
+                os.chmod(self._fd, 0o600)
+                self._byte_offset = os.lseek(self._fd, 0, os.SEEK_END)
+            except OSError as exc:
+                raise _translate_os_error(exc, context=f"opening {self._events_path}") from exc
 
-        safe_header = sanitize_header_for_persistence(header, persist_cwd=self._persist_cwd)
-        write_atomic_private_json(
-            self._execution_path,
-            safe_header.model_dump(mode="json"),
-            fsync=self._fsync_policy != "none",
-        )
-        self._created_at = self._created_at or header.started_at
-        manifest = ExecutionManifest(
-            execution_id=self._execution_id,
-            recording_dir=relative_recording_dir(self._execution_id),
-            status="recording",
-            created_at=self._created_at,
-            byte_size=self._byte_offset,
-            line_count=self._line_count,
-            last_sequence=self._last_sequence,
-        )
-        write_atomic_private_json(
-            self._manifest_path,
-            manifest.model_dump(mode="json"),
-            fsync=self._fsync_policy != "none",
-        )
+            if not preserve_summary:
+                safe_header = sanitize_header_for_persistence(header, persist_cwd=self._persist_cwd)
+                write_atomic_private_json(
+                    self._execution_path,
+                    safe_header.model_dump(mode="json"),
+                    fsync=self._fsync_policy != "none",
+                )
+            self._created_at = self._created_at or header.started_at
+            manifest = ExecutionManifest(
+                execution_id=self._execution_id,
+                recording_dir=relative_recording_dir(self._execution_id),
+                status="recording",
+                created_at=self._created_at,
+                byte_size=self._byte_offset,
+                line_count=self._line_count,
+                last_sequence=self._last_sequence,
+            )
+            write_atomic_private_json(
+                self._manifest_path,
+                manifest.model_dump(mode="json"),
+                fsync=self._fsync_policy != "none",
+            )
+        except BaseException as exc:
+            try:
+                self._close_descriptor()
+            except OSError as close_error:
+                exc.add_note(f"Failed to close {self._events_path}: {close_error}")
+            raise
         return manifest
 
     def append_events(self, events: Sequence[ExecutionEvent]) -> tuple[WrittenEventSlice, ...]:
@@ -710,37 +721,35 @@ class JsonlEventLogWriter:
             return None
 
     def flush(self) -> None:
-        """Flush buffered writes cleanly if ``fsync_policy != 'none'``."""
-        if self._fd is not None and self._fsync_policy != "none":
+        """Sync the open event log as configured and persist its current manifest counters."""
+        if self._fd is None:
+            return
+        if self._fsync_policy != "none":
             try:
                 os.fsync(self._fd)
             except OSError as exc:
                 raise _translate_os_error(exc, context=f"fsyncing {self._events_path}") from exc
 
-        if self._manifest_path.exists():
-            try:
-                raw_m = json.loads(self._manifest_path.read_text(encoding="utf-8"))
-                if isinstance(raw_m, dict):
-                    status = raw_m.get("status", "recording")
-                    manifest = ExecutionManifest(
-                        execution_id=self._execution_id,
-                        recording_dir=relative_recording_dir(self._execution_id),
-                        status=status,
-                        created_at=self._created_at or datetime.now(UTC),
-                        finalized_at=raw_m.get("finalized_at"),
-                        byte_size=self._byte_offset,
-                        line_count=self._line_count,
-                        last_sequence=self._last_sequence,
-                        events_file_sha256=raw_m.get("events_file_sha256"),
-                        corruption_count=int(raw_m.get("corruption_count", 0)),
-                    )
-                    write_atomic_private_json(
-                        self._manifest_path,
-                        manifest.model_dump(mode="json"),
-                        fsync=self._fsync_policy != "none",
-                    )
-            except Exception:
-                pass
+        try:
+            raw_manifest = self._manifest_path.read_bytes()
+        except OSError as exc:
+            raise _translate_os_error(exc, context=f"reading {self._manifest_path}") from exc
+        try:
+            manifest = ExecutionManifest.model_validate_json(raw_manifest)
+        except ValidationError as exc:
+            raise StorageCorruptionError(f"Invalid manifest at {self._manifest_path}") from exc
+        manifest = manifest.model_copy(
+            update={
+                "byte_size": self._byte_offset,
+                "line_count": self._line_count,
+                "last_sequence": self._last_sequence,
+            }
+        )
+        write_atomic_private_json(
+            self._manifest_path,
+            manifest.model_dump(mode="json"),
+            fsync=self._fsync_policy != "none",
+        )
 
     def finalize(self, summary: ExecutionSummary) -> ExecutionManifest:
         """Atomically persist final summary and verified manifest metadata."""
@@ -791,10 +800,22 @@ class JsonlEventLogWriter:
 
     def close(self) -> None:
         """Close the underlying JSONL file descriptor cleanly."""
-        if self._fd is not None:
+        if self._fd is None:
+            return
+        try:
             self.flush()
-            fd = self._fd
-            self._fd = None
+        except BaseException as exc:
+            try:
+                self._close_descriptor()
+            except OSError as close_error:
+                exc.add_note(f"Failed to close {self._events_path}: {close_error}")
+            raise
+        else:
+            self._close_descriptor()
+
+    def _close_descriptor(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
             os.close(fd)
 
 

@@ -12,10 +12,11 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from mcp import Client
@@ -28,7 +29,10 @@ from aerlog.capture import (
     CaptureConfig,
     CaptureProxyObserver,
 )
+from aerlog.capture.normalizer import EventNormalizer
+from aerlog.capture.sinks import RecoverySpool
 from aerlog.events.ids import new_execution_id
+from aerlog.events.models import ExecutionEvent
 from aerlog.export import (
     export_execution_regression_test,
     load_regression_fixture,
@@ -37,7 +41,13 @@ from aerlog.export import (
 from aerlog.proxy.stdio_proxy import ProxyConfig, StdioProxy
 from aerlog.replay import build_cassette_from_execution, replay_cassette
 from aerlog.storage.database import DB_FILE_NAME
-from aerlog.storage.event_log import EVENTS_FILE_NAME, EXECUTIONS_DIR_NAME
+from aerlog.storage.event_log import (
+    EVENTS_FILE_NAME,
+    EXECUTION_FILE_NAME,
+    EXECUTIONS_DIR_NAME,
+    JsonlEventLogWriter,
+    write_atomic_private_json,
+)
 from aerlog.storage.exceptions import StorageCorruptionError
 from aerlog.storage.repositories import RecordingRepository
 from aerlog.storage.sink import PersistentCaptureSink
@@ -669,4 +679,93 @@ async def test_enospc_disk_full_preserves_prior_recordings_and_marks_incomplete(
         assert res_ok.events[0].event.kind == "execution_started"
         assert res_ok.events[-1].event.kind == "execution_finished"
     finally:
+        repo.close()
+
+
+@pytest.mark.parametrize("flush_fails", [False, True])
+def test_spool_retry_preserves_retained_summary_after_failed_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flush_fails: bool
+) -> None:
+    data_dir = tmp_path / "data"
+    eid = new_execution_id()
+    normalizer = EventNormalizer(
+        execution_id=eid,
+        started_at=datetime(2026, 11, 13, tzinfo=UTC),
+        monotonic_start_ns=1,
+        command=("test-server",),
+    )
+    (first,) = normalizer.start_execution()
+    terminal, summary = normalizer.finalize_execution(
+        ended_at=first.timestamp,
+        monotonic_end_ns=2,
+        termination_reason="clean_exit",
+        exit_code=0,
+    )
+    writer = JsonlEventLogWriter(data_dir, eid)
+    writer.open(normalizer.build_header())
+    writer.append_events([first])
+    writer.close()
+    summary_path = writer.execution_dir / EXECUTION_FILE_NAME
+    write_atomic_private_json(summary_path, summary.model_dump(mode="json"))
+    prefix = writer.events_path.read_bytes()
+    retained_bytes = summary_path.read_bytes()
+    spool = RecoverySpool(tmp_path / "retry.spool")
+    spool.write_events([first, terminal])
+    spool.close()
+
+    append_error = OSError("import append interrupted")
+    append_fd: int | None = None
+    real_fsync = os.fsync
+    real_close = os.close
+    close_attempts = 0
+
+    def fail_append(writer: JsonlEventLogWriter, events: Sequence[ExecutionEvent]) -> NoReturn:
+        nonlocal append_fd
+        append_fd = writer._fd
+        raise append_error
+
+    def fail_flush(fd: int) -> None:
+        if flush_fails and fd == append_fd:
+            raise OSError(errno.EIO, "import cleanup flush failed")
+        real_fsync(fd)
+
+    def track_close(fd: int) -> None:
+        nonlocal close_attempts
+        if fd == append_fd:
+            close_attempts += 1
+        real_close(fd)
+
+    repo = RecordingRepository(data_dir)
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(JsonlEventLogWriter, "append_events", fail_append)
+            fault.setattr(os, "fsync", fail_flush)
+            fault.setattr(os, "close", track_close)
+            with pytest.raises(OSError) as raised:
+                repo.import_recovery_spool(spool.path, tail_policy="reject")
+        assert raised.value is append_error
+        assert append_fd is not None
+        assert close_attempts == 1
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(append_fd)
+        assert writer.events_path.read_bytes() == prefix
+        assert summary_path.read_bytes() == retained_bytes
+        report = repo.import_recovery_spool(spool.path, tail_policy="reject")
+        assert (report.imported_events, report.skipped_duplicates, report.final_status) == (
+            1,
+            1,
+            "complete",
+        )
+        assert writer.events_path.read_bytes().startswith(prefix)
+        read = repo.get_execution_events(eid, strict_integrity=True)
+        assert read.summary == summary
+        assert [entry.event.event_id for entry in read.events] == [
+            first.event_id,
+            terminal.event_id,
+        ]
+        retry = repo.import_recovery_spool(spool.path, tail_policy="reject")
+        assert (retry.imported_events, retry.skipped_duplicates) == (0, 2)
+    finally:
+        if append_fd is not None and close_attempts == 0:
+            real_close(append_fd)
         repo.close()

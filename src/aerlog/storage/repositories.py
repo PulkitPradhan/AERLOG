@@ -1629,7 +1629,7 @@ class RecordingRepository:
                 created_at=previous_manifest.created_at if previous_manifest else None,
             )
             try:
-                opened_manifest = writer.open(header)
+                opened_manifest = writer.open(header, preserve_summary=prior.summary is not None)
                 if previous_manifest is not None and previous_manifest.corruption_count:
                     # The writer's recording manifest starts at zero. Carry the destination's
                     # quarantine decision forward before another append can fail.
@@ -1640,7 +1640,13 @@ class RecordingRepository:
                         exec_dir / MANIFEST_FILE_NAME, updated.model_dump(mode="json"), fsync=fsync
                     )
                 writer.append_events(new_events)
-            finally:
+            except BaseException as exc:
+                try:
+                    writer.close()
+                except Exception as close_error:
+                    exc.add_note(f"Failed to close recovery writer for {exec_id}: {close_error}")
+                raise
+            else:
                 writer.close()
             prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
 
