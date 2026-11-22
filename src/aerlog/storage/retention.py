@@ -16,6 +16,8 @@ from pathlib import Path
 
 from aerlog.storage.database import IndexedExecutionRow, SQLiteMetadataStore
 from aerlog.storage.event_log import resolve_execution_dir
+from aerlog.storage.exceptions import ExecutionBusyError
+from aerlog.storage.ownership import ExecutionOwnership
 
 _PROTECTED_INCOMPLETE_STATUSES = frozenset({"incomplete", "spilled", "degraded", "corrupted"})
 
@@ -49,6 +51,7 @@ class RetentionReport:
     protected_execution_ids: tuple[str, ...]
     reclaimed_bytes: int
     compacted: bool
+    busy_execution_ids: tuple[str, ...] = ()
 
 
 def _execution_dir_bytes(data_dir: Path, execution_id: str) -> int:
@@ -58,7 +61,10 @@ def _execution_dir_bytes(data_dir: Path, execution_id: str) -> int:
     total = 0
     for child in exec_dir.rglob("*"):
         if child.is_file() and not child.is_symlink():
-            total += child.stat().st_size
+            try:
+                total += child.stat().st_size
+            except FileNotFoundError:
+                continue  # Another execution may be changing during discovery.
     return total
 
 
@@ -83,6 +89,60 @@ def apply_retention(
 
     store.initialize()
     ref_now = datetime.now(UTC) if now is None else now.astimezone(UTC)
+    to_delete_order, protected_ids, size_by_id = _candidates(data_dir, store, policy, ref_now)
+    reclaimed_bytes = sum(size_by_id[eid] for eid in to_delete_order)
+    if policy.dry_run:
+        return RetentionReport(
+            dry_run=True,
+            candidate_execution_ids=tuple(to_delete_order),
+            deleted_execution_ids=(),
+            protected_execution_ids=tuple(protected_ids),
+            reclaimed_bytes=reclaimed_bytes,
+            compacted=False,
+        )
+
+    deleted: list[str] = []
+    busy: list[str] = []
+    reclaimed_bytes = 0
+    for eid in to_delete_order:
+        try:
+            with ExecutionOwnership.acquire(data_dir, eid):
+                candidates, protected, sizes = _candidates(data_dir, store, policy, ref_now)
+                if eid in protected and eid not in protected_ids:
+                    protected_ids.append(eid)
+                if eid not in candidates:
+                    continue
+                exec_dir = resolve_execution_dir(data_dir, eid)
+                if exec_dir.exists():
+                    shutil.rmtree(exec_dir)
+                store.delete_executions([eid])
+                deleted.append(eid)
+                reclaimed_bytes += sizes[eid]
+        except ExecutionBusyError:
+            busy.append(eid)
+
+    compacted = False
+    if vacuum:
+        store.compact()
+        compacted = True
+
+    return RetentionReport(
+        dry_run=False,
+        candidate_execution_ids=tuple(to_delete_order),
+        deleted_execution_ids=tuple(deleted),
+        busy_execution_ids=tuple(busy),
+        protected_execution_ids=tuple(protected_ids),
+        reclaimed_bytes=reclaimed_bytes,
+        compacted=compacted,
+    )
+
+
+def _candidates(
+    data_dir: Path,
+    store: SQLiteMetadataStore,
+    policy: RetentionPolicy,
+    ref_now: datetime,
+) -> tuple[list[str], list[str], dict[str, int]]:
     rows = store.list_execution_rows(limit=1_000_000, offset=0)  # newest first
 
     protected_ids: list[str] = []
@@ -129,36 +189,7 @@ def apply_retention(
                 _mark(row.execution_id)
                 remaining_bytes -= size
 
-    reclaimed_bytes = sum(size_by_id[eid] for eid in to_delete_order)
-    if policy.dry_run:
-        return RetentionReport(
-            dry_run=True,
-            candidate_execution_ids=tuple(to_delete_order),
-            deleted_execution_ids=(),
-            protected_execution_ids=tuple(protected_ids),
-            reclaimed_bytes=reclaimed_bytes,
-            compacted=False,
-        )
-
-    store.delete_executions(to_delete_order)
-    for eid in to_delete_order:
-        exec_dir = resolve_execution_dir(data_dir, eid)
-        if exec_dir.exists():
-            shutil.rmtree(exec_dir)
-
-    compacted = False
-    if vacuum:
-        store.compact()
-        compacted = True
-
-    return RetentionReport(
-        dry_run=False,
-        candidate_execution_ids=tuple(to_delete_order),
-        deleted_execution_ids=tuple(to_delete_order),
-        protected_execution_ids=tuple(protected_ids),
-        reclaimed_bytes=reclaimed_bytes,
-        compacted=compacted,
-    )
+    return to_delete_order, protected_ids, size_by_id
 
 
 def compact_database(store: SQLiteMetadataStore) -> None:

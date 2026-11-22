@@ -65,9 +65,11 @@ from aerlog.storage.event_log import (
     write_atomic_private_json,
 )
 from aerlog.storage.exceptions import (
+    ExecutionBusyError,
     ExecutionNotFoundError,
     StorageCorruptionError,
 )
+from aerlog.storage.ownership import ExecutionOwnership
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +105,7 @@ class ReconciliationReport:
     discovered_execution_ids: tuple[str, ...]
     corruptions_found: int
     unclean_shutdown_ids: tuple[str, ...]
+    busy_execution_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,10 +757,15 @@ class RecordingRepository:
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         if not exec_dir.exists():
             if mark_missing and (self._store.is_open or self._store.db_path.exists()):
-                row = self._store.get_execution_row(clean_id)
-                if row is not None:
-                    self._store.mark_missing_jsonl(clean_id)
-            raise ExecutionNotFoundError(f"Execution directory missing for {clean_id!r}")
+                with ExecutionOwnership.acquire(self._data_dir, clean_id):
+                    if not exec_dir.exists():
+                        if self._store.get_execution_row(clean_id) is not None:
+                            self._store.mark_missing_jsonl(clean_id)
+                        raise ExecutionNotFoundError(
+                            f"Execution directory missing for {clean_id!r}"
+                        )
+            else:
+                raise ExecutionNotFoundError(f"Execution directory missing for {clean_id!r}")
         return self._reader.read_execution(
             clean_id,
             strict=strict_integrity,
@@ -893,12 +901,13 @@ class RecordingRepository:
             and marks the manifest status as 'incomplete'.
         """
         clean_id = validate_execution_id(execution_id)
-        exec_dir = resolve_execution_dir(self._data_dir, clean_id)
-        events_path = exec_dir / EVENTS_FILE_NAME
-        prior = self._reader.read_execution(clean_id, strict=False, verify_checksums=True)
-        file_bytes = events_path.read_bytes() if events_path.exists() else b""
-        repair = _inspect_tail(prior, file_bytes, tail_policy=tail_policy)
-        return self._apply_tail_repair(exec_dir, prior, file_bytes, repair)
+        with ExecutionOwnership.acquire(self._data_dir, clean_id):
+            exec_dir = resolve_execution_dir(self._data_dir, clean_id)
+            events_path = exec_dir / EVENTS_FILE_NAME
+            prior = self._reader.read_execution(clean_id, strict=False, verify_checksums=True)
+            file_bytes = events_path.read_bytes() if events_path.exists() else b""
+            repair = _inspect_tail(prior, file_bytes, tail_policy=tail_policy)
+            return self._apply_tail_repair(exec_dir, prior, file_bytes, repair)
 
     def _apply_tail_repair(
         self,
@@ -1106,7 +1115,8 @@ class RecordingRepository:
     def reconcile_execution(self, execution_id: str) -> JsonlReadResult | None:
         """Rebuild SQLite index state for one execution from authoritative ``events.jsonl``."""
         clean_id = validate_execution_id(execution_id)
-        return self._reconcile_internal(clean_id)
+        with ExecutionOwnership.acquire(self._data_dir, clean_id):
+            return self._reconcile_internal(clean_id)
 
     def _reconcile_internal(self, clean_id: str) -> JsonlReadResult | None:
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
@@ -1149,9 +1159,12 @@ class RecordingRepository:
 
     def reconcile_all_executions(self) -> ReconciliationReport:
         """Scan SQLite and filesystem executions, repairing divergence from JSONL truth."""
-        self._store.initialize()
         disk_ids = set(self._reader.discover_execution_ids())
-        db_rows = self._store.list_execution_rows(limit=1_000_000, offset=0)
+        db_rows = (
+            self._store.list_execution_rows(limit=1_000_000, offset=0)
+            if self._store.is_open or self._store.db_path.exists()
+            else ()
+        )
         db_ids = {r.execution_id for r in db_rows}
 
         reconciled: list[str] = []
@@ -1160,9 +1173,18 @@ class RecordingRepository:
         unclean: list[str] = []
         corruptions_total = 0
 
+        busy: list[str] = []
         for eid in sorted(disk_ids | db_ids):
-            was_on_disk_only = eid in disk_ids and eid not in db_ids
-            res = self.reconcile_execution(eid)
+            try:
+                with ExecutionOwnership.acquire(self._data_dir, eid):
+                    was_on_disk_only = self._store.get_execution_row(eid) is None
+                    res = self._reconcile_internal(eid)
+            except ExecutionBusyError:
+                busy.append(eid)
+                continue
+            except ExecutionNotFoundError:
+                # Confirmed retention can remove a discovered execution before we acquire it.
+                continue
             if res is None:
                 missing_jsonl.append(eid)
                 continue
@@ -1179,6 +1201,7 @@ class RecordingRepository:
             discovered_execution_ids=tuple(discovered),
             corruptions_found=corruptions_total,
             unclean_shutdown_ids=tuple(unclean),
+            busy_execution_ids=tuple(busy),
         )
 
     def import_recovery_spool(
@@ -1204,6 +1227,7 @@ class RecordingRepository:
         observed_exec_ids: set[str] = set()
 
         with spool_path.open("rb") as handle:
+            source = os.fstat(handle.fileno())
             offset = 0
             for line_no, raw_line in enumerate(handle, start=1):
                 line_len = len(raw_line)
@@ -1360,6 +1384,41 @@ class RecordingRepository:
             for c in corrupt_lines
         )
 
+        with ExecutionOwnership.acquire(self._data_dir, exec_id) as ownership:
+            current = spool_path.stat(follow_symlinks=False)
+            if (
+                not os.path.samestat(source, current)
+                or source.st_size != current.st_size
+                or source.st_ctime_ns != current.st_ctime_ns
+            ):
+                raise StorageCorruptionError("Recovery spool changed during import; retry")
+            return self._import_verified_spool(
+                exec_id,
+                ownership,
+                parsed_header,
+                parsed_summary,
+                conflicting_summaries,
+                parsed_events,
+                fixed_corruptions,
+                redaction_mode,
+                fsync_policy,
+                tail_policy,
+            )
+
+    def _import_verified_spool(
+        self,
+        exec_id: str,
+        ownership: ExecutionOwnership,
+        parsed_header: ExecutionHeader | None,
+        parsed_summary: ExecutionSummary | None,
+        conflicting_summaries: list[ExecutionSummary],
+        parsed_events: list[tuple[ExecutionEvent, bool]],
+        fixed_corruptions: tuple[CorruptRecordReport, ...],
+        redaction_mode: RedactionMode,
+        fsync_policy: FsyncPolicy,
+        tail_policy: TailPolicy,
+    ) -> SpoolImportReport:
+        """Read and mutate the destination only while holding its execution lock."""
         exec_dir = resolve_execution_dir(self._data_dir, exec_id)
         events_path = exec_dir / EVENTS_FILE_NAME
         has_destination = events_path.exists() or (exec_dir / EXECUTION_FILE_NAME).exists()
@@ -1624,6 +1683,7 @@ class RecordingRepository:
                 redaction_mode=redaction_mode,
                 persist_cwd=self._persist_cwd,
                 tail_policy=tail_policy,
+                ownership=ownership,
                 seed_line_count=len(prior.events),
                 seed_last_sequence=prior.last_valid_sequence,
                 created_at=previous_manifest.created_at if previous_manifest else None,

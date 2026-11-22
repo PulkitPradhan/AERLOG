@@ -89,16 +89,17 @@ from aerlog.storage.database import DB_FILE_NAME, IndexedExecutionRow
 from aerlog.storage.event_log import (
     FsyncPolicy,
     JsonlEventLogReader,
-    resolve_execution_dir,
     validate_execution_id,
 )
 from aerlog.storage.exceptions import (
+    ExecutionBusyError,
     ExecutionNotFoundError,
     InvalidExecutionIdError,
     StorageCorruptionError,
     StorageError,
     UnsupportedSchemaVersionError,
 )
+from aerlog.storage.ownership import ExecutionOwnership
 from aerlog.storage.repositories import RecordingRepository
 from aerlog.storage.sink import PersistentCaptureSink
 
@@ -177,6 +178,8 @@ def _cli_error(
 
 
 def _storage_error_hint(exc: BaseException) -> str | None:
+    if isinstance(exc, ExecutionBusyError):
+        return "Retry after the active operation has finished."
     if isinstance(exc, ExecutionNotFoundError):
         return (
             "Run 'aerlog list' to list recorded executions or 'aerlog run -- <cmd>' to capture one."
@@ -563,18 +566,6 @@ def run_mcp_proxy(
         resolved_exec_id = (
             validate_execution_id(execution_id) if execution_id is not None else new_execution_id()
         )
-        if execution_id is not None and (
-            resolve_execution_dir(resolved_dir, resolved_exec_id).exists()
-        ):
-            raise ValueError(
-                f"Execution ID {resolved_exec_id!r} already exists in {resolved_dir}; "
-                "omit '--execution-id' or provide a new UUID."
-            )
-        if execution_id is not None and default_spool_path(resolved_exec_id, spill_dir).exists():
-            raise ValueError(
-                f"A recovery spool already exists for execution ID {resolved_exec_id!r}; "
-                "omit '--execution-id' or provide a new UUID."
-            )
         resolved_cwd = cwd.expanduser() if cwd is not None else None
         if resolved_cwd is not None and not resolved_cwd.is_dir():
             raise ValueError(f"Working directory does not exist: {resolved_cwd}")
@@ -625,9 +616,10 @@ def run_mcp_proxy(
             nl=False,
         )
 
-    async def _run_proxy_capture() -> ProxyResult:
+    async def _run_proxy_capture(ownership: ExecutionOwnership) -> ProxyResult:
         sink = PersistentCaptureSink(
             resolved_dir,
+            ownership=ownership,
             fsync_policy=effective_fsync,
             sqlite_synchronous=cfg.storage.sqlite_synchronous,
             redaction_mode=effective_redaction,
@@ -656,14 +648,20 @@ def run_mcp_proxy(
                     )
                 )
         finally:
-            with contextlib.suppress(Exception):
-                await observer.force_close()
-            await sink.close()
+            try:
+                with contextlib.suppress(Exception):
+                    await observer.force_close()
+            finally:
+                await sink.close()
 
     try:
-        result = asyncio.run(_run_proxy_capture())
+        with ExecutionOwnership.acquire(resolved_dir, resolved_exec_id) as ownership:
+            ownership.check_new_capture(default_spool_path(resolved_exec_id, spill_dir))
+            result = asyncio.run(_run_proxy_capture(ownership))
     except KeyboardInterrupt as exc:
         raise typer.Exit(code=130) from exc
+    except ExecutionBusyError as exc:
+        _cli_error("Run error", exc, code=1, cause=exc)
     except (StorageError, OSError, ValueError) as exc:
         _cli_error(
             "Run error",

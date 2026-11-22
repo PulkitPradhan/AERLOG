@@ -31,6 +31,8 @@ from aerlog.storage.exceptions import (
     StorageWriteError,
     UnsupportedSchemaVersionError,
 )
+from aerlog.storage.ownership import ExecutionOwnership
+from aerlog.storage.ownership import validate_execution_id as validate_execution_id
 
 STORAGE_SCHEMA_VERSION = "1.0.0"
 
@@ -57,24 +59,6 @@ def _ensure_private_dir(path: Path) -> None:
     """Create directory hierarchy and restrict leaf/created directories to ``0o700``."""
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o700)
-
-
-def validate_execution_id(execution_id: str) -> str:
-    """Validate canonical UUID syntax and reject any path-traversal characters."""
-    if not isinstance(execution_id, str) or not execution_id.strip():
-        raise InvalidExecutionIdError("execution_id must be a non-empty string")
-    if "/" in execution_id or "\\" in execution_id or ".." in execution_id:
-        raise InvalidExecutionIdError(f"Unsafe execution_id path characters: {execution_id!r}")
-    try:
-        parsed = uuid.UUID(execution_id)
-    except ValueError as exc:
-        raise InvalidExecutionIdError(f"Invalid UUID execution_id: {execution_id!r}") from exc
-    canonical = str(parsed)
-    if canonical != execution_id:
-        raise InvalidExecutionIdError(
-            f"execution_id must be canonical lowercase UUID string, got {execution_id!r}"
-        )
-    return canonical
 
 
 def resolve_execution_dir(data_dir: Path, execution_id: str) -> Path:
@@ -397,9 +381,12 @@ class JsonlEventLogWriter:
         seed_line_count: int | None = None,
         seed_last_sequence: int | None = None,
         created_at: datetime | None = None,
+        ownership: ExecutionOwnership | None = None,
     ) -> None:
         self._data_dir = data_dir
         self._execution_id = validate_execution_id(execution_id)
+        self._parent_ownership = ownership
+        self._ownership: ExecutionOwnership | None = None
         self._fsync_policy: FsyncPolicy = fsync_policy
         self._redaction_mode: RedactionMode = redaction_mode
         self._persist_cwd = persist_cwd
@@ -459,6 +446,19 @@ class JsonlEventLogWriter:
             raise InvalidExecutionIdError(
                 f"Header execution_id {header.execution_id!r} != {self._execution_id!r}"
             )
+        self._ownership = (
+            ExecutionOwnership.acquire(self._data_dir, self._execution_id)
+            if self._parent_ownership is None
+            else self._parent_ownership.share(self._data_dir, self._execution_id)
+        )
+        try:
+            return self._open_owned(header, preserve_summary=preserve_summary)
+        except BaseException:
+            self._ownership.close()
+            self._ownership = None
+            raise
+
+    def _open_owned(self, header: ExecutionHeader, *, preserve_summary: bool) -> ExecutionManifest:
         _ensure_private_dir(self._data_dir)
         _ensure_private_dir(self._data_dir / EXECUTIONS_DIR_NAME)
         _ensure_private_dir(self._exec_dir)
@@ -753,6 +753,8 @@ class JsonlEventLogWriter:
 
     def finalize(self, summary: ExecutionSummary) -> ExecutionManifest:
         """Atomically persist final summary and verified manifest metadata."""
+        if self._fd is None:
+            raise StorageWriteError("JsonlEventLogWriter must be open to finalize")
         if summary.execution_id != self._execution_id:
             raise InvalidExecutionIdError(
                 f"Summary execution_id {summary.execution_id!r} != {self._execution_id!r}"
@@ -812,6 +814,10 @@ class JsonlEventLogWriter:
             raise
         else:
             self._close_descriptor()
+        finally:
+            if self._ownership is not None:
+                self._ownership.close()
+                self._ownership = None
 
     def _close_descriptor(self) -> None:
         if self._fd is not None:

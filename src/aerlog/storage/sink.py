@@ -11,15 +11,18 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from aerlog.capture.sinks import default_spool_path
 from aerlog.events.models import ExecutionEvent, ExecutionHeader, ExecutionSummary
 from aerlog.events.types import RedactionMode
 from aerlog.storage.database import SQLiteMetadataStore, SqliteSynchronousMode
 from aerlog.storage.event_log import FsyncPolicy, JsonlEventLogWriter
 from aerlog.storage.exceptions import (
+    ExecutionBusyError,
     StorageDiskFullError,
     StorageWriteError,
     UnsupportedSchemaVersionError,
 )
+from aerlog.storage.ownership import ExecutionOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -49,8 +52,11 @@ class PersistentCaptureSink:
         sqlite_synchronous: SqliteSynchronousMode = "NORMAL",
         redaction_mode: RedactionMode = "standard",
         persist_cwd: bool = False,
+        ownership: ExecutionOwnership | None = None,
     ) -> None:
         self._data_dir = data_dir
+        self._parent_ownership = ownership
+        self._capture_ownership: ExecutionOwnership | None = None
         self._owns_store = store is None
         self._store = (
             SQLiteMetadataStore(
@@ -119,6 +125,27 @@ class PersistentCaptureSink:
         loop = asyncio.get_running_loop()
         return asyncio.wrap_future(cf_future, loop=loop)
 
+    def reserve_capture(self, execution_id: str, spool_path: Path) -> ExecutionOwnership:
+        """Reserve before primary startup can fail or time out and activate fallback."""
+        with self._state_lock:
+            if self._capture_ownership is not None:
+                raise ExecutionBusyError("Capture sink is busy; retry with a fresh sink")
+            if self._close_requested:
+                raise StorageWriteError("Capture sink is closing")
+            lease = (
+                ExecutionOwnership.acquire(self._data_dir, execution_id)
+                if self._parent_ownership is None
+                else self._parent_ownership.share(self._data_dir, execution_id)
+            )
+            try:
+                lease.check_new_capture(spool_path)
+                spool_lease = lease.share(self._data_dir, execution_id)
+            except BaseException:
+                lease.close()
+                raise
+            self._capture_ownership = lease
+            return spool_lease
+
     def _on_start_sync(self, header: ExecutionHeader) -> None:
         if (
             header.redaction_mode != self._redaction_mode
@@ -128,9 +155,32 @@ class PersistentCaptureSink:
                 f"Sink redaction_mode {self._redaction_mode!r} cannot accept header with "
                 f"{header.redaction_mode!r}"
             )
+        if self._writer is not None:
+            raise StorageWriteError("PersistentCaptureSink already has an open writer")
+        standalone = self._capture_ownership is None
+        if standalone:
+            self._capture_ownership = (
+                ExecutionOwnership.acquire(self._data_dir, header.execution_id)
+                if self._parent_ownership is None
+                else self._parent_ownership.share(self._data_dir, header.execution_id)
+            )
+        try:
+            if standalone and self._capture_ownership is not None:
+                self._capture_ownership.check_new_capture(
+                    default_spool_path(header.execution_id, self._data_dir / "spool")
+                )
+            self._open_writer_and_index(header)
+        except BaseException:
+            if standalone and self._capture_ownership is not None:
+                self._capture_ownership.close()
+                self._capture_ownership = None
+            raise
+
+    def _open_writer_and_index(self, header: ExecutionHeader) -> None:
         writer = JsonlEventLogWriter(
             self._data_dir,
             header.execution_id,
+            ownership=self._capture_ownership,
             fsync_policy=self._fsync_policy,
             redaction_mode=self._redaction_mode,
             persist_cwd=self._persist_cwd,
@@ -264,8 +314,12 @@ class PersistentCaptureSink:
                 loop = asyncio.get_running_loop()
 
                 def _close_runner() -> None:
-                    target = self._close_sync
-                    target()
+                    try:
+                        self._close_sync()
+                    finally:
+                        if self._capture_ownership is not None:
+                            self._capture_ownership.close()
+                            self._capture_ownership = None
 
                 cf_future = self._executor.submit(_close_runner)
                 fut = asyncio.wrap_future(cf_future, loop=loop)

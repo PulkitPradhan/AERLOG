@@ -32,6 +32,7 @@ from aerlog.storage.event_log import (
 )
 from aerlog.storage.exceptions import (
     EXPECTED_EVENT_SCHEMA_VERSION,
+    ExecutionBusyError,
     ExecutionNotFoundError,
     InvalidExecutionIdError,
     StorageCorruptionError,
@@ -41,6 +42,7 @@ from aerlog.storage.exceptions import (
     UnsupportedSchemaVersionError,
 )
 from aerlog.storage.migrations import LATEST_DB_SCHEMA_VERSION
+from aerlog.storage.ownership import ExecutionOwnership
 from aerlog.storage.repositories import (
     EventQueryResult,
     ReconciliationReport,
@@ -68,8 +70,10 @@ __all__ = [
     "CorruptRecordReport",
     "CorruptionIssueKind",
     "EventQueryResult",
+    "ExecutionBusyError",
     "ExecutionManifest",
     "ExecutionNotFoundError",
+    "ExecutionOwnership",
     "FsyncPolicy",
     "IndexedEventRow",
     "IndexedExecutionRow",

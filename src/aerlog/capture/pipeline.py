@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aerlog.capture.normalizer import (
     EventNormalizer,
@@ -37,6 +37,9 @@ from aerlog.capture.sinks import CaptureSink, RecoverySpool, default_spool_path
 from aerlog.events.ids import new_execution_id
 from aerlog.events.models import ExecutionEvent, ExecutionSummary
 from aerlog.events.types import CaptureBackpressurePolicy, RedactionMode
+
+if TYPE_CHECKING:
+    from aerlog.storage.ownership import ExecutionOwnership
 
 _DEFAULT_MAX_QUEUE_EVENTS = 2048
 _DEFAULT_MAX_QUEUE_BYTES = 64 * 1024 * 1024  # 64 MiB
@@ -137,6 +140,7 @@ class CapturePipeline:
             redaction_config=redaction_cfg,
             backpressure_policy=self._config.backpressure_policy,
         )
+        self._ownership: ExecutionOwnership | None = None
         self._spool = RecoverySpool(
             default_spool_path(self._execution_id, self._config.spill_dir),
             redaction_config=redaction_cfg,
@@ -395,6 +399,20 @@ class CapturePipeline:
                 reason="primary_sink_failed",
             )
 
+    def _reserve_capture(self) -> None:
+        reserve = getattr(self._sink, "reserve_capture", None)
+        if reserve is not None:
+            self._ownership = reserve(self._execution_id, self._spool.path)
+        elif self._config.backpressure_policy == "spill":
+            # A custom sink has no storage root. The standard spool directory identifies
+            # its data root; a custom spill directory is its own coordination namespace.
+            from aerlog.storage.ownership import ExecutionOwnership
+
+            directory = self._spool.path.parent
+            root = directory.parent if directory.name == "spool" else directory
+            self._ownership = ExecutionOwnership.acquire(root, self._execution_id)
+            self._ownership.check_new_capture(self._spool.path)
+
     async def start(self) -> None:
         """Deliver header + startup events and launch the background consumer task."""
         if self._started:
@@ -405,6 +423,15 @@ class CapturePipeline:
 
             if self._capture_error is not None:
                 raise self._capture_error
+            try:
+                self._reserve_capture()
+            except BaseException as exc:
+                # A contender has no claim on the sink already serving another pipeline.
+                self._capture_error = exc
+                if self._ownership is not None:
+                    self._ownership.close()
+                    self._ownership = None
+                raise
             try:
                 header = self._normalizer.build_header()
                 ok = await self._call_primary_sink_with_spill_guard(self._sink.on_start(header))
@@ -676,13 +703,18 @@ class CapturePipeline:
             await asyncio.gather(self._worker_task, return_exceptions=True)
 
         try:
-            await asyncio.wait_for(
-                self._sink.close(), timeout=min(1.0, self._config.drain_timeout_s)
-            )
-        except Exception as exc:
-            _LOGGER.warning("Failed to close capture sink %r: %s", self._sink, exc)
-        finally:
             self._spool.close()
+        finally:
+            try:
+                await asyncio.wait_for(
+                    self._sink.close(), timeout=min(1.0, self._config.drain_timeout_s)
+                )
+            except Exception as exc:
+                _LOGGER.warning("Failed to close capture sink %r: %s", self._sink, exc)
+            finally:
+                if self._ownership is not None:
+                    self._ownership.close()
+                    self._ownership = None
 
     async def _wait_for_close(self) -> None:
         if self._close_task is None:

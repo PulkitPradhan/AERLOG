@@ -109,9 +109,11 @@ def test_writer_failed_open_closes_descriptor_without_flushing(
     close_attempts = 0
     manifest_attempts = 0
 
-    def track_open(path: Path, flags: int, mode: int) -> int:
+    def track_open(
+        path: str | Path, flags: int, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> int:
         nonlocal event_fd
-        fd = real_open(path, flags, mode)
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
         if path == writer.events_path:
             event_fd = fd
         return fd
@@ -590,7 +592,7 @@ async def test_capture_pipeline_closes_sink_after_cancelled_startup_unwinds(
             await sink.close()
 
 
-async def test_capture_pipeline_closes_spool_after_sink_when_finalization_raises(
+async def test_capture_pipeline_closes_spool_before_sink_when_finalization_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sink = PersistentCaptureSink(tmp_path / "data")
@@ -611,7 +613,7 @@ async def test_capture_pipeline_closes_spool_after_sink_when_finalization_raises
 
     def close_spool_with_error() -> None:
         real_spool_close()
-        assert sink.closed
+        assert not sink.closed
         raise OSError("secondary spool close failed")
 
     monkeypatch.setattr(sink, "emit_events", fail_primary_delivery)

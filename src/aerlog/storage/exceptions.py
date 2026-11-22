@@ -13,6 +13,10 @@ class InvalidExecutionIdError(StorageError, ValueError):
     """Raised when an execution identifier is invalid or fails path-containment checks."""
 
 
+class ExecutionBusyError(StorageError):
+    """Another cooperating operation owns this execution. A fresh attempt may succeed."""
+
+
 class ExecutionNotFoundError(StorageError):
     """Raised when a requested execution recording does not exist."""
 
@@ -37,6 +41,7 @@ EXPECTED_EVENT_SCHEMA_VERSION = EVENT_SCHEMA_VERSION
 
 __all__ = [
     "EXPECTED_EVENT_SCHEMA_VERSION",
+    "ExecutionBusyError",
     "ExecutionNotFoundError",
     "InvalidExecutionIdError",
     "StorageCorruptionError",
