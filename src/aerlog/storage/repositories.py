@@ -394,16 +394,11 @@ def _recording_completeness(read: JsonlReadResult) -> str:
         or summary is None
         or manifest is None
         or manifest.corruption_count > 0
-        or (
-            summary.capture_completeness == "complete"
-            and (
-                manifest.status != "finalized"
-                or not _has_matching_final_summary(
-                    [item.event for item in read.events],
-                    summary,
-                    allow_legacy_end_time=manifest.finalized_at is not None,
-                )
-            )
+        or (summary.capture_completeness == "complete" and manifest.status != "finalized")
+        or not _has_matching_final_summary(
+            [item.event for item in read.events],
+            summary,
+            allow_legacy_end_time=manifest.finalized_at is not None,
         )
     ):
         return "incomplete"
@@ -563,10 +558,11 @@ def _recovery_index_matches(
     # One extra result detects surplus rows. SQL orders by timestamp, so use sequence keys.
     try:
         rows = store.query_event_index(execution_id=prior.execution_id, limit=len(prior.events) + 1)
+        corruptions = store.get_corruptions(prior.execution_id)
     except ValueError:
         # SQLite returned values that the typed index reader could not decode.
         return False
-    if len(rows) != len(prior.events):
+    if len(rows) != len(prior.events) or corruptions != prior.corruptions:
         return False
     indexed = {item.sequence: item for item in rows}
     for item in prior.events:
