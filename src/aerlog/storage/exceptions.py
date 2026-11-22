@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from aerlog.events.types import EVENT_SCHEMA_VERSION
+
+if TYPE_CHECKING:
+    from aerlog.storage.event_log import AppendFailureOutcome
 
 
 class StorageError(Exception):
@@ -23,6 +28,8 @@ class ExecutionNotFoundError(StorageError):
 
 class StorageWriteError(StorageError, OSError):
     """Raised when persisting event logs, metadata, or index state fails."""
+
+    append_outcome: AppendFailureOutcome | None = None
 
 
 class StorageDiskFullError(StorageWriteError):

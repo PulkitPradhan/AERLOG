@@ -475,7 +475,7 @@ async def test_stderr_bounded_buffering_and_observer_error_safety() -> None:
 
 
 async def test_capture_pipeline_late_finalize_spill_and_concurrent_start(tmp_path: Path) -> None:
-    """Late finalize failure spills updated summary/event; concurrent start runs cleanly."""
+    """Concurrent starts and late spill preserve the original terminal evidence."""
 
     class _FailOnFinishSink(InMemoryCaptureSink):
         async def on_finish(self, summary: ExecutionSummary) -> None:
@@ -511,8 +511,8 @@ async def test_capture_pipeline_late_finalize_spill_and_concurrent_start(tmp_pat
         for line in Path(final_summary.spool_file).read_text(encoding="utf-8").splitlines()
     ]
     assert spool_records[-1]["record_type"] == "summary"
-    assert spool_records[-1]["data"]["capture_completeness"] == "spilled"
-    assert spool_records[-1]["data"]["spool_file"] == final_summary.spool_file
+    assert spool_records[-1]["data"]["capture_completeness"] == "complete"
+    assert spool_records[-1]["data"]["spool_file"] is None
 
     # Missing cwd reports exit_code=1 with distinct error (not EXIT_SPAWN_NOT_FOUND=127).
     with pytest.raises(SpawnError, match="Working directory not found") as exc_info:
