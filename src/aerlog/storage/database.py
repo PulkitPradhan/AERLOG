@@ -845,7 +845,10 @@ class SQLiteMetadataStore:
 
 
 def _decode_index_text_array(row: sqlite3.Row, column: str) -> tuple[str, ...]:
-    value = json.loads(str(row[column]))
+    try:
+        value = json.loads(str(row[column]))
+    except RecursionError as exc:
+        raise ValueError(f"SQLite index column {column} contains deeply nested JSON") from exc
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"SQLite index column {column} must contain a JSON array of strings")
     return tuple(value)

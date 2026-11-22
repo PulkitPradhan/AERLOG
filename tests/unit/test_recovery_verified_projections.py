@@ -150,3 +150,31 @@ def test_exact_retry_removes_stale_index_corruption_reports(
         assert repository.get_execution(execution_id).corruptions == ()
         assert repository.store.query_event_index(execution_id=execution_id) == events
     assert {path: path.read_bytes() for path in writer.execution_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize("policy", ["reject", "quarantine"])
+def test_exact_retry_rebuilds_deeply_nested_index_json(
+    tmp_path: Path, repository: RecordingRepository, policy: TailPolicy
+) -> None:
+    spool = tmp_path / "events.spool"
+    writer, execution_id = _record_and_spool(repository, spool)
+    before = {path: path.read_bytes() for path in writer.execution_dir.iterdir()}
+    repository.reconcile_execution(execution_id)
+    expected = repository.store.get_execution_row(execution_id)
+    assert expected is not None
+    deeply_nested = "[" * 10_000 + "]" * 10_000
+    with closing(sqlite3.connect(repository.store.db_path)) as conn, conn:
+        conn.execute(
+            "UPDATE executions SET command_json = ? WHERE execution_id = ?",
+            (deeply_nested, execution_id),
+        )
+
+    retry = repository.import_recovery_spool(spool, tail_policy=policy)
+
+    assert (retry.imported_events, retry.skipped_duplicates, retry.final_status) == (
+        0,
+        2,
+        "complete",
+    )
+    assert repository.store.get_execution_row(execution_id) == expected
+    assert {path: path.read_bytes() for path in writer.execution_dir.iterdir()} == before
