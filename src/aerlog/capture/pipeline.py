@@ -20,7 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from aerlog.capture.normalizer import (
     EventNormalizer,
@@ -39,6 +39,7 @@ from aerlog.events.models import ExecutionEvent, ExecutionSummary
 from aerlog.events.types import CaptureBackpressurePolicy, RedactionMode
 
 if TYPE_CHECKING:
+    from aerlog.storage.event_log import AppendFailureOutcome
     from aerlog.storage.ownership import ExecutionOwnership
 
 _DEFAULT_MAX_QUEUE_EVENTS = 2048
@@ -110,6 +111,15 @@ class _QueuedEntry:
     byte_cost: int
 
 
+@dataclass(slots=True)
+class _GapSpan:
+    reason: str
+    count_unit: Literal["raw_input", "event"]
+    count: int
+    first_ns: int
+    last_ns: int
+
+
 class CapturePipeline:
     """Async single-consumer capture pipeline connecting proxy events to sinks."""
 
@@ -163,16 +173,16 @@ class CapturePipeline:
         self._spilled = False
         self._force_incomplete = False
         self._sink_error: str | None = None
+        self._primary_complete_prefix: int | None = None
         self._sink_timed_out = False
         self._spool_error: str | None = None
         self._sink_delivered_header = False
 
         # Pending non-silent gap tracking when mark_incomplete overflows or sinks fail.
-        self._pending_gap_count = 0
-        self._pending_gap_first_ns: int | None = None
-        self._pending_gap_last_ns: int | None = None
-        self._pending_gap_reason: str = "capture_queue_full"
-        self._gap_history_batches: list[tuple[int, str, int, int]] = []
+        self._pending_gaps: list[_GapSpan] = []
+        self._extend_pending_gap = False
+        self._interrupted_events: Sequence[ExecutionEvent] = ()
+        self._interruption_warnings: list[RawCaptureWarningInput] = []
 
     @property
     def execution_id(self) -> str:
@@ -216,54 +226,64 @@ class CapturePipeline:
             return False
         return (self._queued_bytes + item_bytes) <= self._config.max_queue_bytes
 
-    def _record_gap_span(self, monotonic_ns: int, *, count: int = 1, reason: str) -> None:
-        self._pending_gap_count += count
-        if self._pending_gap_first_ns is None:
-            self._pending_gap_first_ns = monotonic_ns
-        self._pending_gap_last_ns = monotonic_ns
-        self._pending_gap_reason = reason
+    def mark_incomplete(self, warning: RawCaptureWarningInput | None = None) -> None:
+        """Record an interruption whose loss count cannot be established."""
         self._force_incomplete = True
+        if warning is not None:
+            self._interruption_warnings.append(warning)
+
+    def _record_gap_span(
+        self,
+        monotonic_ns: int,
+        *,
+        end_ns: int | None = None,
+        count: int = 1,
+        reason: str,
+        count_unit: Literal["raw_input", "event"] = "raw_input",
+    ) -> None:
+        last_ns = monotonic_ns if end_ns is None else end_ns
+        prior = self._pending_gaps[-1] if self._extend_pending_gap else None
+        if prior is not None and (prior.reason, prior.count_unit) == (reason, count_unit):
+            prior.count += count
+            prior.first_ns = min(prior.first_ns, monotonic_ns)
+            prior.last_ns = max(prior.last_ns, last_ns)
+            self._normalizer.record_gap(count, new_span=False)
+        else:
+            self._pending_gaps.append(_GapSpan(reason, count_unit, count, monotonic_ns, last_ns))
+            self._normalizer.record_gap(count)
+            self._extend_pending_gap = True
+        self.mark_incomplete()
+
+    def _record_event_losses(self, events: Sequence[ExecutionEvent], *, reason: str) -> None:
+        self.mark_incomplete()
+        times = [event.monotonic_time_ns for event in events if event.kind != "capture_gap"]
+        if times:
+            self._record_gap_span(
+                min(times), end_ns=max(times), count=len(times), reason=reason, count_unit="event"
+            )
 
     def _flush_pending_gap_events(self) -> list[ExecutionEvent]:
-        events: list[ExecutionEvent] = []
-        if self._gap_history_batches:
-            for count, reason, first_ns, last_ns in self._gap_history_batches:
-                events.append(
-                    self._normalizer.build_gap_event(
-                        timestamp=datetime.now(UTC),
-                        monotonic_time_ns=last_ns,
-                        dropped_count=count,
-                        reason=reason,
-                        first_gap_monotonic_ns=first_ns,
-                        last_gap_monotonic_ns=last_ns,
-                    )
-                )
-            self._gap_history_batches.clear()
-        if self._pending_gap_count > 0:
-            first_ns = (
-                self._pending_gap_first_ns
-                if self._pending_gap_first_ns is not None
-                else time.monotonic_ns()
+        spans, self._pending_gaps = self._pending_gaps, []
+        self._extend_pending_gap = False
+        return [
+            self._normalizer.build_gap_event(
+                timestamp=datetime.now(UTC),
+                monotonic_time_ns=span.last_ns,
+                dropped_count=span.count,
+                reason=span.reason,
+                first_gap_monotonic_ns=span.first_ns,
+                last_gap_monotonic_ns=span.last_ns,
+                details={"count_unit": span.count_unit},
+                account_loss=False,
             )
-            last_ns = (
-                self._pending_gap_last_ns if self._pending_gap_last_ns is not None else first_ns
-            )
-            count = self._pending_gap_count
-            reason = self._pending_gap_reason
-            self._pending_gap_count = 0
-            self._pending_gap_first_ns = None
-            self._pending_gap_last_ns = None
-            events.append(
-                self._normalizer.build_gap_event(
-                    timestamp=datetime.now(UTC),
-                    monotonic_time_ns=last_ns,
-                    dropped_count=count,
-                    reason=reason,
-                    first_gap_monotonic_ns=first_ns,
-                    last_gap_monotonic_ns=last_ns,
-                )
-            )
-        return events
+            for span in spans
+        ]
+
+    def _remember_primary_failure(self, error: BaseException) -> None:
+        self._sink_error = repr(error)
+        outcome: AppendFailureOutcome | None = getattr(error, "append_outcome", None)
+        if outcome is not None:
+            self._primary_complete_prefix = len(outcome.complete_slices)
 
     def _activate_spill(
         self, reason: str, detail: str | None = None, *, terminal: bool = False
@@ -319,7 +339,7 @@ class CapturePipeline:
                 await coro
                 return True
             except Exception as exc:
-                self._sink_error = repr(exc)
+                self._remember_primary_failure(exc)
                 self._force_incomplete = True
                 return False
 
@@ -339,7 +359,7 @@ class CapturePipeline:
                 task_exc = sink_task.exception()
                 if task_exc is None:
                     return True
-                self._sink_error = repr(task_exc)
+                self._remember_primary_failure(task_exc)
                 self._activate_spill("primary_sink_error", repr(task_exc), terminal=terminal)
                 return False
 
@@ -362,51 +382,59 @@ class CapturePipeline:
             await asyncio.gather(sink_task, spill_wait_task, return_exceptions=True)
             raise
 
-    async def _deliver_events(self, events: Sequence[ExecutionEvent]) -> None:
-        """Deliver normalized events cleanly to primary sink or recovery spool."""
+    def _write_spool_events(
+        self, events: Sequence[ExecutionEvent], *, known_missing_from: int | None = 0
+    ) -> None:
         if not events:
             return
-
-        if self._spilled:
-            try:
-                self._spool.write_events(events)
-            except OSError as exc:
-                self._spool_error = repr(exc)
-                self._record_gap_span(
-                    events[-1].monotonic_time_ns,
-                    count=len(events),
-                    reason="recovery_spool_write_failed",
+        if self._spool_error is not None:
+            if known_missing_from is not None:
+                self._record_event_losses(
+                    events[known_missing_from:], reason="recovery_spool_unavailable"
                 )
             return
 
+        before = self._spool.record_count
+        try:
+            self._spool.write_events(events)
+        except OSError as exc:
+            self._spool_error = repr(exc)
+            self.mark_incomplete()
+            if known_missing_from is not None:
+                # The first failed record may have reached disk before flush failed.
+                first_unattempted = self._spool.record_count - before + 1
+                self._record_event_losses(
+                    events[max(known_missing_from, first_unattempted) :],
+                    reason="recovery_spool_write_failed",
+                )
+
+    async def _deliver_events(self, events: Sequence[ExecutionEvent]) -> None:
+        """Deliver normalized events, tracking only losses established by either sink."""
+        if not events:
+            return
+        if self._spilled:
+            self._write_spool_events(events)
+            return
         if self._sink_error is not None:
-            self._record_gap_span(
-                events[-1].monotonic_time_ns,
-                count=len(events),
-                reason="primary_sink_failed",
-            )
+            self._record_event_losses(events, reason="primary_sink_unavailable")
             return
 
-        ok = await self._call_primary_sink_with_spill_guard(self._sink.emit_events(events))
+        try:
+            ok = await self._call_primary_sink_with_spill_guard(self._sink.emit_events(events))
+        except asyncio.CancelledError:
+            self._interrupted_events = events
+            raise
         if ok:
             return
-
         if self._spilled:
-            try:
-                self._spool.write_events(events)
-            except OSError as exc:
-                self._spool_error = repr(exc)
-                self._record_gap_span(
-                    events[-1].monotonic_time_ns,
-                    count=len(events),
-                    reason="recovery_spool_write_failed",
-                )
+            # Exact records are safe to retry even when the primary write later finishes.
+            self._write_spool_events(events, known_missing_from=self._primary_complete_prefix)
         else:
-            self._record_gap_span(
-                events[-1].monotonic_time_ns,
-                count=len(events),
-                reason="primary_sink_failed",
-            )
+            self.mark_incomplete()
+            if self._primary_complete_prefix is not None:
+                self._record_event_losses(
+                    events[self._primary_complete_prefix :], reason="primary_sink_write_failed"
+                )
 
     def _reserve_capture(self) -> None:
         reserve = getattr(self._sink, "reserve_capture", None)
@@ -471,55 +499,30 @@ class CapturePipeline:
             if self._closed_for_input:
                 return
 
-            if policy == "block":
-                while not self._has_capacity_for(byte_cost):
-                    if self._closed_for_input:
-                        return
-                    await self._condition.wait()
-                self._queue.append(_QueuedEntry(item=raw_input, byte_cost=byte_cost))
-                self._queued_bytes += byte_cost
-                self._condition.notify_all()
-                return
-
-            if policy == "spill":
-                if not self._has_capacity_for(byte_cost):
-                    self._spill_trigger.set()
-                    while not self._has_capacity_for(byte_cost):
-                        if self._closed_for_input:
-                            return
-                        await self._condition.wait()
-                self._queue.append(_QueuedEntry(item=raw_input, byte_cost=byte_cost))
-                self._queued_bytes += byte_cost
-                self._condition.notify_all()
-                return
-
-            # mark_incomplete policy: never stalls forwarding and never silently drops.
             if not self._has_capacity_for(byte_cost):
-                self._record_gap_span(
-                    raw_input.monotonic_time_ns,
-                    count=1,
-                    reason="capture_queue_full",
-                )
-                return
+                if policy == "mark_incomplete":
+                    self._record_gap_span(raw_input.monotonic_time_ns, reason="capture_queue_full")
+                    return
+                if policy == "spill":
+                    self._spill_trigger.set()
+                try:
+                    await self._condition.wait_for(
+                        lambda: self._closed_for_input or self._has_capacity_for(byte_cost)
+                    )
+                except asyncio.CancelledError:
+                    if self._summary is None:
+                        self._record_gap_span(
+                            raw_input.monotonic_time_ns, reason="capture_enqueue_cancelled"
+                        )
+                    raise
+                if self._closed_for_input:
+                    if self._summary is None:
+                        self._record_gap_span(
+                            raw_input.monotonic_time_ns, reason="capture_input_closed"
+                        )
+                    return
 
-            if self._pending_gap_count > 0:
-                first_ns = (
-                    self._pending_gap_first_ns
-                    if self._pending_gap_first_ns is not None
-                    else raw_input.monotonic_time_ns
-                )
-                last_ns = (
-                    self._pending_gap_last_ns
-                    if self._pending_gap_last_ns is not None
-                    else raw_input.monotonic_time_ns
-                )
-                self._gap_history_batches.append(
-                    (self._pending_gap_count, self._pending_gap_reason, first_ns, last_ns)
-                )
-                self._pending_gap_count = 0
-                self._pending_gap_first_ns = None
-                self._pending_gap_last_ns = None
-
+            self._extend_pending_gap = False
             self._queue.append(_QueuedEntry(item=raw_input, byte_cost=byte_cost))
             self._queued_bytes += byte_cost
             self._condition.notify_all()
@@ -536,17 +539,28 @@ class CapturePipeline:
             if entry.item is None:
                 break
 
+            raw_pending = True
             try:
                 gap_events = self._flush_pending_gap_events()
                 if gap_events:
                     await self._deliver_events(gap_events)
 
                 normalized = self._normalizer.normalize(entry.item)
+                raw_pending = False
                 await self._deliver_events(normalized)
+            except asyncio.CancelledError:
+                self.mark_incomplete()
+                if raw_pending:
+                    self._record_gap_span(
+                        entry.item.monotonic_time_ns, reason="capture_consumer_cancelled"
+                    )
+                raise
             except Exception:
-                self._record_gap_span(
-                    entry.item.monotonic_time_ns, reason="capture_consumer_failed"
-                )
+                self.mark_incomplete()
+                if raw_pending:
+                    self._record_gap_span(
+                        entry.item.monotonic_time_ns, reason="capture_consumer_failed"
+                    )
                 async with self._condition:
                     self._closed_for_input = True
                     self._condition.notify_all()
@@ -558,54 +572,56 @@ class CapturePipeline:
             return
 
         done, _ = await asyncio.wait({worker}, timeout=self._config.drain_timeout_s)
-        if done:
+        if done and not worker.cancelled():
             await worker
             return
 
-        self._sink_timed_out = True
-        worker.cancel()
-        await asyncio.wait({worker})
+        if not done:
+            self._sink_timed_out = True
+            worker.cancel()
+            await asyncio.wait({worker})
         if not worker.cancelled():
             worker.result()
         async with self._condition:
             remaining = [entry.item for entry in self._queue if entry.item is not None]
             self._queue.clear()
             self._queued_bytes = 0
-        self._force_incomplete = True
-        if remaining:
-            if self._config.backpressure_policy == "spill":
-                self._activate_spill("drain_timeout", "Worker drain timeout reached")
-                if not self._spilled:
-                    self._record_gap_span(
-                        remaining[-1].monotonic_time_ns,
-                        count=len(remaining),
-                        reason="drain_timeout_spill_failed",
-                    )
-                else:
-                    for raw_rem in remaining:
-                        try:
-                            self._spool.write_events(self._normalizer.normalize(raw_rem))
-                        except OSError as exc:
-                            self._spool_error = repr(exc)
-                            self._record_gap_span(
-                                raw_rem.monotonic_time_ns,
-                                count=1,
-                                reason="recovery_spool_write_failed",
-                            )
-            else:
-                self._record_gap_span(
-                    remaining[-1].monotonic_time_ns,
-                    count=len(remaining),
-                    reason="drain_timeout",
-                )
+        self.mark_incomplete()
+        reason = "drain_timeout" if self._sink_timed_out else "capture_consumer_cancelled"
+        if self._config.backpressure_policy == "spill" and (remaining or self._interrupted_events):
+            self._activate_spill(reason)
+        if self._spilled:
+            self._write_spool_events(self._interrupted_events, known_missing_from=None)
+            for item in remaining:
+                self._write_spool_events(self._normalizer.normalize(item))
+        else:
+            if self._interrupted_events:
+                self._sink_error = self._sink_error or "Unconfirmed primary append during drain"
+            for item in remaining:
+                self._record_gap_span(item.monotonic_time_ns, reason=reason)
+        self._interrupted_events = ()
 
     async def _finish_capture(
         self, *, termination_reason: str, exit_code: int, returncode: int | None
     ) -> ExecutionSummary:
         # Deliver any trailing gap markers before emitting execution_finished.
-        trailing_gaps = self._flush_pending_gap_events()
-        if trailing_gaps and (self._spilled or self._sink_error is None):
-            await self._deliver_events(trailing_gaps)
+        if self._spool_error is None and (
+            self._spilled or (self._sink_error is None and not self._sink_timed_out)
+        ):
+            controls = self._flush_pending_gap_events()
+            for warning in self._interruption_warnings:
+                controls.extend(self._normalizer.normalize(warning))
+            if controls:
+                try:
+                    await asyncio.wait_for(
+                        self._deliver_events(controls), timeout=self._config.drain_timeout_s
+                    )
+                except TimeoutError as exc:
+                    self._sink_timed_out = True
+                    self.mark_incomplete()
+                    if self._config.backpressure_policy == "spill":
+                        self._activate_spill("control_write_timeout", repr(exc))
+                        self._write_spool_events(controls, known_missing_from=None)
 
         ended_at = datetime.now(UTC)
         monotonic_end_ns = time.monotonic_ns()
@@ -643,7 +659,7 @@ class CapturePipeline:
                 if self._config.backpressure_policy == "spill":
                     self._activate_spill("finalize_sink_failed", repr(exc), terminal=True)
 
-        if self._spilled:
+        if self._spilled and self._spool_error is None:
             try:
                 # A cancelled coroutine may have left an executor operation running.
                 # Restart must see exactly the event and summary offered to that worker.
@@ -682,6 +698,10 @@ class CapturePipeline:
 
         try:
             self._spool.close()
+        except OSError as exc:
+            if self._summary is None or self._capture_error is not None:
+                raise
+            _LOGGER.warning("Failed to close capture recovery spool %s: %s", self._spool.path, exc)
         finally:
             try:
                 await asyncio.wait_for(
@@ -725,6 +745,15 @@ class CapturePipeline:
                 if not self._started:
                     await self.start()
 
+                if termination_reason in {
+                    "aborted",
+                    "cancelled",
+                    "diagnostic_write_failed",
+                    "frame_too_large",
+                    "signal",
+                    "transport_error",
+                }:
+                    self.mark_incomplete()
                 async with self._condition:
                     self._closed_for_input = True
                     self._queue.append(_QueuedEntry(item=None, byte_cost=0))

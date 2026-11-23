@@ -384,7 +384,8 @@ def _has_seal_mismatch(read: JsonlReadResult) -> bool:
     )
 
 
-def _recording_completeness(read: JsonlReadResult) -> str:
+def recording_completeness(read: JsonlReadResult) -> str:
+    """Project recording status from verified events, terminal, and companion metadata."""
     manifest, summary = read.manifest, read.summary
     if (
         read.has_corruptions
@@ -458,7 +459,7 @@ def _derive_execution_row_from_jsonl(
     safe_cmd, _ = redactor.redact_command(raw_cmd)
     safe_cwd = raw_cwd if persist_cwd and redaction_mode != "strict_hash_only" else None
 
-    completeness = _recording_completeness(read_result)
+    completeness = recording_completeness(read_result)
 
     observed_traces: list[str] = list(summary.observed_trace_ids) if summary is not None else []
     if not observed_traces:
@@ -1765,7 +1766,7 @@ class RecordingRepository:
             imported_events=len(new_events),
             skipped_duplicates=skipped_dups,
             corrupt_lines=all_corruptions,
-            final_status="incomplete" if all_corruptions else _recording_completeness(prior),
+            final_status="incomplete" if all_corruptions else recording_completeness(prior),
         )
 
 
@@ -1858,4 +1859,5 @@ __all__ = [
     "RecordingRepository",
     "SpoolImportReport",
     "StoredExecutionRecord",
+    "recording_completeness",
 ]

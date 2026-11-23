@@ -52,7 +52,7 @@ from aerlog.events.types import (
 )
 from aerlog.storage.database import IndexedExecutionRow
 from aerlog.storage.event_log import CorruptRecordReport, JsonlReadResult
-from aerlog.storage.repositories import RecordingRepository
+from aerlog.storage.repositories import RecordingRepository, recording_completeness
 
 TIMELINE_SCHEMA_VERSION: Final[Literal["1.0.0"]] = "1.0.0"
 DEFAULT_TIMELINE_LIMIT: Final[int] = 200
@@ -598,6 +598,7 @@ def reconstruct_timeline_from_events(
     corruptions: Sequence[CorruptRecordReport] = (),
     unclean_shutdown: bool = False,
     diverged_index: bool = False,
+    verified_completeness: str | None = None,
 ) -> ExecutionTimeline:
     """Reconstruct an immutable :class:`ExecutionTimeline` from ordered stored events."""
     ordered = sorted(events, key=lambda item: item.sequence)
@@ -1072,7 +1073,9 @@ def reconstruct_timeline_from_events(
 
     has_corruptions = bool(corruptions)
     completeness = (
-        "corrupted"
+        verified_completeness
+        if verified_completeness is not None
+        else "corrupted"
         if has_corruptions
         else "incomplete"
         if unclean_shutdown
@@ -1238,6 +1241,7 @@ def reconstruct_timeline(
         corruptions=read_result.corruptions,
         unclean_shutdown=read_result.unclean_shutdown,
         diverged_index=diverged_index,
+        verified_completeness=recording_completeness(read_result),
     )
 
 

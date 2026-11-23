@@ -583,11 +583,7 @@ def detect_capture_integrity(ctx: DiagnosticContext) -> list[DiagnosticDraft]:
                 )
             )
 
-    summary_completeness = (
-        ctx.summary.capture_completeness
-        if ctx.summary is not None
-        else ctx.timeline.capture_completeness
-    )
+    summary_completeness = ctx.timeline.capture_completeness
     has_start = any(isinstance(ev.payload, ExecutionStartedPayload) for ev in ctx.events)
     has_finish = any(isinstance(ev.payload, ExecutionFinishedPayload) for ev in ctx.events)
     incomplete_reasons: list[str] = []

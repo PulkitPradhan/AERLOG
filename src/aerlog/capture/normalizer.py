@@ -379,6 +379,12 @@ class EventNormalizer:
             )
         return events
 
+    def record_gap(self, dropped_count: int, *, new_span: bool = True) -> None:
+        """Account for a known loss independently of its marker's delivery."""
+        self._dropped_events += dropped_count
+        if new_span:
+            self._gap_count += 1
+
     def build_gap_event(
         self,
         *,
@@ -389,10 +395,11 @@ class EventNormalizer:
         first_gap_monotonic_ns: int,
         last_gap_monotonic_ns: int,
         details: Mapping[str, Any] | None = None,
+        account_loss: bool = True,
     ) -> ExecutionEvent:
         """Create an explicit ``capture_gap`` event and record gap accounting."""
-        self._dropped_events += dropped_count
-        self._gap_count += 1
+        if account_loss:
+            self.record_gap(dropped_count)
         return ExecutionEvent(
             event_id=new_event_id(),
             execution_id=self._execution_id,

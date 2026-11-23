@@ -50,6 +50,7 @@ from aerlog.cli.render import (
 )
 from aerlog.config import AerlogConfig, ConfigError, load_config
 from aerlog.events.ids import new_execution_id
+from aerlog.events.models import ExecutionSummary
 from aerlog.events.types import (
     CaptureBackpressurePolicy,
     CaptureCompleteness,
@@ -69,6 +70,7 @@ from aerlog.export import (
 )
 from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES
 from aerlog.proxy.stdio_proxy import ProxyConfig, ProxyResult, run_stdio_proxy
+from aerlog.replay.cassette import fidelity_findings, require_replay_evidence
 from aerlog.replay import (
     Cassette,
     CassetteValidationError,
@@ -100,7 +102,7 @@ from aerlog.storage.exceptions import (
     UnsupportedSchemaVersionError,
 )
 from aerlog.storage.ownership import ExecutionOwnership
-from aerlog.storage.repositories import RecordingRepository
+from aerlog.storage.repositories import RecordingRepository, recording_completeness
 from aerlog.storage.sink import PersistentCaptureSink
 
 _ROOT_EPILOG = (
@@ -254,16 +256,8 @@ def _list_unindexed_executions_read_only(
     reader = JsonlEventLogReader(data_dir)
     rows: list[IndexedExecutionRow] = []
     for eid in reader.discover_execution_ids():
-        res = reader.read_execution(eid, strict=False, verify_checksums=False)
-        status = (
-            "corrupted"
-            if res.has_corruptions
-            else "incomplete"
-            if res.unclean_shutdown
-            else res.summary.capture_completeness
-            if res.summary is not None
-            else "incomplete"
-        )
+        res = reader.read_execution(eid, strict=False)
+        status = recording_completeness(res)
         if completeness is not None and status != completeness:
             continue
         cmd = (
@@ -616,7 +610,9 @@ def run_mcp_proxy(
             nl=False,
         )
 
-    async def _run_proxy_capture(ownership: ExecutionOwnership) -> ProxyResult:
+    async def _run_proxy_capture(
+        ownership: ExecutionOwnership,
+    ) -> tuple[ProxyResult, ExecutionSummary | None]:
         sink = PersistentCaptureSink(
             resolved_dir,
             ownership=ownership,
@@ -637,7 +633,7 @@ def run_mcp_proxy(
                     if proxy_cfg.log_file is not None
                     else stack.enter_context(open(os.devnull, "w", encoding="utf-8"))
                 )
-                return (
+                proxy_result = (
                     await run_stdio_proxy(
                         proxy_cfg,
                         observer=observer,
@@ -652,12 +648,14 @@ def run_mcp_proxy(
                 with contextlib.suppress(Exception):
                     await observer.force_close()
             finally:
-                await sink.close()
+                if not sink.closed:
+                    await sink.close()
+        return proxy_result, observer.last_summary
 
     try:
         with ExecutionOwnership.acquire(resolved_dir, resolved_exec_id) as ownership:
             ownership.check_new_capture(default_spool_path(resolved_exec_id, spill_dir))
-            result = asyncio.run(_run_proxy_capture(ownership))
+            result, capture_summary = asyncio.run(_run_proxy_capture(ownership))
     except KeyboardInterrupt as exc:
         raise typer.Exit(code=130) from exc
     except ExecutionBusyError as exc:
@@ -681,6 +679,17 @@ def run_mcp_proxy(
             f"(exit_code={result.exit_code}).",
             err=True,
         )
+    if capture_summary is not None:
+        if capture_summary.capture_completeness == "incomplete":
+            typer.echo(
+                f"WARNING: Capture incomplete for {resolved_exec_id} "
+                f"({capture_summary.dropped_events} confirmed drops).",
+                err=True,
+            )
+        if capture_summary.spool_file is not None and (
+            not quiet or capture_summary.capture_completeness == "incomplete"
+        ):
+            typer.echo(f"Capture recovery spool: {capture_summary.spool_file}", err=True)
     if not quiet:
         typer.echo(
             render_run_summary_stderr(
@@ -1139,6 +1148,12 @@ def diagnose_recorded_execution(
         raise typer.Exit(code=2)
 
 
+def _warn_lossy(findings: dict[str, int]) -> None:
+    if findings:
+        detail = ", ".join(f"{issue}={count}" for issue, count in findings.items())
+        typer.echo(f"WARNING: Lossy replay evidence: {detail}", err=True)
+
+
 def _warn_cassette_raw_secrets_if_applicable(cassette: Cassette) -> None:
     if cassette.contains_raw_secrets:
         typer.echo(
@@ -1213,6 +1228,7 @@ def cassette_create(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
+    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
 ) -> None:
     """Create a hashed offline replay cassette from an existing execution recording."""
     _, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
@@ -1223,6 +1239,7 @@ def cassette_create(
             execution_id,
             strict_integrity=strict,
             allow_unredacted_cassette=allow_unredacted_cassette,
+            allow_lossy=allow_lossy,
         )
         saved_path = save_cassette(cassette, data_dir=resolved_dir, output_path=output)
     except (
@@ -1247,12 +1264,7 @@ def cassette_create(
         repo.close()
 
     _warn_cassette_raw_secrets_if_applicable(cassette)
-    if cassette.source_has_corruptions:
-        typer.echo(
-            "WARNING: Source recording contains corrupt/partial JSONL records; cassette covers "
-            "verified prefix events only.",
-            err=True,
-        )
+    _warn_lossy(fidelity_findings(cassette))
 
     if json_output:
         typer.echo(cassette_summary_to_json(cassette, path=saved_path))
@@ -1404,6 +1416,7 @@ def replay_recorded_execution(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
+    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
 ) -> None:
     """Replay recorded MCP interactions safely offline from a cassette without real tools."""
     try:
@@ -1466,9 +1479,11 @@ def replay_recorded_execution(
                     execution_id,
                     strict_integrity=strict,
                     allow_unredacted_cassette=allow_unredacted_cassette,
+            allow_lossy=allow_lossy,
                 )
             finally:
                 repo.close()
+        require_replay_evidence(cassette, allow_lossy=allow_lossy)
     except (
         ExecutionNotFoundError,
         InvalidExecutionIdError,
@@ -1488,11 +1503,7 @@ def replay_recorded_execution(
         )
 
     _warn_cassette_raw_secrets_if_applicable(cassette)
-    if cassette.source_has_corruptions:
-        typer.echo(
-            "WARNING: Source recording has corruptions; cassette contains verified prefix only.",
-            err=True,
-        )
+    _warn_lossy(fidelity_findings(cassette))
 
     if serve:
         try:
@@ -1504,6 +1515,7 @@ def replay_recorded_execution(
                     unsafe_tool_policy=unsafe_policy,
                     missing_response_policy=effective_missing,
                     require_exact_id=exact_id,
+            allow_lossy=allow_lossy,
                 )
             )
         except ReplayInterruptedError as exc:
@@ -1526,6 +1538,7 @@ def replay_recorded_execution(
             unsafe_tool_policy=unsafe_policy,
             missing_response_policy=effective_missing,
             require_exact_id=exact_id,
+            allow_lossy=allow_lossy,
         )
 
     saved_report_path: Path | None = None
@@ -1677,6 +1690,7 @@ def export_test(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
+    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
 ) -> None:
     """Export an offline SHA-256-sealed regression fixture and pytest module."""
     cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
@@ -1735,6 +1749,7 @@ def export_test(
             normalize_volatile=effective_normalize,
             raw=raw,
             allow_unredacted_export=allow_unredacted_export,
+            allow_lossy=allow_lossy,
             strict_integrity=strict,
         )
     except (
@@ -1769,12 +1784,7 @@ def export_test(
             "(contains_raw_secrets=True); restrict access accordingly.",
             err=True,
         )
-    if bundle.fixture.source_has_corruptions:
-        typer.echo(
-            "WARNING: Source recording has corruptions; exported fixture covers verified prefix "
-            "events only.",
-            err=True,
-        )
+    _warn_lossy(fidelity_findings(bundle.fixture.cassette))
     for overwritten_path in bundle.overwritten_files:
         typer.echo(
             f"NOTICE: Overwrote existing export artifact {overwritten_path}",
@@ -1820,6 +1830,7 @@ def export_verify(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
+    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
 ) -> None:
     """Verify an exported regression fixture offline cleanly or against a replacement cassette."""
     resolved_dir: Path | None = None
@@ -1834,7 +1845,8 @@ def export_verify(
             candidate = Path(cassette).expanduser()
             target: str | Path = candidate if candidate.is_file() else cassette
             override_cassette, override_path = load_cassette(target, data_dir=resolved_dir)
-        result = run_regression_fixture(fixture, override_cassette=override_cassette)
+        result = run_regression_fixture(fixture, override_cassette=override_cassette, allow_lossy=allow_lossy)
+        _warn_lossy(result.fidelity_findings)
     except (
         RegressionFixtureValidationError,
         InvalidExecutionIdError,

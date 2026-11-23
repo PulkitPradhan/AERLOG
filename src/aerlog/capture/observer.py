@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from aerlog.capture.normalizer import (
+    RawCaptureWarningInput,
     RawChildShutdownEscalateInput,
     RawFrameTooLargeInput,
     RawIncompleteFrameInput,
@@ -202,6 +203,19 @@ class CaptureProxyObserver:
                 returncode=returncode,
             )
         )
+
+    def on_proxy_drain_timeout(self, timeout: float, streams: Sequence[str]) -> None:
+        """Flag a drain interruption even if the input queue has no capacity."""
+        if self._pipeline is not None:
+            self._pipeline.mark_incomplete(
+                RawCaptureWarningInput(
+                    timestamp=datetime.now(UTC),
+                    monotonic_time_ns=time.monotonic_ns(),
+                    code="proxy_drain_timeout",
+                    message="Proxy stopped waiting for child output. Loss count is unknown.",
+                    details={"timeout_seconds": timeout, "streams": list(streams)},
+                )
+            )
 
     async def on_execution_finished(
         self,

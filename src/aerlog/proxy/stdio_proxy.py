@@ -784,6 +784,20 @@ class StdioProxy:
         primary_cancel: asyncio.CancelledError | None = None
         teardown_task: asyncio.Task[list[tuple[str, BaseException]]] | None = None
 
+        async def _drain_child_output(*pumps: tuple[str, asyncio.Task[Any]]) -> None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(task for _, task in pumps), return_exceptions=True),
+                    timeout=cfg.drain_timeout,
+                )
+            except TimeoutError:
+                streams = tuple(name for name, task in pumps if task.cancelled())
+                await sink.emit("proxy_drain_timeout", timeout=cfg.drain_timeout, streams=streams)
+                # This optional hook preserves compatibility with existing observers.
+                on_timeout = getattr(observer, "on_proxy_drain_timeout", None)
+                if on_timeout is not None:
+                    on_timeout(cfg.drain_timeout, streams)
+
         async def _perform_cleanup() -> list[tuple[str, BaseException]]:
             nonlocal c2s_result, s2c_result, exit_code
             errors: list[tuple[str, BaseException]] = []
@@ -1130,11 +1144,7 @@ class StdioProxy:
                         exit_code = 1
                         raise s2c_done_exc
                     s2c_result = s2c_task.result()
-                    with suppress(TimeoutError):
-                        await asyncio.wait_for(
-                            asyncio.gather(err_task, return_exceptions=True),
-                            timeout=cfg.drain_timeout,
-                        )
+                    await _drain_child_output(("stderr", err_task))
                     exit_code = await terminate_process_group(
                         managed,
                         sink,
@@ -1153,11 +1163,7 @@ class StdioProxy:
 
                 if exit_task in done:
                     server_rc = exit_task.result()
-                    with suppress(TimeoutError):
-                        await asyncio.wait_for(
-                            asyncio.gather(s2c_task, err_task, return_exceptions=True),
-                            timeout=cfg.drain_timeout,
-                        )
+                    await _drain_child_output(("stdout", s2c_task), ("stderr", err_task))
                     if s2c_task.done() and not s2c_task.cancelled():
                         s2c_exc = s2c_task.exception()
                         if isinstance(s2c_exc, FrameTooLargeError):
