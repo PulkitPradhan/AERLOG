@@ -764,7 +764,7 @@ AERLOG uses two complementary local persistence mechanisms.
 
 ### A. Append-Only JSONL Event Log
 
-The event log is the durable record of captured execution events.
+The event log is the authoritative record of captured execution events.
 
 Responsibilities:
 
@@ -791,7 +791,7 @@ Responsibilities:
 - Replay metadata.
 - Search and filtering.
 
-SQLite should be treated as an index and metadata store, not as an independent source of truth that can silently contradict the event log.
+SQLite stores a rebuildable projection. Indexed event queries use SQLite to locate records and read the event data from JSONL.
 
 ### C. Storage Layout
 
@@ -821,20 +821,36 @@ SQLite should be treated as an index and metadata store, not as an independent s
 
 Paths follow XDG Base Directory conventions (`$XDG_DATA_HOME/aerlog`, `$XDG_CONFIG_HOME/aerlog`) and are overridable via `--data-dir`, `--config`, or `$AERLOG_CONFIG`.
 
-### D. Storage Integrity
+### D. Durability and Recovery
 
-The implementation should consider:
+Capture persistence on local Linux storage is best effort. The defaults are
+`storage.fsync_policy = "lifecycle"` and `storage.sqlite_synchronous = "NORMAL"`.
 
-- Atomic metadata updates.
-- Partial recordings after crashes.
-- Incomplete final JSONL records.
-- SQLite transactions and migrations.
-- Event schema versioning.
-- Recording manifests.
-- Checksums or integrity metadata where useful.
-- Recovery of incomplete executions.
+| Boundary | What has happened |
+|---|---|
+| Queue acceptance | The observation is in AERLOG's process memory. With `mark_incomplete`, a full queue can record a pending gap in memory instead of accepting the observation. |
+| JSONL append | A successful append has written complete, checksummed records to the operating system. A write interrupted partway through can leave a verified prefix and a torn final record. |
+| Recording sync | `lifecycle` syncs `events.jsonl` on flush, finalization, and normal writer close. `every_batch` also syncs before each nonempty append returns. Both policies sync temporary header, summary, and manifest files before atomic replacement. `none` skips those syncs during normal recording writes. |
+| Spool write | Each complete NDJSON line is flushed from the application to the operating system. Recovery spools use no `fsync`, including with `every_batch`. |
+| SQLite commit | An independent WAL transaction commits the derived index. `storage.sqlite_synchronous` selects `NORMAL` or `FULL` for SQLite alone. The files and the index can reach their respective commit points separately. |
 
-A partially written execution must not be presented as a fully successful recording.
+When AERLOG is killed while Linux keeps running, queued observations can be lost.
+Complete records already handed to the operating system can remain readable from
+its cache. Finalization writes the summary and manifest separately before updating
+SQLite, so a kill can leave a recording without its final metadata or with an
+older index. Normal file creation and metadata replacement leave parent directory
+entries unsynced. Recovery after machine power loss is best effort under every
+policy, including `every_batch` with SQLite `FULL`.
+
+`RecordingRepository.reconcile_execution()` rebuilds the index from checksummed
+JSONL and companion metadata. It can report an incomplete execution when
+finalization stopped early, even if the terminal event survived. Missing or corrupt
+recording bytes can leave a stale SQLite row, so verify the recording before relying
+on its completion state. Reconciliation flags missing recording files and checks
+any surviving metadata against the log. If a recovery spool survived,
+`RecordingRepository.import_recovery_spool()` can add missing events and finish
+interrupted finalization when its evidence matches the recording. Retrying the
+same spool skips verified events already recorded.
 
 ## 6. Diagnostics Engine
 
@@ -1458,7 +1474,7 @@ The implemented capture target is **MCP stdio transport** (Streamable HTTP/SSE t
 - **Stdio transport only:** HTTP and Streamable HTTP/SSE MCP transports are not intercepted in v0.1.0.
 - **Live replay blocked fail-closed:** `--mode live` intentionally fails with exit `1`; replay runs offline exclusively through SHA-256-sealed cassettes (`--mode cassette` / `--serve`).
 - **Best-effort unstructured redaction (`standard` mode):** Structured secret keys, PEM private keys, JWTs, URL userinfo credentials, auth schemes, and known token prefixes are redacted before persistence/export, and `--redaction-mode strict_hash_only` withholds payloads completely; unstructured arbitrary secrets without matching patterns/keys cannot be guaranteed removable in `standard` mode.
-- **No `SIGKILL` recovery guarantee for in-flight memory buffers:** Graceful exit and `SIGINT`/`SIGTERM` drain and flush capture buffers cleanly; abrupt `SIGKILL` loses un-flushed in-memory queue items (previously written JSONL lines remain intact and recoverable).
+- **Best-effort capture durability:** Abrupt process termination can lose queued observations. Surviving recordings are verified during recovery. [Durability and recovery](#d-durability-and-recovery)
 - **Experimental / deferred areas:** Local web cockpit (`FastAPI` backend + browser UI) and OpenTelemetry collector export are not yet implemented; W3C `traceparent`/`tracestate` correlation metadata is captured read-only on JSONL events cleanly.
 
 ---
