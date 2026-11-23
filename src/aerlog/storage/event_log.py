@@ -611,9 +611,9 @@ class JsonlEventLogWriter:
                 os.lseek(self._fd, self._retained_tail_offset, os.SEEK_SET)
             except OSError as exc:
                 self._requires_verification = True
-                raise _translate_os_error(
-                    exc, context=f"replacing tail of {self._events_path}"
-                ) from exc
+                error = _translate_os_error(exc, context=f"replacing tail of {self._events_path}")
+                error.append_outcome = AppendFailureOutcome(0, (), False, True)
+                raise error from exc
             self._byte_offset = self._retained_tail_offset
             self._retained_tail = b""
 

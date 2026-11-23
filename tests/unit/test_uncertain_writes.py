@@ -333,7 +333,9 @@ def test_valid_record_without_newline_survives_mismatching_append(tmp_path: Path
         reopened.close()
 
 
-def test_failed_seek_after_quarantine_blocks_reuse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_seek_after_quarantine_blocks_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     header, events, summary = recording()
     writer = JsonlEventLogWriter(tmp_path, header.execution_id)
     writer.open(header)
