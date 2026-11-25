@@ -22,7 +22,6 @@ from aerlog.events.ids import new_event_id, new_execution_id
 from aerlog.events.models import ExecutionEvent, ExecutionHeader, ExecutionSummary
 from aerlog.storage import (
     JsonlEventLogWriter,
-    JsonlReadResult,
     PersistentCaptureSink,
     RecordingRepository,
     TailPolicy,
@@ -30,6 +29,8 @@ from aerlog.storage import (
 from aerlog.storage.database import IndexedExecutionRow
 from aerlog.storage.exceptions import ExecutionBusyError, StorageCorruptionError, StorageError
 from aerlog.storage.ownership import ExecutionOwnership
+from aerlog.storage.recovery_stage import RecoveryStage
+from aerlog.storage.repositories import _VerifiedLog
 from aerlog.storage.retention import RetentionPolicy, apply_retention
 
 
@@ -220,21 +221,19 @@ def test_overlapping_imports_retry_against_committed_evidence(
     if checkpoint == "index":
         original_replace = winner._replace_verified_index
 
-        def gate_index(read: JsonlReadResult) -> None:
+        def gate_index(read: _VerifiedLog) -> None:
             pause()
             original_replace(read)
 
         monkeypatch.setattr(winner, "_replace_verified_index", gate_index)
     else:
-        original_read = winner._reader.read_execution
+        original_read = winner._read_recovery_destination
 
-        def gate_read(
-            execution_id: str, *, strict: bool, verify_checksums: bool
-        ) -> JsonlReadResult:
+        def gate_read(execution_id: str, stage: RecoveryStage) -> _VerifiedLog:
             pause()
-            return original_read(execution_id, strict=strict, verify_checksums=verify_checksums)
+            return original_read(execution_id, stage)
 
-        monkeypatch.setattr(winner._reader, "read_execution", gate_read)
+        monkeypatch.setattr(winner, "_read_recovery_destination", gate_read)
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             accepted = pool.submit(winner.import_recovery_spool, source)

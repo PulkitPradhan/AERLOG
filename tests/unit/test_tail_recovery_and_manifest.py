@@ -1705,7 +1705,7 @@ def test_recovery_propagates_nondecoding_index_errors(tmp_path: Path, error: Exc
         repo.reconcile_execution(eid)
         before = _stored_bytes(tmp_path, eid), _index_file_hashes(tmp_path)
         with (
-            patch.object(repo.store, "query_event_index", side_effect=error),
+            patch("aerlog.storage.database._row_to_event", side_effect=error),
             patch.object(repo.store, "replace_execution_index") as rebuild,
             pytest.raises(type(error), match=str(error)),
         ):

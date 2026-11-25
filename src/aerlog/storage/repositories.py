@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator
+from contextlib import closing
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any, Literal
 
@@ -46,13 +48,18 @@ from aerlog.storage.event_log import (
     CorruptRecordReport,
     ExecutionManifest,
     FsyncPolicy,
+    IndexedLogEvent,
     JsonlEventLogReader,
     JsonlEventLogWriter,
     JsonlReadResult,
     TailPolicy,
     TailRecoveryResult,
     WrittenEventSlice,
+    _JsonlReadResult,
+    _LogEventsView,
     _parse_jsonl_line,
+    _quarantine_tail_chunks,
+    _read_log_tail,
     canonical_event_sha256,
     compute_file_sha256,
     quarantine_tail_bytes,
@@ -70,6 +77,7 @@ from aerlog.storage.exceptions import (
     StorageCorruptionError,
 )
 from aerlog.storage.ownership import ExecutionOwnership
+from aerlog.storage.recovery_stage import RecoveryStage, stage_recovery
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +134,9 @@ class _TailRepair:
     issue: CorruptRecordReport | None
 
 
+_VerifiedLog = _JsonlReadResult[_LogEventsView]
+
+
 _DESTINATION_TAIL_REASON = "Destination log tail: "
 _RECOVERED_SPOOL_COMMAND = ("recovered-spool",)
 
@@ -179,29 +190,46 @@ def _destination_quarantine_count(exec_dir: Path, execution_id: str) -> int:
     )
 
 
+def _read_log_prefix(path: Path, length: int) -> Iterator[bytes]:
+    with path.open("rb") as handle:
+        while length:
+            chunk = handle.read(min(65_536, length))
+            if not chunk:
+                raise StorageCorruptionError(f"Event log shrank while recovering {path}")
+            length -= len(chunk)
+            yield chunk
+
+
+def _tail_digest(path: Path, length: int, *, suffix: bytes = b"") -> str:
+    digest = hashlib.sha256()
+    for chunk in _read_log_prefix(path, length):
+        digest.update(chunk)
+    digest.update(suffix)
+    return digest.hexdigest()
+
+
 def _inspect_tail(
-    prior: JsonlReadResult,
-    file_bytes: bytes,
+    prior: _VerifiedLog,
+    tail: tuple[int, bytes],
     *,
     tail_policy: TailPolicy,
     require_unambiguous: bool = False,
 ) -> _TailRepair | None:
     """Plan tail repair without changing the log, its companions, or SQLite."""
-    if not file_bytes or file_bytes.endswith(b"\n"):
+    prefix_len, raw_tail = tail
+    if not raw_tail:
         if prior.corruptions and tail_policy == "reject":
             raise StorageCorruptionError(
                 f"Corruption detected in {prior.execution_id}: {prior.corruptions[0].details}"
             )
         return None
 
-    prefix_len = file_bytes.rfind(b"\n") + 1
     if tail_policy == "reject":
         for corruption in prior.corruptions:
             if corruption.byte_offset < prefix_len:
                 raise StorageCorruptionError(
                     f"Corruption detected in {prior.execution_id}: {corruption.details}"
                 )
-    raw_tail = file_bytes[prefix_len:]
     event, issue = _parse_jsonl_line(
         execution_id=prior.execution_id,
         raw_line=raw_tail + b"\n",
@@ -289,16 +317,27 @@ def _is_recovery_duplicate(
 
 
 def _has_matching_final_summary(
-    events: Sequence[ExecutionEvent],
+    events: Iterable[ExecutionEvent],
     summary: ExecutionSummary,
     *,
     allow_legacy_end_time: bool = False,
 ) -> bool:
-    if not events:
+    records = iter(events)
+    first = next(records, None)
+    if first is None or first.sequence != 1 or first.execution_id != summary.execution_id:
         return False
-    terminal = events[-1]
+    terminal = first
+    gap_or_degraded = first.kind == "capture_gap" or first.degraded
+    for sequence, event in enumerate(records, start=2):
+        if (
+            terminal.kind == "execution_finished"
+            or event.execution_id != summary.execution_id
+            or event.sequence != sequence
+        ):
+            return False
+        terminal = event
+        gap_or_degraded |= event.kind == "capture_gap" or event.degraded
     payload = terminal.payload
-    first = events[0]
     started = first.payload
     summary_command = summary.command
     if (
@@ -312,11 +351,6 @@ def _has_matching_final_summary(
     return (
         isinstance(payload, ExecutionFinishedPayload)
         and terminal.direction == "proxy"
-        and all(
-            event.execution_id == summary.execution_id and event.sequence == sequence
-            for sequence, event in enumerate(events, start=1)
-        )
-        and not any(event.kind == "execution_finished" for event in events[:-1])
         and summary.started_at <= terminal.timestamp
         and (
             summary.ended_at == terminal.timestamp
@@ -351,7 +385,7 @@ def _has_matching_final_summary(
             summary.capture_completeness != "complete"
             or (
                 summary.dropped_events == summary.gap_count == summary.degraded_events == 0
-                and not any(event.kind == "capture_gap" or event.degraded for event in events)
+                and not gap_or_degraded
             )
         )
     )
@@ -369,7 +403,7 @@ def _matches_manifest(
     )
 
 
-def _has_seal_mismatch(read: JsonlReadResult) -> bool:
+def _has_seal_mismatch(read: _VerifiedLog) -> bool:
     manifest = read.manifest
     return (
         manifest is not None
@@ -384,7 +418,7 @@ def _has_seal_mismatch(read: JsonlReadResult) -> bool:
     )
 
 
-def recording_completeness(read: JsonlReadResult) -> str:
+def recording_completeness(read: _VerifiedLog) -> str:
     """Project recording status from verified events, terminal, and companion metadata."""
     manifest, summary = read.manifest, read.summary
     if (
@@ -400,7 +434,7 @@ def recording_completeness(read: JsonlReadResult) -> str:
         or manifest.corruption_count > 0
         or (summary.capture_completeness == "complete" and manifest.status != "finalized")
         or not _has_matching_final_summary(
-            [item.event for item in read.events],
+            (item.event for item in read.events),
             summary,
             allow_legacy_end_time=manifest.finalized_at is not None,
         )
@@ -411,7 +445,7 @@ def recording_completeness(read: JsonlReadResult) -> str:
 
 def _derive_execution_row_from_jsonl(
     *,
-    read_result: JsonlReadResult,
+    read_result: _VerifiedLog,
     persist_cwd: bool,
 ) -> dict[str, Any]:
     """Construct an authoritative ``executions`` index dict from JSONL and companions."""
@@ -461,28 +495,22 @@ def _derive_execution_row_from_jsonl(
 
     completeness = recording_completeness(read_result)
 
-    observed_traces: list[str] = list(summary.observed_trace_ids) if summary is not None else []
-    if not observed_traces:
+    observed_traces = list(summary.observed_trace_ids) if summary is not None else []
+    degraded_count = summary.degraded_events if summary is not None else 0
+    warning_count = summary.warning_count if summary is not None else 0
+    gap_count = summary.gap_count if summary is not None else 0
+    collect_traces = not observed_traces
+    if collect_traces or summary is None:
         for item in events:
-            t_id = item.event.trace.observed_trace_id if item.event.trace else None
-            if t_id is not None and t_id not in observed_traces:
-                observed_traces.append(t_id)
-
-    degraded_count = (
-        summary.degraded_events
-        if summary is not None
-        else sum(1 for item in events if item.event.degraded)
-    )
-    warning_count = (
-        summary.warning_count
-        if summary is not None
-        else sum(1 for item in events if item.event.kind == "capture_warning")
-    )
-    gap_count = (
-        summary.gap_count
-        if summary is not None
-        else sum(1 for item in events if item.event.kind == "capture_gap")
-    )
+            event = item.event
+            if collect_traces and event.trace is not None:
+                trace_id = event.trace.observed_trace_id
+                if trace_id is not None and trace_id not in observed_traces:
+                    observed_traces.append(trace_id)
+            if summary is None:
+                degraded_count += int(event.degraded)
+                warning_count += event.kind == "capture_warning"
+                gap_count += event.kind == "capture_gap"
 
     return {
         "execution_id": clean_id,
@@ -539,7 +567,7 @@ def _derive_execution_row_from_jsonl(
 def _recovery_index_matches(
     store: SQLiteMetadataStore,
     row: IndexedExecutionRow,
-    prior: JsonlReadResult,
+    prior: _VerifiedLog,
     *,
     persist_cwd: bool,
 ) -> bool:
@@ -559,48 +587,41 @@ def _recovery_index_matches(
     if actual != expected:
         return False
 
-    # One extra result detects surplus rows. SQL orders by timestamp, so use sequence keys.
-    try:
-        rows = store.query_event_index(execution_id=prior.execution_id, limit=len(prior.events) + 1)
-        corruptions = store.get_corruptions(prior.execution_id)
-    except ValueError:
-        # SQLite returned values that the typed index reader could not decode.
-        return False
-    if len(rows) != len(prior.events) or corruptions != prior.corruptions:
-        return False
-    indexed = {item.sequence: item for item in rows}
-    for item in prior.events:
-        event = item.event
-        method, id_type, id_text = _extract_index_fields(event)
-        trace, correlation, derived = event.trace, event.correlation, event.derived
-        if indexed.get(event.sequence) != IndexedEventRow(
-            execution_id=prior.execution_id,
-            event_id=event.event_id,
-            sequence=event.sequence,
-            timestamp=event.timestamp,
-            monotonic_time_ns=event.monotonic_time_ns,
-            direction=event.direction,
-            kind=event.kind,
-            method=method,
-            jsonrpc_id_type=id_type,
-            jsonrpc_id_text=id_text,
-            observed_trace_id=trace.observed_trace_id if trace else None,
-            observed_parent_span_id=trace.observed_parent_span_id if trace else None,
-            synthetic_execution_trace_id=trace.synthetic_execution_trace_id if trace else None,
-            correlation_status=correlation.status if correlation else None,
-            matched_request_event_id=correlation.matched_request_event_id if correlation else None,
-            tool_is_error=derived.tool_is_error if derived else None,
-            degraded=event.degraded,
-            jsonl_byte_offset=item.byte_offset,
-            jsonl_byte_length=item.byte_length,
-        ):
-            return False
-    return True
+    def projected_rows() -> Iterator[IndexedEventRow]:
+        for item in prior.events:
+            event = item.event
+            method, id_type, id_text = _extract_index_fields(event)
+            trace, correlation, derived = event.trace, event.correlation, event.derived
+            yield IndexedEventRow(
+                execution_id=prior.execution_id,
+                event_id=event.event_id,
+                sequence=event.sequence,
+                timestamp=event.timestamp,
+                monotonic_time_ns=event.monotonic_time_ns,
+                direction=event.direction,
+                kind=event.kind,
+                method=method,
+                jsonrpc_id_type=id_type,
+                jsonrpc_id_text=id_text,
+                observed_trace_id=trace.observed_trace_id if trace else None,
+                observed_parent_span_id=trace.observed_parent_span_id if trace else None,
+                synthetic_execution_trace_id=trace.synthetic_execution_trace_id if trace else None,
+                correlation_status=correlation.status if correlation else None,
+                matched_request_event_id=correlation.matched_request_event_id
+                if correlation
+                else None,
+                tool_is_error=derived.tool_is_error if derived else None,
+                degraded=event.degraded,
+                jsonl_byte_offset=item.byte_offset,
+                jsonl_byte_length=item.byte_length,
+            )
+
+    return not store._has_indexed_corruptions(prior.execution_id) and store._matches_event_index(
+        prior.execution_id, projected_rows()
+    )
 
 
-def _recovery_manifest(
-    prior: JsonlReadResult, summary: ExecutionSummary | None
-) -> ExecutionManifest:
+def _recovery_manifest(prior: _VerifiedLog, summary: ExecutionSummary | None) -> ExecutionManifest:
     manifest = prior.manifest
     corruption_count = manifest.corruption_count if manifest else 0
     finalized_at = manifest.finalized_at if manifest else None
@@ -906,15 +927,15 @@ class RecordingRepository:
             exec_dir = resolve_execution_dir(self._data_dir, clean_id)
             events_path = exec_dir / EVENTS_FILE_NAME
             prior = self._reader.read_execution(clean_id, strict=False, verify_checksums=True)
-            file_bytes = events_path.read_bytes() if events_path.exists() else b""
-            repair = _inspect_tail(prior, file_bytes, tail_policy=tail_policy)
-            return self._apply_tail_repair(exec_dir, prior, file_bytes, repair)
+            tail = _read_log_tail(events_path)
+            repair = _inspect_tail(prior, tail, tail_policy=tail_policy)
+            return self._apply_tail_repair(exec_dir, prior, tail[1], repair)
 
     def _apply_tail_repair(
         self,
         exec_dir: Path,
-        prior: JsonlReadResult,
-        file_bytes: bytes,
+        prior: _VerifiedLog,
+        raw_tail: bytes,
         repair: _TailRepair | None,
         *,
         update_index: bool = True,
@@ -939,7 +960,6 @@ class RecordingRepository:
         events_path = exec_dir / EVENTS_FILE_NAME
         manifest_path = exec_dir / MANIFEST_FILE_NAME
         prefix_len = repair.prefix_len
-        raw_tail = file_bytes[prefix_len:]
         decoded = repair.event
         issue = repair.issue
         previous = prior.manifest
@@ -953,9 +973,7 @@ class RecordingRepository:
             else datetime.now(UTC)
         )
         if decoded is not None:
-            digest = hashlib.sha256(file_bytes)
-            digest.update(b"\n")
-            restored_sha = digest.hexdigest()
+            restored_sha = _tail_digest(events_path, prior.byte_size, suffix=b"\n")
             new_line_count = prior.line_count
             new_last_seq = decoded.sequence
             same_manifest = (
@@ -963,7 +981,7 @@ class RecordingRepository:
                 and previous.execution_id == clean_id
                 and _matches_manifest(
                     previous,
-                    byte_size=len(file_bytes) + 1,
+                    byte_size=prior.byte_size + 1,
                     line_count=new_line_count,
                     last_sequence=new_last_seq,
                     digest=restored_sha,
@@ -990,7 +1008,7 @@ class RecordingRepository:
                     ),
                     created_at=created_at,
                     finalized_at=previous.finalized_at if previous else None,
-                    byte_size=len(file_bytes) + 1,
+                    byte_size=prior.byte_size + 1,
                     line_count=new_line_count,
                     last_sequence=new_last_seq,
                     events_file_sha256=restored_sha,
@@ -1015,8 +1033,7 @@ class RecordingRepository:
                 final_last_sequence=new_last_seq,
             )
 
-        prefix = file_bytes[:prefix_len]
-        prefix_digest = hashlib.sha256(prefix).hexdigest()
+        prefix_digest = _tail_digest(events_path, prefix_len)
         tail_digest = hashlib.sha256(raw_tail).hexdigest()
         stem = f"corrupted_tail_offset_{prefix_len}_{tail_digest[:12]}"
         sidecar = exec_dir / f"{stem}.meta.json"
@@ -1086,7 +1103,8 @@ class RecordingRepository:
         fd = os.open(tmp_events, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "wb") as handle:
-                handle.write(prefix)
+                for block in _read_log_prefix(events_path, prefix_len):
+                    handle.write(block)
                 handle.flush()
                 os.fsync(handle.fileno())
             # Persist a new quarantine decision before removing the original tail bytes.
@@ -1139,19 +1157,19 @@ class RecordingRepository:
         self._replace_verified_index(read_result)
         return read_result
 
-    def _replace_verified_index(self, read_result: JsonlReadResult) -> None:
+    def _replace_verified_index(self, read_result: _VerifiedLog) -> None:
         execution_row = _derive_execution_row_from_jsonl(
             read_result=read_result,
             persist_cwd=self._persist_cwd,
         )
-        slices = [
+        slices = (
             WrittenEventSlice(
                 event=item.event,
                 byte_offset=item.byte_offset,
                 byte_length=item.byte_length,
             )
             for item in read_result.events
-        ]
+        )
         self._store.replace_execution_index(
             execution_row=execution_row,
             slices=slices,
@@ -1214,6 +1232,24 @@ class RecordingRepository:
         tail_policy: TailPolicy = "quarantine",
     ) -> SpoolImportReport:
         """Validate, redact, deduplicate, and import a ``0o600`` local recovery spool."""
+        with stage_recovery() as stage:
+            return self._stage_recovery_spool(
+                stage,
+                spool_path,
+                redaction_mode=redaction_mode,
+                fsync_policy=fsync_policy,
+                tail_policy=tail_policy,
+            )
+
+    def _stage_recovery_spool(
+        self,
+        stage: RecoveryStage,
+        spool_path: Path,
+        *,
+        redaction_mode: RedactionMode,
+        fsync_policy: FsyncPolicy,
+        tail_policy: TailPolicy,
+    ) -> SpoolImportReport:
         if spool_path.is_symlink():
             raise StorageCorruptionError(f"Refusing symlink recovery spool: {spool_path}")
         if not spool_path.exists():
@@ -1223,7 +1259,6 @@ class RecordingRepository:
         parsed_header: ExecutionHeader | None = None
         parsed_summary: ExecutionSummary | None = None
         conflicting_summaries: list[ExecutionSummary] = []
-        parsed_events: list[tuple[ExecutionEvent, bool]] = []
         corrupt_lines: list[CorruptRecordReport] = []
         observed_exec_ids: set[str] = set()
 
@@ -1327,7 +1362,7 @@ class RecordingRepository:
                             and ev.redaction.applied
                             and not ev.redaction.degraded
                         )
-                        parsed_events.append((safe_event, legacy_strict_candidate))
+                        stage.add_spool_event(safe_event, legacy_strict_candidate)
                     else:
                         corrupt_lines.append(
                             CorruptRecordReport(
@@ -1399,12 +1434,23 @@ class RecordingRepository:
                 parsed_header,
                 parsed_summary,
                 conflicting_summaries,
-                parsed_events,
+                stage,
                 fixed_corruptions,
                 redaction_mode,
                 fsync_policy,
                 tail_policy,
             )
+
+    def _read_recovery_destination(self, exec_id: str, stage: RecoveryStage) -> _VerifiedLog:
+        stage.reset_log()
+        return self._reader._scan_execution(
+            exec_id,
+            strict=False,
+            verify_checksums=True,
+            add_event=stage.add_log_event,
+            finish_events=lambda: stage.log,
+            make_result=_JsonlReadResult,
+        )
 
     def _import_verified_spool(
         self,
@@ -1413,7 +1459,7 @@ class RecordingRepository:
         parsed_header: ExecutionHeader | None,
         parsed_summary: ExecutionSummary | None,
         conflicting_summaries: list[ExecutionSummary],
-        parsed_events: list[tuple[ExecutionEvent, bool]],
+        stage: RecoveryStage,
         fixed_corruptions: tuple[CorruptRecordReport, ...],
         redaction_mode: RedactionMode,
         fsync_policy: FsyncPolicy,
@@ -1423,7 +1469,7 @@ class RecordingRepository:
         exec_dir = resolve_execution_dir(self._data_dir, exec_id)
         events_path = exec_dir / EVENTS_FILE_NAME
         has_destination = events_path.exists() or (exec_dir / EXECUTION_FILE_NAME).exists()
-        prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
+        prior = self._read_recovery_destination(exec_id, stage)
         if (
             (exec_dir / EXECUTION_FILE_NAME).exists()
             and prior.header is None
@@ -1437,27 +1483,20 @@ class RecordingRepository:
                 raise StorageCorruptionError(
                     f"Destination metadata belongs to a different execution: {exec_id}"
                 )
-        file_bytes = events_path.read_bytes() if events_path.exists() else b""
-        repair = _inspect_tail(prior, file_bytes, tail_policy=tail_policy, require_unambiguous=True)
+        tail = _read_log_tail(events_path)
+        repair = _inspect_tail(prior, tail, tail_policy=tail_policy, require_unambiguous=True)
 
-        prior_events = [item.event for item in prior.events]
         prior_last_seq = prior.last_valid_sequence
         if repair is not None and repair.event is not None:
-            prior_events.append(repair.event)
+            stage.add_log_event(
+                IndexedLogEvent(repair.event, prior.line_count, repair.prefix_len, len(tail[1]))
+            )
             prior_last_seq = repair.event.sequence
-        by_id: dict[str, ExecutionEvent] = {}
-        by_seq: dict[int, ExecutionEvent] = {}
-        for event in prior_events:
-            if (
-                "event_id" not in event.model_fields_set
-                or not event.event_id.strip()
-                or event.event_id in by_id
-                or event.sequence in by_seq
-            ):
-                raise StorageCorruptionError(
-                    f"Ambiguous destination identity in {exec_id} at sequence {event.sequence}"
-                )
-            by_id[event.event_id] = by_seq[event.sequence] = event
+        ambiguous_sequence = stage.find_ambiguous_log_identity()
+        if ambiguous_sequence is not None:
+            raise StorageCorruptionError(
+                f"Ambiguous destination identity in {exec_id} at sequence {ambiguous_sequence}"
+            )
 
         extra_corruptions: list[CorruptRecordReport] = [
             issue
@@ -1465,16 +1504,15 @@ class RecordingRepository:
             if repair is None or issue.byte_offset < repair.prefix_len
         ]
         quarantines: list[
-            tuple[Sequence[ExecutionEvent | ExecutionSummary], str, CorruptionIssueKind]
+            tuple[Iterable[ExecutionEvent | ExecutionSummary], str, CorruptionIssueKind]
         ] = []
-        new_events: list[ExecutionEvent] = []
+        candidate_count = 0
         skipped_dups = 0
-        for ev, legacy_strict_candidate in parsed_events:
-            same_id = by_id.get(ev.event_id)
-            same_seq = by_seq.get(ev.sequence)
+        for ordinal, ev, legacy_strict_candidate in stage.spool_events():
+            same_id, same_seq = stage.find_log_or_candidate(ev)
             if same_id is None and same_seq is None:
-                by_id[ev.event_id] = by_seq[ev.sequence] = ev
-                new_events.append(ev)
+                stage.add_candidate(ordinal, ev)
+                candidate_count += 1
                 continue
             if same_id is not None and same_id is same_seq:
                 if _is_recovery_duplicate(
@@ -1495,13 +1533,11 @@ class RecordingRepository:
 
             if tail_policy == "reject":
                 raise StorageCorruptionError(reason)
-            quarantines.append(([ev], reason, issue_kind))
+            quarantines.append((stage.spool_event_for_quarantine(ordinal), reason, issue_kind))
 
-        new_events.sort(key=lambda e: e.sequence)
-        terminal_seen = bool(new_events) and any(
-            event.kind == "execution_finished" for event in prior_events
-        )
-        for index, ev in enumerate(new_events):
+        new_count = candidate_count
+        terminal_seen = bool(candidate_count) and stage.log_has_terminal()
+        for index, ev in enumerate(stage.candidates()):
             expected_seq = prior_last_seq + index + 1
             if terminal_seen:
                 reason = f"Recovery event at sequence {ev.sequence} follows the terminal event"
@@ -1516,8 +1552,8 @@ class RecordingRepository:
                 continue
             if tail_policy == "reject":
                 raise StorageCorruptionError(reason)
-            quarantines.append((new_events[index:], reason, issue_kind))
-            new_events = new_events[:index]
+            quarantines.append((stage.candidates(offset=index), reason, issue_kind))
+            new_count = index
             break
 
         # Validate summaries against the records that would survive this import. A supplied
@@ -1528,45 +1564,52 @@ class RecordingRepository:
             raise StorageCorruptionError("Recovery cannot import into a recording marked corrupted")
         source_matches_seal = not _has_seal_mismatch(prior)
         if not source_matches_seal and manifest is not None and repair is not None:
-            digest = hashlib.sha256(
-                file_bytes if repair.event is not None else file_bytes[: repair.prefix_len]
+            repaired_sha = (
+                _tail_digest(events_path, prior.byte_size, suffix=b"\n")
+                if repair.event is not None
+                else _tail_digest(events_path, repair.prefix_len)
             )
-            if repair.event is not None:
-                digest.update(b"\n")
             source_matches_seal = _matches_manifest(
                 manifest,
-                byte_size=len(file_bytes) + 1 if repair.event is not None else repair.prefix_len,
+                byte_size=prior.byte_size + 1 if repair.event is not None else repair.prefix_len,
                 line_count=prior.line_count if repair.event is not None else prior.line_count - 1,
                 last_sequence=prior_last_seq,
-                digest=digest.hexdigest(),
+                digest=repaired_sha,
             )
 
-        if new_events and (
+        if new_count and (
             (manifest is not None and manifest.status == "finalized")
             or (
                 retained_summary is not None
                 and (
                     extra_corruptions
-                    or not _has_matching_final_summary(prior_events + new_events, retained_summary)
+                    or not _has_matching_final_summary(
+                        chain(
+                            (item.event for item in prior.events), stage.candidates(limit=new_count)
+                        ),
+                        retained_summary,
+                    )
                 )
             )
         ):
             reason = "Recovery append conflicts with finalized recording or retained summary"
             if tail_policy == "reject":
                 raise StorageCorruptionError(reason)
-            quarantines.append((new_events, reason, "event_validation_failed"))
-            new_events = []
+            quarantines.append(
+                (stage.candidates(limit=new_count), reason, "event_validation_failed")
+            )
+            new_count = 0
 
         supplied_summary = parsed_summary
         summary_header = prior.header or parsed_header
         if (
             prior.header is not None
-            and prior_events
+            and prior.events
             and prior.header.command == _RECOVERED_SPOOL_COMMAND
             and prior.header.backpressure_policy == "spill"
             and prior.header.cwd is None
-            and prior.header.started_at == prior_events[0].timestamp
-            and prior.header.monotonic_start_ns == prior_events[0].monotonic_time_ns
+            and prior.header.started_at == prior.events[0].event.timestamp
+            and prior.header.monotonic_start_ns == prior.events[0].event.monotonic_time_ns
         ):
             # Old fallback headers have no explicit provenance. Treat this exact shape
             # as ambiguous. A recorded start event still supplies independent evidence.
@@ -1584,10 +1627,10 @@ class RecordingRepository:
             or extra_corruptions
             or not source_matches_seal
             or not _has_matching_final_summary(
-                prior_events + new_events,
+                chain((item.event for item in prior.events), stage.candidates(limit=new_count)),
                 supplied_summary,
                 allow_legacy_end_time=(
-                    not new_events
+                    not new_count
                     and supplied_summary == retained_summary
                     and manifest is not None
                     and manifest.status == "finalized"
@@ -1611,13 +1654,13 @@ class RecordingRepository:
         # Rejected imports return before modifying the recording, its companions, or SQLite.
         tail_quarantined = False
         if repair is not None:
-            tail_res = self._apply_tail_repair(
-                exec_dir, prior, file_bytes, repair, update_index=False
-            )
+            if repair.event is not None:
+                stage.remove_last_log_event()
+            tail_res = self._apply_tail_repair(exec_dir, prior, tail[1], repair, update_index=False)
             if tail_res.quarantined_report is not None:
                 tail_quarantined = True
                 extra_corruptions.append(tail_res.quarantined_report)
-            prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
+            prior = self._read_recovery_destination(exec_id, stage)
 
         fsync = fsync_policy != "none"
         # A failed append can reset recording metadata before it carries the count forward.
@@ -1644,24 +1687,24 @@ class RecordingRepository:
                 }
                 for record in records
             )
-            _, _, report = quarantine_tail_bytes(
+            _, _, report = _quarantine_tail_chunks(
                 exec_dir=exec_dir,
                 execution_id=exec_id,
-                raw_tail=b"".join(
-                    (json.dumps(payload) + "\n").encode("utf-8") for payload in payloads
-                ),
+                chunks=((json.dumps(payload) + "\n").encode("utf-8") for payload in payloads),
                 byte_offset=0,
                 reason=reason,
                 issue_kind=kind,
             )
             extra_corruptions.append(report)
 
-        if new_events:
+        if new_count:
             if _has_seal_mismatch(prior):
                 raise StorageCorruptionError("Recovery append would bypass a mismatched manifest")
             header = prior.header or parsed_header
             if header is None:
-                first_event = prior_events[0] if prior_events else new_events[0]
+                first_event = (
+                    prior.events[0].event if prior.events else next(stage.candidates(limit=1))
+                )
                 header = ExecutionHeader(
                     execution_id=exec_id,
                     started_at=supplied_summary.started_at
@@ -1700,7 +1743,9 @@ class RecordingRepository:
                     write_atomic_private_json(
                         exec_dir / MANIFEST_FILE_NAME, updated.model_dump(mode="json"), fsync=fsync
                     )
-                writer.append_events(new_events)
+                with closing(stage.candidates(limit=new_count)) as pending:
+                    while batch := tuple(islice(pending, 256)):
+                        writer.append_events(batch)
             except BaseException as exc:
                 try:
                     writer.close()
@@ -1709,7 +1754,7 @@ class RecordingRepository:
                 raise
             else:
                 writer.close()
-            prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
+            prior = self._read_recovery_destination(exec_id, stage)
 
         manifest = prior.manifest
         clean_recording = not prior.has_corruptions and not _has_seal_mismatch(prior)
@@ -1717,9 +1762,9 @@ class RecordingRepository:
         should_finalize = (
             clean_recording
             and summary is not None
-            and (supplied_summary is not None or (not quarantines and (skipped_dups or new_events)))
+            and (supplied_summary is not None or (not quarantines and (skipped_dups or new_count)))
             and (manifest is None or manifest.status == "recording" or prior.summary is None)
-            and _has_matching_final_summary([item.event for item in prior.events], summary)
+            and _has_matching_final_summary((item.event for item in prior.events), summary)
         )
         if should_finalize:
             assert summary is not None
@@ -1734,16 +1779,17 @@ class RecordingRepository:
                     final_manifest.model_dump(mode="json"),
                     fsync=fsync,
                 )
-            prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
+            prior = replace(prior, summary=summary, manifest=final_manifest, unclean_shutdown=False)
         elif manifest is None and prior.summary is None and clean_recording and skipped_dups:
+            recovered_manifest = _recovery_manifest(prior, None)
             write_atomic_private_json(
                 exec_dir / MANIFEST_FILE_NAME,
-                _recovery_manifest(prior, None).model_dump(mode="json"),
+                recovered_manifest.model_dump(mode="json"),
                 fsync=fsync,
             )
-            prior = self._reader.read_execution(exec_id, strict=False, verify_checksums=True)
+            prior = replace(prior, manifest=recovered_manifest)
 
-        if new_events or tail_quarantined or restored_quarantine or should_finalize:
+        if new_count or tail_quarantined or restored_quarantine or should_finalize:
             self._replace_verified_index(prior)
         elif (
             has_destination
@@ -1763,7 +1809,7 @@ class RecordingRepository:
         all_corruptions = fixed_corruptions + tuple(extra_corruptions)
         return SpoolImportReport(
             execution_id=exec_id,
-            imported_events=len(new_events),
+            imported_events=new_count,
             skipped_duplicates=skipped_dups,
             corrupt_lines=all_corruptions,
             final_status="incomplete" if all_corruptions else recording_completeness(prior),

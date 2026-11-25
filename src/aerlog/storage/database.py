@@ -9,8 +9,8 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Sequence
-from contextlib import suppress
+from collections.abc import Iterable, Sequence
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -532,8 +532,8 @@ class SQLiteMetadataStore:
         self,
         *,
         execution_row: dict[str, Any],
-        slices: Sequence[WrittenEventSlice],
-        corruptions: Sequence[CorruptRecordReport],
+        slices: Iterable[WrittenEventSlice],
+        corruptions: Iterable[CorruptRecordReport],
     ) -> None:
         """Atomically rebuild all SQLite rows for one execution from authoritative JSONL."""
         clean_id = validate_execution_id(str(execution_row["execution_id"]))
@@ -623,60 +623,56 @@ class SQLiteMetadataStore:
                     ),
                 )
 
-                if slices:
-                    event_rows = []
+                def event_rows() -> Iterable[tuple[Any, ...]]:
                     for item in slices:
                         ev = item.event
                         method, id_type, id_text = _extract_index_fields(ev)
-                        observed_trace = ev.trace.observed_trace_id if ev.trace else None
-                        observed_span = ev.trace.observed_parent_span_id if ev.trace else None
-                        synth_trace = ev.trace.synthetic_execution_trace_id if ev.trace else None
-                        corr_status = ev.correlation.status if ev.correlation else None
-                        matched_req = (
-                            ev.correlation.matched_request_event_id if ev.correlation else None
+                        trace, correlation, derived = ev.trace, ev.correlation, ev.derived
+                        yield (
+                            clean_id,
+                            ev.event_id,
+                            ev.sequence,
+                            ev.timestamp.isoformat(),
+                            ev.monotonic_time_ns,
+                            ev.direction,
+                            ev.kind,
+                            method,
+                            id_type,
+                            id_text,
+                            trace.observed_trace_id if trace else None,
+                            trace.observed_parent_span_id if trace else None,
+                            trace.synthetic_execution_trace_id if trace else None,
+                            correlation.status if correlation else None,
+                            correlation.matched_request_event_id if correlation else None,
+                            None
+                            if derived is None or derived.tool_is_error is None
+                            else int(derived.tool_is_error),
+                            int(ev.degraded),
+                            item.byte_offset,
+                            item.byte_length,
                         )
-                        tool_err: int | None = None
-                        if ev.derived is not None and ev.derived.tool_is_error is not None:
-                            tool_err = 1 if ev.derived.tool_is_error else 0
-                        event_rows.append(
-                            (
-                                clean_id,
-                                ev.event_id,
-                                ev.sequence,
-                                ev.timestamp.isoformat(),
-                                ev.monotonic_time_ns,
-                                ev.direction,
-                                ev.kind,
-                                method,
-                                id_type,
-                                id_text,
-                                observed_trace,
-                                observed_span,
-                                synth_trace,
-                                corr_status,
-                                matched_req,
-                                tool_err,
-                                1 if ev.degraded else 0,
-                                item.byte_offset,
-                                item.byte_length,
-                            )
-                        )
-                    conn.executemany(
-                        """
-                        INSERT INTO events_index (
-                            execution_id, event_id, sequence, timestamp, monotonic_time_ns,
-                            direction, kind, method, jsonrpc_id_type, jsonrpc_id_text,
-                            observed_trace_id, observed_parent_span_id,
-                            synthetic_execution_trace_id, correlation_status,
-                            matched_request_event_id, tool_is_error, degraded,
-                            jsonl_byte_offset, jsonl_byte_length
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        event_rows,
-                    )
 
-                if corruptions:
-                    corr_rows = [
+                conn.executemany(
+                    """
+                    INSERT INTO events_index (
+                        execution_id, event_id, sequence, timestamp, monotonic_time_ns,
+                        direction, kind, method, jsonrpc_id_type, jsonrpc_id_text,
+                        observed_trace_id, observed_parent_span_id,
+                        synthetic_execution_trace_id, correlation_status,
+                        matched_request_event_id, tool_is_error, degraded,
+                        jsonl_byte_offset, jsonl_byte_length
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    event_rows(),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO execution_corruptions (
+                        execution_id, line_number, byte_offset, byte_length,
+                        issue_kind, excerpt_sha256, details, detected_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
                         (
                             clean_id,
                             c.line_number,
@@ -688,21 +684,15 @@ class SQLiteMetadataStore:
                             now_iso,
                         )
                         for c in corruptions
-                    ]
-                    conn.executemany(
-                        """
-                        INSERT INTO execution_corruptions (
-                            execution_id, line_number, byte_offset, byte_length,
-                            issue_kind, excerpt_sha256, details, detected_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        corr_rows,
-                    )
+                    ),
+                )
                 conn.commit()
-            except sqlite3.Error as exc:
+            except BaseException as exc:
                 with suppress(sqlite3.Error):
                     conn.rollback()
-                raise _translate_sqlite_error(exc, context="replace_execution_index") from exc
+                if isinstance(exc, sqlite3.Error):
+                    raise _translate_sqlite_error(exc, context="replace_execution_index") from exc
+                raise
 
     def mark_missing_jsonl(self, execution_id: str) -> None:
         """Flag an indexed execution whose directory/JSONL log disappeared on disk."""
@@ -862,6 +852,38 @@ class SQLiteMetadataStore:
             conn = self._conn_or_init()
             rows = conn.execute(sql, params).fetchall()
         return tuple(_row_to_event(r) for r in rows)
+
+    def _has_indexed_corruptions(self, execution_id: str) -> bool:
+        clean_id = validate_execution_id(execution_id)
+        with self._lock:
+            conn = self._conn_or_init()
+            row = conn.execute(
+                "SELECT 1 FROM execution_corruptions WHERE execution_id = ? LIMIT 1",
+                (clean_id,),
+            ).fetchone()
+        return row is not None
+
+    def _matches_event_index(self, execution_id: str, expected: Iterable[IndexedEventRow]) -> bool:
+        """Compare every indexed row in sequence order with its verified JSONL projection."""
+        clean_id = validate_execution_id(execution_id)
+        with self._lock:
+            conn = self._conn_or_init()
+            with closing(
+                conn.execute(
+                    "SELECT * FROM events_index WHERE execution_id = ? ORDER BY sequence",
+                    (clean_id,),
+                )
+            ) as cursor:
+                for expected_row in expected:
+                    actual = cursor.fetchone()
+                    if actual is None:
+                        return False
+                    try:
+                        if _row_to_event(actual) != expected_row:
+                            return False
+                    except ValueError:
+                        return False
+                return cursor.fetchone() is None
 
     def get_corruptions(self, execution_id: str) -> tuple[CorruptRecordReport, ...]:
         """Return persisted corruption reports indexed for ``execution_id``."""

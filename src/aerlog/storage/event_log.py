@@ -7,12 +7,12 @@ import hashlib
 import json
 import os
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Generic, Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -265,15 +265,24 @@ class IndexedLogEvent:
     byte_length: int
 
 
+class _LogEventsView(Protocol):
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int, /) -> IndexedLogEvent: ...
+    def __iter__(self) -> Iterator[IndexedLogEvent]: ...
+
+
+_LogEvents = TypeVar("_LogEvents", bound=_LogEventsView, covariant=True)
+
+
 @dataclass(frozen=True, slots=True)
-class JsonlReadResult:
+class _JsonlReadResult(Generic[_LogEvents]):
     """Complete audit result produced by reading or verifying ``events.jsonl``."""
 
     execution_id: str
     header: ExecutionHeader | None
     summary: ExecutionSummary | None
     manifest: ExecutionManifest | None
-    events: tuple[IndexedLogEvent, ...]
+    events: _LogEvents
     corruptions: tuple[CorruptRecordReport, ...]
     byte_size: int
     line_count: int
@@ -286,6 +295,11 @@ class JsonlReadResult:
     def has_corruptions(self) -> bool:
         """Return True if any corrupt, partial, or sequence-gapped line was detected."""
         return bool(self.corruptions)
+
+
+@dataclass(frozen=True, slots=True)
+class JsonlReadResult(_JsonlReadResult[tuple[IndexedLogEvent, ...]]):
+    """Complete audit result with a materialized tuple of events."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,24 +328,39 @@ def quarantine_tail_bytes(
     issue_kind: CorruptionIssueKind = "invalid_json",
 ) -> tuple[Path, Path, CorruptRecordReport]:
     """Safely persist exact corrupted tail bytes and companion JSON metadata with 0o600 mode."""
+    return _quarantine_tail_chunks(
+        exec_dir, execution_id, (raw_tail,), byte_offset, reason=reason, issue_kind=issue_kind
+    )
+
+
+def _quarantine_tail_chunks(
+    exec_dir: Path,
+    execution_id: str,
+    chunks: Iterable[bytes],
+    byte_offset: int,
+    *,
+    reason: str,
+    issue_kind: CorruptionIssueKind,
+) -> tuple[Path, Path, CorruptRecordReport]:
     _ensure_private_dir(exec_dir)
-    digest = hashlib.sha256(raw_tail).hexdigest()
-    short_hash = digest[:12]
-    quarantine_name = f"corrupted_tail_offset_{byte_offset}_{short_hash}.quarantine"
-    meta_name = f"corrupted_tail_offset_{byte_offset}_{short_hash}.meta.json"
-
-    quarantine_path = exec_dir / quarantine_name
-    meta_path = exec_dir / meta_name
-
-    tmp_q = exec_dir / f".{quarantine_name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    checksum = hashlib.sha256()
+    total_bytes = 0
+    tmp_q = exec_dir / f".quarantine.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     fd = os.open(tmp_q, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         try:
-            for _ in _write_chunks(fd, raw_tail, tmp_q):
-                pass
+            for chunk in chunks:
+                checksum.update(chunk)
+                total_bytes += len(chunk)
+                for _ in _write_chunks(fd, chunk, tmp_q):
+                    pass
             os.fsync(fd)
         finally:
             os.close(fd)
+        digest = checksum.hexdigest()
+        stem = f"corrupted_tail_offset_{byte_offset}_{digest[:12]}"
+        quarantine_path = exec_dir / f"{stem}.quarantine"
+        meta_path = exec_dir / f"{stem}.meta.json"
         os.replace(tmp_q, quarantine_path)
     finally:
         tmp_q.unlink(missing_ok=True)
@@ -340,7 +369,7 @@ def quarantine_tail_bytes(
     meta_payload = {
         "execution_id": execution_id,
         "byte_offset": byte_offset,
-        "byte_length": len(raw_tail),
+        "byte_length": total_bytes,
         "sha256": digest,
         "issue_kind": issue_kind,
         "reason": reason,
@@ -352,7 +381,7 @@ def quarantine_tail_bytes(
         execution_id=execution_id,
         line_number=-1,
         byte_offset=byte_offset,
-        byte_length=len(raw_tail),
+        byte_length=total_bytes,
         issue_kind=issue_kind,
         excerpt_sha256=digest,
         details=f"Quarantined tail: {reason}",
@@ -369,6 +398,29 @@ def _check_major_version(found: object, *, expected: str, label: str) -> None:
         raise UnsupportedSchemaVersionError(
             f"Unsupported {label} {found!r}; expected major version {expected_major}.x"
         )
+
+
+def _read_log_tail(path: Path) -> tuple[int, bytes]:
+    """Read only the bytes after the last newline, scanning backward in bounded blocks."""
+    if path.is_symlink():
+        raise StorageCorruptionError(f"Refusing symlink events log: {path}")
+    if not path.exists():
+        return 0, b""
+    with path.open("rb") as handle:
+        end = handle.seek(0, os.SEEK_END)
+        position = end
+        tail_blocks = []
+        while position:
+            count = min(65_536, position)
+            position -= count
+            handle.seek(position)
+            block = handle.read(count)
+            newline = block.rfind(b"\n")
+            if newline != -1:
+                tail_blocks.append(block[newline + 1 :])
+                return position + newline + 1, b"".join(reversed(tail_blocks))
+            tail_blocks.append(block)
+        return 0, b"".join(reversed(tail_blocks))
 
 
 def compute_file_sha256(path: Path) -> str:
@@ -495,13 +547,7 @@ class JsonlEventLogWriter:
 
         # Inspect pre-existing events file if present before opening
         if self._events_path.exists() and self._events_path.stat().st_size > 0:
-            file_bytes = self._events_path.read_bytes()
-            if not file_bytes.endswith(b"\n"):
-                last_nl = file_bytes.rfind(b"\n")
-                prefix_len = last_nl + 1 if last_nl >= 0 else 0
-                raw_tail = file_bytes[prefix_len:]
-                self._retained_tail_offset = prefix_len
-                self._retained_tail = raw_tail
+            self._retained_tail_offset, self._retained_tail = _read_log_tail(self._events_path)
 
             if self._seed_line_count is None or self._seed_last_sequence is None:
                 prior = JsonlEventLogReader(self._data_dir).read_execution(self._execution_id)
@@ -815,6 +861,9 @@ class JsonlEventLogWriter:
             os.close(fd)
 
 
+_ReadResult = TypeVar("_ReadResult", bound=_JsonlReadResult[_LogEventsView])
+
+
 class JsonlEventLogReader:
     """Integrity-aware reader for per-execution ``events.jsonl`` and companion JSON files."""
 
@@ -932,7 +981,28 @@ class JsonlEventLogReader:
         strict: bool = False,
         verify_checksums: bool = True,
     ) -> JsonlReadResult:
-        """Scan ``events.jsonl`` completely, preserving valid events and reporting corruptions."""
+        """Scan the complete log and return a tuple of verified events."""
+        events: list[IndexedLogEvent] = []
+        return self._scan_execution(
+            execution_id,
+            strict=strict,
+            verify_checksums=verify_checksums,
+            add_event=events.append,
+            finish_events=lambda: tuple(events),
+            make_result=JsonlReadResult,
+        )
+
+    def _scan_execution(
+        self,
+        execution_id: str,
+        *,
+        strict: bool,
+        verify_checksums: bool,
+        add_event: Callable[[IndexedLogEvent], None],
+        finish_events: Callable[[], _LogEventsView],
+        make_result: Callable[..., _ReadResult],
+    ) -> _ReadResult:
+        """Verify the same evidence using the caller's choice of event storage."""
         clean_id = validate_execution_id(execution_id)
         exec_dir = resolve_execution_dir(self._data_dir, clean_id)
         events_path = exec_dir / EVENTS_FILE_NAME
@@ -940,7 +1010,7 @@ class JsonlEventLogReader:
             raise StorageCorruptionError(f"Refusing symlink events log: {events_path}")
         header, summary, manifest = self.read_metadata(clean_id)
 
-        valid_events: list[IndexedLogEvent] = []
+        saw_valid_event = False
         corruptions: list[CorruptRecordReport] = []
         file_digest = hashlib.sha256()
         last_seq = 0
@@ -1009,7 +1079,8 @@ class JsonlEventLogReader:
                     last_seq = max(last_seq, decoded.sequence)
                     if decoded.kind == "execution_finished":
                         saw_finished_event = True
-                    valid_events.append(
+                    saw_valid_event = True
+                    add_event(
                         IndexedLogEvent(
                             event=decoded,
                             line_number=line_no,
@@ -1022,14 +1093,14 @@ class JsonlEventLogReader:
         unclean_shutdown = (
             summary is None
             or (manifest is not None and manifest.status == "recording")
-            or (bool(valid_events) and not saw_finished_event)
+            or (saw_valid_event and not saw_finished_event)
         )
-        return JsonlReadResult(
+        return make_result(
             execution_id=clean_id,
             header=header,
             summary=summary,
             manifest=manifest,
-            events=tuple(valid_events),
+            events=finish_events(),
             corruptions=tuple(corruptions),
             byte_size=total_bytes,
             line_count=line_count,
