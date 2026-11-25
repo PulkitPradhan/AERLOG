@@ -79,6 +79,7 @@ def test_sqlite_migrations_wal_and_sidecar_permissions_0o600(tmp_path: Path) -> 
 def test_rejects_database_with_newer_unknown_schema_version(tmp_path: Path) -> None:
     """Opening an existing database with a higher user_version fails explicitly."""
     db_path = tmp_path / "aerlog.db"
+    db_path.touch(mode=0o600)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA user_version = 999")
     conn.close()

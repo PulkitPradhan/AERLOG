@@ -821,6 +821,27 @@ SQLite stores a rebuildable projection. Indexed event queries use SQLite to loca
 
 Paths follow XDG Base Directory conventions (`$XDG_DATA_HOME/aerlog`, `$XDG_CONFIG_HOME/aerlog`) and are overridable via `--data-dir`, `--config`, or `$AERLOG_CONFIG`.
 
+#### Local SQLite storage
+
+AERLOG checks the configured pathname before opening SQLite. The data
+directory and the immediate parent of a custom database path must be real
+directories owned by the current user with mode `0700`. A custom database path
+must be inside the data directory. Ancestors must be real directories owned by
+root or the current user, with write access limited to the owner. A root-owned
+sticky directory such as `/tmp` can be an ancestor when the directories beneath
+it meet the ownership and mode rules. AERLOG refuses symlinks and `..` components
+in the database path.
+
+The database and any existing `-wal`, `-shm`, and `-journal` files must be
+single-link regular files owned by the current user with mode `0600`. SQLite
+uses the private main database mode when creating sidecars.
+
+SQLite opens files by pathname after these checks. A process with write access
+to the validated directory tree can change its entries between validation and
+SQLite's use. On supported local Linux storage, the trust boundary includes root
+and processes running under AERLOG's user account. Capture and execution lock
+management also assume a trusted data directory.
+
 ### D. Durability and Recovery
 
 Capture persistence on local Linux storage is best effort. The defaults are
@@ -1417,7 +1438,7 @@ AERLOG observes potentially sensitive payloads and launches local server subproc
 | Malformed frames, oversized messages, OOM | [`FrameAccumulator`](src/aerlog/protocol/framing.py) fail-closed limit (`max_frame_bytes=16 MiB`), `STDERR_LINE_MAX_BUFFER_BYTES` (`256 KiB`), bounded capture queues (`block`/`spill`/`mark_incomplete`) | Very fast producers under `block` policy slow proxy forwarding to avoid silent memory drops. |
 | Child process / orphan leakage | Subprocesses spawn with `start_new_session=True`; shutdown escalates `SIGTERM` -> `SIGKILL` to the process group (`os.killpg`) | Requires Linux/POSIX process groups; native Windows job objects are unsupported. |
 | Untrusted / forged cassettes & annotation spoofing | SHA-256 integrity seal, `CassetteMatcher` dynamic safety re-classification ignoring forged `side_effect_class`, `_extract_tool_annotations` restricted to `tools/list`, default `unsafe_tool_policy="block"`, `--mode live` blocked (exit `1`) | Opting into `--allow-mutating` allows serving recorded mutating-tool responses in offline cassette mode (audit warning logged). |
-| Symlink & path-traversal local attacks | `0o600`/`0o700` artifacts/dirs, `O_NOFOLLOW` spool/log opens, `is_symlink()` refusal across logs/spools/cassettes/fixtures/config, strict UUID validation on `execution_id` | Protects local XDG storage against symlink redirection under the current user's account. |
+| Symlink & path-traversal local attacks | `0o600`/`0o700` artifacts/dirs, `O_NOFOLLOW` spool/log opens, SQLite pathname and permission checks, `is_symlink()` refusal across logs/spools/cassettes/fixtures/config, strict UUID validation on `execution_id` | The storage checks assume a trusted local data directory. [Local SQLite storage](#local-sqlite-storage) |
 | Terminal / Rich markup injection | `_render_to_str` configures `Console(..., markup=False, highlight=False)` so stored `[...]` strings render literally | Assumes standard UTF-8 terminal output. |
 
 ## Trust Model

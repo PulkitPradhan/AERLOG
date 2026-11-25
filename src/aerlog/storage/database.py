@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Sequence
@@ -37,6 +39,84 @@ from aerlog.storage.migrations import LATEST_DB_SCHEMA_VERSION, apply_migrations
 
 DB_FILE_NAME = "aerlog.db"
 SqliteSynchronousMode = Literal["NORMAL", "FULL"]
+
+
+def _ensure_trusted_sqlite_parent(data_dir: Path, parent: Path, uid: int) -> None:
+    """Inspect each directory before descending into it or creating its child."""
+    for directory in (*reversed(parent.parents), parent):
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            # A cooperating first run may have already created this directory.
+            with suppress(FileExistsError):
+                directory.mkdir(mode=0o700)
+            metadata = directory.lstat()
+
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise StorageWriteError(f"SQLite path component must be a real directory: {directory}")
+        if directory in (data_dir, parent):
+            if metadata.st_uid != uid or mode != 0o700:
+                raise StorageWriteError(
+                    f"SQLite directory {directory} must be user-owned with mode 0700"
+                )
+        else:
+            # A root-owned sticky ancestor protects each root- or user-owned child.
+            root_sticky = metadata.st_uid == 0 and mode & stat.S_ISVTX
+            if metadata.st_uid not in (0, uid) or (mode & 0o022 and not root_sticky):
+                raise StorageWriteError(f"Untrusted SQLite directory ancestor: {directory}")
+
+
+def _validate_sqlite_file(path: Path, uid: int) -> bool:
+    """Return whether a private regular database or sidecar entry already exists."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != uid
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise StorageWriteError(
+            f"SQLite file must be a user-owned, single-link regular file with mode 0600: {path}"
+        )
+    return True
+
+
+def _prepare_sqlite_storage(data_dir: Path, db_path: Path) -> None:
+    """Check a persistent database path and reserve a private main file on first run."""
+    if (
+        db_path.anchor != "/"
+        or ".." in db_path.parts
+        or not db_path.parent.is_relative_to(data_dir)
+    ):
+        raise StorageWriteError(f"SQLite database must be inside the data directory: {db_path}")
+
+    uid = os.geteuid()
+    try:
+        _ensure_trusted_sqlite_parent(data_dir, db_path.parent, uid)
+        db_exists = _validate_sqlite_file(db_path, uid)
+        for suffix in ("-wal", "-shm", "-journal"):
+            _validate_sqlite_file(db_path.with_name(db_path.name + suffix), uid)
+        if not db_exists:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                fd = os.open(db_path, flags, 0o600)
+            except FileExistsError:
+                _validate_sqlite_file(db_path, uid)
+            else:
+                try:
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+    except StorageWriteError:
+        raise
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            raise StorageDiskFullError(f"Disk full while preparing SQLite storage: {exc}") from exc
+        raise StorageWriteError(f"Failed to prepare SQLite storage: {exc}") from exc
 
 
 def _is_transient_sqlite_lock_error(exc: sqlite3.Error) -> bool:
@@ -169,35 +249,20 @@ class SQLiteMetadataStore:
         """Whether a SQLite connection is currently active."""
         return self._conn is not None
 
-    def _restrict_sqlite_files(self) -> None:
-        """Apply ``0o600`` to ``aerlog.db`` and any SQLite ``-wal`` / ``-shm`` sidecars."""
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(f"{self._db_path}{suffix}")
-            if candidate.exists():
-                with suppress(OSError):
-                    os.chmod(candidate, 0o600)
-
     def _connect_locked(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
 
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._db_path.parent, 0o700)
-        if not self._db_path.exists():
-            fd = os.open(self._db_path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                os.chmod(fd, 0o600)
-            finally:
-                os.close(fd)
-        else:
-            os.chmod(self._db_path, 0o600)
-
+        data_dir = self._data_dir.absolute()
+        db_path = self._db_path.absolute()
         max_attempts = 5
         backoffs = (0.02, 0.04, 0.08, 0.16)
 
         for attempt in range(max_attempts):
+            # SQLite derives new sidecar modes from the private main database.
+            _prepare_sqlite_storage(data_dir, db_path)
             conn = sqlite3.connect(
-                str(self._db_path),
+                str(db_path),
                 timeout=self._busy_timeout_ms / 1000.0,
                 isolation_level=None,
                 check_same_thread=False,
@@ -211,24 +276,21 @@ class SQLiteMetadataStore:
                 apply_migrations(conn)
             except sqlite3.Error as exc:
                 conn.close()
-                self._restrict_sqlite_files()
                 if _is_transient_sqlite_lock_error(exc) and attempt < max_attempts - 1:
                     time.sleep(backoffs[attempt])
                     continue
                 raise
             except Exception:
                 conn.close()
-                self._restrict_sqlite_files()
                 raise
 
             self._conn = conn
-            self._restrict_sqlite_files()
             return conn
 
         raise StorageWriteError("Failed to initialize SQLite connection after retry exhaustion")
 
     def initialize(self) -> int:
-        """Open connection, configure WAL/permissions, apply migrations, and return version."""
+        """Validate private storage, open a WAL connection, and return the migrated version."""
         with self._lock:
             self._connect_locked()
             return LATEST_DB_SCHEMA_VERSION
@@ -246,7 +308,6 @@ class SQLiteMetadataStore:
                     self._conn.close()
                 finally:
                     self._conn = None
-                self._restrict_sqlite_files()
 
     def compact(self) -> None:
         """Run ``WAL`` truncation checkpoint and ``VACUUM``, preserving ``0o600`` modes."""
@@ -257,8 +318,6 @@ class SQLiteMetadataStore:
                 conn.execute("VACUUM")
             except sqlite3.Error as exc:
                 raise _translate_sqlite_error(exc, context="compacting database") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def insert_execution_start(self, header: ExecutionHeader) -> None:
         """Insert or update the initial `'recording'` execution catalog entry."""
@@ -310,8 +369,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="insert_execution_start") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def insert_event_slices(
         self,
@@ -395,8 +452,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="insert_event_slices") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def update_execution_finish(
         self,
@@ -472,8 +527,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="update_execution_finish") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def replace_execution_index(
         self,
@@ -650,8 +703,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="replace_execution_index") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def mark_missing_jsonl(self, execution_id: str) -> None:
         """Flag an indexed execution whose directory/JSONL log disappeared on disk."""
@@ -673,8 +724,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="mark_missing_jsonl") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def delete_executions(self, execution_ids: Sequence[str]) -> int:
         """Delete specified executions cleanly from SQLite (with ON DELETE CASCADE)."""
@@ -700,8 +749,6 @@ class SQLiteMetadataStore:
                 with suppress(sqlite3.Error):
                     conn.rollback()
                 raise _translate_sqlite_error(exc, context="delete_executions") from exc
-            finally:
-                self._restrict_sqlite_files()
 
     def get_execution_row(self, execution_id: str) -> IndexedExecutionRow | None:
         """Fetch one execution metadata row from SQLite."""
