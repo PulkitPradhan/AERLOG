@@ -1,4 +1,5 @@
 """Run the smoke test with Unix-domain sockets only, preserving file ownership."""
+
 import ctypes
 import errno
 import os
@@ -21,7 +22,10 @@ def main() -> None:
     library.seccomp_init.restype = ctypes.c_void_p
     library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
     library.seccomp_rule_add_array.argtypes = [
-        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint,
         ctypes.POINTER(ArgumentComparison),
     ]
     library.seccomp_load.argtypes = [ctypes.c_void_p]
