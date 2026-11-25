@@ -42,6 +42,8 @@ MatchOutcomeKind = Literal[
     "cancellation_matched",
     "cancellation_target_missing",
     "notification_ignored",
+    "handshake_matched",
+    "handshake_mismatch",
     "unsupported_notification",
 ]
 
@@ -64,6 +66,7 @@ class ReplayDivergence(BaseModel):
         "cancellation_target_missing",
         "id_mismatch",
         "unconsumed_recorded_interactions",
+        "handshake_mismatch",
         "unsupported_notification",
     ]
     severity: Literal["info", "warning", "error"]
@@ -195,6 +198,12 @@ class CassetteMatcher:
         self._client_slots: tuple[CassetteInteraction, ...] = tuple(
             item for item in cassette.interactions if item.origin_direction == "client_to_server"
         )
+        self._handshakes = sorted(
+            n.sequence
+            for n in cassette.standalone_notifications
+            if n.direction == "client_to_server" and n.method == "notifications/initialized"
+        )
+        self._matched_handshakes = 0
         self._tool_annotations: dict[str, dict[str, Any]] = {}
         for item in cassette.interactions:
             if item.method != "tools/list" or not isinstance(item.response_result, Mapping):
@@ -230,6 +239,10 @@ class CassetteMatcher:
     def consumed_indices(self) -> frozenset[int]:
         """Set of ``interaction_index`` slots already consumed in this replay session."""
         return frozenset(self._consumed_indices)
+
+    @property
+    def remaining_handshakes(self) -> int:
+        return len(self._handshakes) - self._matched_handshakes
 
     def unconsumed_client_interactions(self) -> tuple[CassetteInteraction, ...]:
         """Return client-to-server cassette interactions not yet replayed."""
@@ -758,9 +771,29 @@ class CassetteMatcher:
         step_index = self._step_counter
         self._step_counter += 1
 
-        if method != "notifications/initialized" and (
-            method != "notifications/cancelled" or not self._cassette.cancellations
-        ):
+        if method == "notifications/initialized":
+            if self.remaining_handshakes:
+                sequence = self._handshakes[self._matched_handshakes]
+                if all(
+                    (slot.request_sequence < sequence)
+                    == (slot.interaction_index in self._consumed_indices)
+                    for slot in self._client_slots
+                ):
+                    self._matched_handshakes += 1
+                    return MatchDecision(matched=True, outcome_kind="handshake_matched")
+            return MatchDecision(
+                matched=False,
+                outcome_kind="handshake_mismatch",
+                diverged=True,
+                divergence=ReplayDivergence(
+                    kind="handshake_mismatch",
+                    severity="error",
+                    method=method,
+                    step_index=step_index,
+                    message="Initialized notification is extra or out of recorded request order.",
+                ),
+            )
+        if method != "notifications/cancelled" or not self._cassette.cancellations:
             return MatchDecision(
                 matched=False,
                 outcome_kind="unsupported_notification",
@@ -774,71 +807,64 @@ class CassetteMatcher:
                 ),
             )
 
-        if method == "notifications/cancelled":
-            raw_target = params.get("requestId") if isinstance(params, Mapping) else None
-            target_type, target_val = classify_jsonrpc_id({"id": raw_target})
-            seen_idx = self._seen_request_keys.get((target_type, repr(target_val)))
-            if seen_idx is not None:
-                target_slot = next(
-                    (s for s in self._client_slots if s.interaction_index == seen_idx),
-                    None,
-                )
-                return MatchDecision(
-                    matched=True,
-                    outcome_kind="cancellation_matched",
-                    interaction=target_slot,
-                    diverged=False,
-                )
+        raw_target = params.get("requestId") if isinstance(params, Mapping) else None
+        target_type, target_val = classify_jsonrpc_id({"id": raw_target})
+        seen_idx = self._seen_request_keys.get((target_type, repr(target_val)))
+        if seen_idx is not None:
+            target_slot = next(
+                (s for s in self._client_slots if s.interaction_index == seen_idx),
+                None,
+            )
+            return MatchDecision(
+                matched=True,
+                outcome_kind="cancellation_matched",
+                interaction=target_slot,
+                diverged=False,
+            )
 
-            # In self-replay or recorded cancellations, also match recorded cancellation entries.
-            rec_cancel: CassetteNotification | None = next(
+        # In self-replay or recorded cancellations, also match recorded cancellation entries.
+        rec_cancel: CassetteNotification | None = next(
+            (
+                c
+                for c in self._cassette.cancellations
+                if c.target_interaction_index is not None
+                and isinstance(c.params, Mapping)
+                and c.params.get("requestId") == raw_target
+            ),
+            None,
+        )
+        if rec_cancel is not None and rec_cancel.target_interaction_index is not None:
+            target_slot = next(
                 (
-                    c
-                    for c in self._cassette.cancellations
-                    if c.target_interaction_index is not None
-                    and isinstance(c.params, Mapping)
-                    and c.params.get("requestId") == raw_target
+                    s
+                    for s in self._client_slots
+                    if s.interaction_index == rec_cancel.target_interaction_index
                 ),
                 None,
             )
-            if rec_cancel is not None and rec_cancel.target_interaction_index is not None:
-                target_slot = next(
-                    (
-                        s
-                        for s in self._client_slots
-                        if s.interaction_index == rec_cancel.target_interaction_index
-                    ),
-                    None,
-                )
-                return MatchDecision(
-                    matched=True,
-                    outcome_kind="cancellation_matched",
-                    interaction=target_slot,
-                    diverged=False,
-                )
-
-            safe_target = self._safe_value(raw_target)
-            div = ReplayDivergence(
-                kind="cancellation_target_missing",
-                severity="warning",
-                step_index=step_index,
-                method=self._safe_text(method),
-                message=(
-                    f"Cancellation notification targeted unknown/unseen requestId={safe_target!r}."
-                ),
-                details={"target_request_id": safe_target},
-            )
             return MatchDecision(
-                matched=False,
-                outcome_kind="cancellation_target_missing",
-                diverged=True,
-                divergence=div,
+                matched=True,
+                outcome_kind="cancellation_matched",
+                interaction=target_slot,
+                diverged=False,
             )
 
+        safe_target = self._safe_value(raw_target)
+        div = ReplayDivergence(
+            kind="cancellation_target_missing",
+            severity="warning",
+            step_index=step_index,
+            method=self._safe_text(method),
+            message=(
+                f"Cancellation notification targeted unknown/unseen requestId={safe_target!r}."
+            ),
+            details={"target_request_id": safe_target},
+        )
         return MatchDecision(
-            matched=True,
-            outcome_kind="notification_ignored",
-            diverged=False,
+            matched=False,
+            outcome_kind="cancellation_target_missing",
+            diverged=True,
+            divergence=div,
         )
 
 

@@ -668,9 +668,33 @@ async def test_serve_cassette_stdio_offline_roundtrip_and_report_permissions(
     assert (t0 + timedelta(seconds=1)) > t0
 
 
+def _record_protocol(messages: list[tuple[WireDirection, dict[str, Any]]]) -> JsonlReadResult:
+    now = datetime.now(UTC)
+    norm = EventNormalizer(
+        execution_id=new_execution_id(), started_at=now, monotonic_start_ns=0, command=("server",)
+    )
+    events = list(norm.start_execution())
+    for n, (direction, message) in enumerate(messages, start=1):
+        events.extend(
+            _wire(norm, ts=now, mono_ns=n, direction=direction, obj={"jsonrpc": "2.0", **message})
+        )
+    finish, summary = norm.finalize_execution(
+        ended_at=now, monotonic_end_ns=100, termination_reason="completed", exit_code=0
+    )
+    events.append(finish)
+    return read_recording(events, norm, summary)
+
+
 @pytest.mark.parametrize(
     ("messages", "finding"),
     [
+        (
+            [
+                ("client_to_server", {"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+                ("server_to_client", {"jsonrpc": "1.0", "id": 1, "result": {}}),
+            ],
+            "unsupported_jsonrpc_version",
+        ),
         ([("client_to_server", {"id": 1, "method": "ping"})], "exchange_without_reliable_response"),
         (
             [("server_to_client", {"method": "notifications/message"})],
@@ -715,20 +739,7 @@ async def test_serve_cassette_stdio_offline_roundtrip_and_report_permissions(
 def test_unsupported_recorded_behavior_needs_consent_at_build_and_run(
     messages: list[tuple[WireDirection, dict[str, Any]]], finding: str
 ) -> None:
-    now = datetime.now(UTC)
-    norm = EventNormalizer(
-        execution_id=new_execution_id(), started_at=now, monotonic_start_ns=0, command=("server",)
-    )
-    events = list(norm.start_execution())
-    for n, (direction, message) in enumerate(messages, start=1):
-        events.extend(
-            _wire(norm, ts=now, mono_ns=n, direction=direction, obj={"jsonrpc": "2.0", **message})
-        )
-    finish, summary = norm.finalize_execution(
-        ended_at=now, monotonic_end_ns=100, termination_reason="completed", exit_code=0
-    )
-    events.append(finish)
-    result = read_recording(events, norm, summary)
+    result = _record_protocol(messages)
     with pytest.raises(CassetteValidationError, match=finding):
         build_cassette_from_read_result(result)
     cassette = build_cassette_from_read_result(result, allow_lossy=True)
@@ -817,3 +828,141 @@ def test_verified_gap_marker_overrides_clean_metadata() -> None:
         build_cassette_from_read_result(result)
     cassette = build_cassette_from_read_result(result, allow_lossy=True)
     assert replay_cassette(cassette, allow_lossy=True).fidelity_findings["capture_gap"] == 1
+
+
+async def test_reversed_responses_require_lossy_consent() -> None:
+    result = _record_protocol(
+        [
+            ("client_to_server", {"id": 1, "method": "ping"}),
+            ("client_to_server", {"id": 2, "method": "tools/list"}),
+            ("server_to_client", {"id": 2, "result": {"tools": []}}),
+            ("server_to_client", {"id": 1, "result": {}}),
+        ]
+    )
+    with pytest.raises(CassetteValidationError, match="server_frame_order_changed"):
+        build_cassette_from_read_result(result)
+    cassette = build_cassette_from_read_result(result, allow_lossy=True)
+    with pytest.raises(CassetteValidationError, match="server_frame_order_changed"):
+        replay_cassette(cassette)
+    report = replay_cassette(cassette, allow_lossy=True)
+    assert report.fidelity_findings == {"server_frame_order_changed": 1}
+    assert report.overall_status == "matched_with_warnings"
+
+    requests = iter(
+        [
+            _wire_bytes({"jsonrpc": "2.0", "method": "ping", "id": 1}),
+            _wire_bytes({"jsonrpc": "2.0", "method": "tools/list", "id": 2}),
+            b"",
+        ]
+    )
+    written: list[bytes] = []
+    with pytest.raises(CassetteValidationError, match="server_frame_order_changed"):
+        await serve_cassette_stdio(
+            cassette, read_chunk=requests.__next__, write_frame=written.append
+        )
+    assert written == []
+    served = await serve_cassette_stdio(
+        cassette, allow_lossy=True, read_chunk=requests.__next__, write_frame=written.append
+    )
+    assert [json.loads(frame)["id"] for frame in written] == [1, 2]
+    assert served.fidelity_findings == report.fidelity_findings
+    assert served.overall_status == "matched_with_warnings"
+
+
+def test_initialized_handshake_checked_once_in_recorded_position() -> None:
+    initialize = {"id": 1, "method": "initialize"}
+    initialized = {"method": "notifications/initialized"}
+    ping = {"id": 2, "method": "ping"}
+    cassette = build_cassette_from_read_result(
+        _record_protocol(
+            [
+                ("client_to_server", initialize),
+                ("server_to_client", {"id": 1, "result": {}}),
+                ("client_to_server", initialized),
+                ("client_to_server", ping),
+                ("server_to_client", {"id": 2, "result": {}}),
+            ]
+        )
+    )
+    for mode in ("strict", "tolerant"):
+        assert replay_cassette(cassette, match_mode=mode).overall_status == "clean_match"
+        for messages in [
+            [initialize, ping],
+            [initialized, initialized, initialize, ping],
+            [initialize, initialized, initialized, ping],
+            [initialize, ping, initialized],
+        ]:
+            report = replay_cassette(cassette, match_mode=mode, incoming_messages=messages)
+            assert report.overall_status == "diverged"
+            assert any("handshake" in divergence.kind for divergence in report.divergences)
+
+
+@pytest.mark.parametrize(
+    "raw_evidence", ["header", "summary", "start_payload", "event_mode", "payload_mode"]
+)
+def test_conflicting_raw_evidence_requires_independent_consent(raw_evidence: str) -> None:
+    from dataclasses import replace
+
+    from aerlog.export.regression import (
+        UnredactedExportRefusedError,
+        build_regression_fixture_from_read_result,
+    )
+
+    result = _record_protocol(
+        [
+            ("client_to_server", {"id": 1, "method": "ping"}),
+            ("server_to_client", {"id": 1, "result": {"example": "placeholder"}}),
+        ]
+    )
+    assert result.summary is not None
+    if raw_evidence == "header":
+        from aerlog.events.models import ExecutionHeader
+
+        header = ExecutionHeader(
+            execution_id=result.execution_id,
+            started_at=result.summary.started_at,
+            monotonic_start_ns=0,
+            command=("server",),
+            redaction_mode="explicit_unredacted",
+        )
+        result = replace(result, header=header)
+    elif raw_evidence == "summary":
+        result = replace(
+            result,
+            summary=result.summary.model_copy(update={"redaction_mode": "explicit_unredacted"}),
+        )
+    else:
+        rows = list(result.events)
+        idx = 0 if raw_evidence == "start_payload" else 2
+        event = rows[idx].event
+        if raw_evidence == "start_payload":
+            changes = {
+                "payload": event.payload.model_copy(
+                    update={"redaction_mode": "explicit_unredacted"}
+                )
+            }
+        else:
+            update = (
+                {"mode": "explicit_unredacted"}
+                if raw_evidence == "event_mode"
+                else {"payload_mode": "full_unredacted"}
+            )
+            changes = {"redaction": event.redaction.model_copy(update=update)}
+        rows[idx] = replace(rows[idx], event=event.model_copy(update=changes))
+        result = replace(result, events=tuple(rows))
+
+    with pytest.raises(UnredactedCassetteRefusedError):
+        build_cassette_from_read_result(result, allow_lossy=True)
+    cassette = build_cassette_from_read_result(
+        result, allow_lossy=True, allow_unredacted_cassette=True
+    )
+    assert (
+        cassette.replay_evidence
+        and cassette.replay_evidence.findings["inconsistent_redaction_modes"] == 1
+    )
+    assert cassette.contains_raw_secrets
+    assert cassette.source_redaction_mode == "explicit_unredacted"
+    with pytest.raises(UnredactedExportRefusedError):
+        build_regression_fixture_from_read_result(result, allow_lossy=True, sanitize=False)
+    fixture, sanitized = build_regression_fixture_from_read_result(result, allow_lossy=True)
+    assert sanitized and not fixture.contains_raw_secrets

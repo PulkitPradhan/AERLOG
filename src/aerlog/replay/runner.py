@@ -272,6 +272,18 @@ class CassetteReplaySession:
 
     def finalize(self) -> ReplayReport:
         """Finalize counters, record unconsumed cassette slots, and build :class:`ReplayReport`."""
+        if self._matcher.remaining_handshakes:
+            self._divergences.append(
+                ReplayDivergence(
+                    kind="handshake_mismatch",
+                    severity="error",
+                    step_index=None,
+                    method="notifications/initialized",
+                    message="A recorded initialized notification is missing or out of order.",
+                    details={"missing": self._matcher.remaining_handshakes},
+                )
+            )
+            self._diverged_count += 1
         unconsumed = self._matcher.unconsumed_client_interactions()
         if unconsumed:
             self._divergences.append(

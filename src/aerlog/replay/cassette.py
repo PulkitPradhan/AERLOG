@@ -17,6 +17,7 @@ from aerlog.analysis.timeline import ExecutionTimeline, reconstruct_timeline
 from aerlog.events.models import (
     ExecutionEvent,
     ExecutionFinishedPayload,
+    ExecutionStartedPayload,
     JsonRpcErrorPayload,
     JsonRpcIdValue,
     JsonRpcNotificationPayload,
@@ -135,6 +136,7 @@ class CassetteInteraction(BaseModel):
 
 SourceFinding = Literal[
     "record_checksums_unverified",
+    "inconsistent_redaction_modes",
     "manifest_missing",
     "manifest_not_clean",
     "manifest_mismatch",
@@ -151,6 +153,7 @@ SourceFinding = Literal[
     "wire_anomaly",
     "duplicate_response",
     "invalid_wire_message",
+    "unsupported_jsonrpc_version",
     "missing_newline",
     "invalid_utf8",
     "invalid_json",
@@ -299,8 +302,28 @@ def _contains_redacted_placeholders(events: Sequence[ExecutionEvent]) -> bool:
     return False
 
 
-def _source_evidence(result: JsonlReadResult, timeline: ExecutionTimeline) -> ReplayEvidence:
+def _source_redaction_modes(result: JsonlReadResult) -> set[str]:
+    modes: set[str] = {
+        metadata.redaction_mode
+        for metadata in (result.header, result.summary)
+        if metadata is not None
+    }
+    for row in result.events:
+        event = row.event
+        modes.add(event.redaction.mode)
+        if event.redaction.payload_mode == "full_unredacted":
+            modes.add("explicit_unredacted")
+        if isinstance(event.payload, ExecutionStartedPayload):
+            modes.add(event.payload.redaction_mode)
+    return modes
+
+
+def _source_evidence(
+    result: JsonlReadResult, timeline: ExecutionTimeline, redaction_modes: set[str]
+) -> ReplayEvidence:
     findings: Counter[SourceFinding] = Counter()
+    if len(redaction_modes) > 1:
+        findings["inconsistent_redaction_modes"] = 1
     if not result.checksums_verified:
         findings["record_checksums_unverified"] += 1
     manifest = result.manifest
@@ -339,6 +362,10 @@ def _source_evidence(result: JsonlReadResult, timeline: ExecutionTimeline) -> Re
         findings[issue.issue_kind] += 1
     for row in result.events:
         event = row.event
+        if event.kind.startswith("jsonrpc_") and (
+            event.wire is None or event.wire.jsonrpc_version != "2.0"
+        ):
+            findings["unsupported_jsonrpc_version"] += 1
         if (
             isinstance(event.payload, (JsonRpcNotificationPayload, JsonRpcRequestPayload))
             and not event.payload.method
@@ -390,7 +417,18 @@ def fidelity_findings(cassette: Cassette) -> dict[str, int]:
     for notif in cassette.standalone_notifications:
         if (notif.direction, notif.method) != ("client_to_server", "notifications/initialized"):
             findings["standalone_notification_omitted"] += 1
+    last_server_sequence = 0
     for slot in cassette.interactions:
+        # The stdio server emits a slot's notifications and response as one batch.
+        if slot.origin_direction == "client_to_server" and slot.response_sequence is not None:
+            emitted_sequences = [
+                n.sequence for n in slot.emitted_notifications if n.direction == "server_to_client"
+            ]
+            emitted_sequences.append(slot.response_sequence)
+            for sequence in emitted_sequences:
+                if sequence <= last_server_sequence:
+                    findings["server_frame_order_changed"] += 1
+                last_server_sequence = max(last_server_sequence, sequence)
         if slot.origin_direction == "server_to_client":
             findings["server_request_omitted"] += 1
         if slot.cancel_notified and not cassette.cancellations:
@@ -447,7 +485,12 @@ def build_cassette_from_read_result(
             f"Refusing cassette build under strict integrity: {first.details}"
         )
     timeline = reconstruct_timeline(read_result)
-    redaction_mode = timeline.redaction_mode
+    redaction_modes = _source_redaction_modes(read_result)
+    redaction_mode = (
+        "explicit_unredacted"
+        if "explicit_unredacted" in redaction_modes
+        else timeline.redaction_mode
+    )
     if redaction_mode == "explicit_unredacted" and not allow_unredacted_cassette:
         raise UnredactedCassetteRefusedError(
             f"Recording {read_result.execution_id!r} uses redaction_mode='explicit_unredacted'; "
@@ -637,7 +680,7 @@ def build_cassette_from_read_result(
     resolved_id = (
         validate_execution_id(cassette_id) if cassette_id is not None else str(uuid.uuid4())
     )
-    evidence = _source_evidence(read_result, timeline)
+    evidence = _source_evidence(read_result, timeline, redaction_modes)
     if strict_integrity and "manifest_mismatch" in evidence.findings:
         raise StorageCorruptionError("Scanned recording does not match its finalized manifest")
     unsigned = Cassette(

@@ -1044,7 +1044,14 @@ def run_regression_fixture(
             decision = matcher.match_notification(method=step.method, params=step.params)
             if decision.diverged:
                 diverged_count += 1
-            if decision.outcome_kind != step.expected.expected_outcome_kind:
+            expected_kind = step.expected.expected_outcome_kind
+            if (
+                step.method == "notifications/initialized"
+                and expected_kind == "notification_ignored"
+            ):
+                # Older fixtures used this label for a successful handshake.
+                expected_kind = "handshake_matched"
+            if decision.outcome_kind != expected_kind:
                 step_failed = True
                 failures.append(
                     StepVerificationFailure(
@@ -1066,6 +1073,15 @@ def run_regression_fixture(
         if not step_failed:
             passed_steps += 1
 
+    if matcher.remaining_handshakes:
+        failures.append(
+            StepVerificationFailure(
+                field="missing_initialized_notifications",
+                expected=0,
+                actual=matcher.remaining_handshakes,
+                message="Fixture steps omitted a recorded initialized notification.",
+            )
+        )
     unconsumed = matcher.unconsumed_client_interactions()
     if unconsumed and override_cassette is not None:
         failures.append(
