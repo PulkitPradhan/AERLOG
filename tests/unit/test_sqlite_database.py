@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from aerlog.capture import CaptureConfig, CapturePipeline, RawWireFrameInput
+from aerlog.capture.normalizer import EventNormalizer
 from aerlog.capture.redaction import REDACTED_MARKER
 from aerlog.config import load_config
 from aerlog.events import (
@@ -318,39 +319,24 @@ def test_retention_defaults_dry_run_protects_recording_and_requires_confirm(
         eid = new_execution_id()
         ids.append(eid)
         ts = base + timedelta(days=idx)
-        hdr = ExecutionHeader(
-            execution_id=eid,
-            started_at=ts,
-            monotonic_start_ns=100,
-            command=("server.py",),
+        normalizer = EventNormalizer(
+            execution_id=eid, started_at=ts, monotonic_start_ns=100, command=("server.py",)
         )
+        hdr = normalizer.build_header()
         writer = JsonlEventLogWriter(data_dir, eid)
         writer.open(hdr)
-        ev = ExecutionEvent(
-            execution_id=eid,
-            sequence=1,
-            timestamp=ts,
-            monotonic_time_ns=100,
-            direction="proxy",
-            kind="jsonrpc_request",
-            payload=JsonRpcRequestPayload(id=1, id_type="int", method="ping"),
-        )
-        slices = writer.append_events([ev])
         store.insert_execution_start(hdr)
-        store.insert_event_slices(eid, slices)
+        store.insert_event_slices(eid, writer.append_events(normalizer.start_execution()))
 
         if completeness != "recording":
-            smry = ExecutionSummary(
-                execution_id=eid,
-                started_at=ts,
+            terminal, smry = normalizer.finalize_execution(
                 ended_at=ts,
-                duration_ns=10,
-                command=("server.py",),
-                capture_completeness=completeness,  # type: ignore[arg-type]
+                monotonic_end_ns=110,
                 termination_reason="completed",
                 exit_code=0,
-                total_events=1,
+                force_incomplete=completeness == "incomplete",
             )
+            store.insert_event_slices(eid, writer.append_events([terminal]))
             manifest = writer.finalize(smry)
             store.update_execution_finish(
                 smry,
@@ -397,3 +383,54 @@ def test_retention_defaults_dry_run_protects_recording_and_requires_confirm(
 
     compact_database(store)
     store.close()
+
+
+def test_retention_preserves_quarantined_recording_after_interrupted_index_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    eid = new_execution_id()
+    now = datetime.now(UTC)
+    normalizer = EventNormalizer(
+        execution_id=eid, started_at=now, monotonic_start_ns=1, command=("test",)
+    )
+    writer = JsonlEventLogWriter(tmp_path, eid)
+    writer.open(normalizer.build_header())
+    try:
+        startup = normalizer.start_execution()
+        terminal, summary = normalizer.finalize_execution(
+            ended_at=now, monotonic_end_ns=2, termination_reason="clean_exit", exit_code=0
+        )
+        writer.append_events([*startup, terminal])
+        writer.finalize(summary)
+    finally:
+        writer.close()
+
+    repo = RecordingRepository(tmp_path)
+    try:
+        repo.reconcile_execution(eid)
+        with writer.events_path.open("ab") as handle:
+            handle.write(b"damaged tail")
+
+        def interrupt_index(**kwargs: object) -> None:
+            raise OSError("index replacement interrupted")
+
+        with monkeypatch.context() as fault:
+            fault.setattr(repo.store, "replace_execution_index", interrupt_index)
+            with pytest.raises(OSError, match="index replacement interrupted"):
+                repo.recover_tail(eid)
+        row = repo.store.get_execution_row(eid)
+        assert row is not None and row.capture_completeness == "complete"
+        (quarantine,) = writer.execution_dir.glob("*.quarantine")
+        policy = RetentionPolicy(max_executions=0, dry_run=False, protect_incomplete=True)
+        report = apply_retention(tmp_path, repo.store, policy, confirm=True)
+        assert report.protected_execution_ids == (eid,)
+        assert not report.deleted_execution_ids and report.reclaimed_bytes == 0
+        assert quarantine.read_bytes() == b"damaged tail"
+        assert repo.store.get_execution_row(eid) == row
+
+        override = RetentionPolicy(max_executions=0, dry_run=False, protect_incomplete=False)
+        assert apply_retention(
+            tmp_path, repo.store, override, confirm=True
+        ).deleted_execution_ids == (eid,)
+    finally:
+        repo.close()

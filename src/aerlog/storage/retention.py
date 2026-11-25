@@ -15,9 +15,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aerlog.storage.database import IndexedExecutionRow, SQLiteMetadataStore
-from aerlog.storage.event_log import resolve_execution_dir
-from aerlog.storage.exceptions import ExecutionBusyError
+from aerlog.storage.event_log import JsonlEventLogReader, resolve_execution_dir
+from aerlog.storage.exceptions import ExecutionBusyError, StorageError
 from aerlog.storage.ownership import ExecutionOwnership
+from aerlog.storage.repositories import recording_completeness
 
 _PROTECTED_INCOMPLETE_STATUSES = frozenset({"incomplete", "spilled", "degraded", "corrupted"})
 
@@ -74,6 +75,19 @@ def _is_protected(row: IndexedExecutionRow, *, protect_incomplete: bool) -> bool
     return protect_incomplete and row.capture_completeness in _PROTECTED_INCOMPLETE_STATUSES
 
 
+def _verified_complete(reader: JsonlEventLogReader, execution_id: str) -> bool:
+    """A stale completed index row cannot authorize destroying incomplete evidence."""
+    try:
+        read = reader.read_execution(execution_id, strict=True, verify_checksums=True)
+        return (
+            read.manifest is not None
+            and read.manifest.execution_id == execution_id
+            and recording_completeness(read) == "complete"
+        )
+    except (StorageError, OSError):
+        return False
+
+
 def apply_retention(
     data_dir: Path,
     store: SQLiteMetadataStore,
@@ -101,6 +115,7 @@ def apply_retention(
             compacted=False,
         )
 
+    reader = JsonlEventLogReader(data_dir)
     deleted: list[str] = []
     busy: list[str] = []
     reclaimed_bytes = 0
@@ -111,6 +126,9 @@ def apply_retention(
                 if eid in protected and eid not in protected_ids:
                     protected_ids.append(eid)
                 if eid not in candidates:
+                    continue
+                if policy.protect_incomplete and not _verified_complete(reader, eid):
+                    protected_ids.append(eid)
                     continue
                 exec_dir = resolve_execution_dir(data_dir, eid)
                 if exec_dir.exists():
