@@ -870,9 +870,9 @@ async def test_reversed_responses_require_lossy_consent() -> None:
 
 
 def test_initialized_handshake_checked_once_in_recorded_position() -> None:
-    initialize = {"id": 1, "method": "initialize"}
-    initialized = {"method": "notifications/initialized"}
-    ping = {"id": 2, "method": "ping"}
+    initialize: dict[str, object] = {"id": 1, "method": "initialize"}
+    initialized: dict[str, object] = {"method": "notifications/initialized"}
+    ping: dict[str, object] = {"id": 2, "method": "ping"}
     cassette = build_cassette_from_read_result(
         _record_protocol(
             [
@@ -914,13 +914,14 @@ def test_conflicting_raw_evidence_requires_independent_consent(raw_evidence: str
             ("server_to_client", {"id": 1, "result": {"example": "placeholder"}}),
         ]
     )
-    assert result.summary is not None
+    summary = result.summary
+    assert summary is not None
     if raw_evidence == "header":
         from aerlog.events.models import ExecutionHeader
 
         header = ExecutionHeader(
             execution_id=result.execution_id,
-            started_at=result.summary.started_at,
+            started_at=summary.started_at,
             monotonic_start_ns=0,
             command=("server",),
             redaction_mode="explicit_unredacted",
@@ -929,12 +930,13 @@ def test_conflicting_raw_evidence_requires_independent_consent(raw_evidence: str
     elif raw_evidence == "summary":
         result = replace(
             result,
-            summary=result.summary.model_copy(update={"redaction_mode": "explicit_unredacted"}),
+            summary=summary.model_copy(update={"redaction_mode": "explicit_unredacted"}),
         )
     else:
         rows = list(result.events)
         idx = 0 if raw_evidence == "start_payload" else 2
         event = rows[idx].event
+        changes: dict[str, object]
         if raw_evidence == "start_payload":
             changes = {
                 "payload": event.payload.model_copy(
