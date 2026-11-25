@@ -1272,6 +1272,53 @@ aerlog export test "$EXEC_OK" --data-dir "$DATA_DIR" --output "$DATA_DIR/exporte
 aerlog export verify "$DATA_DIR/exported_tests"/exec_*.fixture.json --data-dir "$DATA_DIR"
 ```
 
+### Gemini CLI quickstart
+
+From the AERLOG checkout on Linux, run this command with AERLOG installed in
+`.venv` and Gemini CLI 0.66.0 already installed through mise. The harness also
+requires Node, Python 3, and libseccomp. Pass an absolute path as the first
+argument if your AERLOG executable is elsewhere.
+
+```bash
+bash examples/gemini-smoke/run.sh
+```
+
+The harness builds a disposable project with this [Gemini CLI MCP settings
+structure](https://geminicli.com/docs/tools/mcp-server/). Replace the example
+paths if you use it in your own trusted project's `.gemini/settings.json` or
+in `~/.gemini/settings.json`.
+
+```json
+{
+  "mcpServers": {
+    "aerlog-quickstart": {
+      "command": "/absolute/path/to/aerlog",
+      "args": [
+        "run",
+        "--",
+        "python3",
+        "/absolute/path/to/AERLOG/examples/quickstart_server.py"
+      ]
+    }
+  }
+}
+```
+
+`gemini mcp list` verifies the project's settings and the stdio connection
+through AERLOG. The separate core invocation uses the installed Gemini 0.66.0
+MCP client and tool registry to discover `echo_message` and `slow_lookup`,
+call `echo_message`, and check for `echo:hello-gemini`. The harness checks the
+recorded AERLOG timelines for the ping, tool discovery, and echo responses.
+Gemini's stdio cleanup can terminate the proxy with SIGTERM. AERLOG marks that
+capture incomplete even when the observed request and response are present.
+
+The harness uses an empty home and environment, a disposable trusted project,
+and a Linux seccomp filter that allows Unix-domain sockets and blocks IP socket
+creation. It preserves host UIDs so AERLOG can verify SQLite directory
+ownership. This smoke exercises the installed MCP plumbing directly.
+Interactive approval, authentication, and model-driven invocation are outside
+its coverage. The bundled core import is pinned to the installed 0.66.0 layout.
+
 ### Configuration Reference
 
 AERLOG loads configuration strictly (unknown keys fail validation) in the following precedence order:
