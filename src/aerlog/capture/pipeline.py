@@ -741,10 +741,11 @@ class CapturePipeline:
             if self._summary is not None:
                 return self._summary
 
-            try:
-                if not self._started:
-                    await self.start()
+            # Startup handles its own cleanup once it has reserved the sink.
+            if not self._started:
+                await self.start()
 
+            try:
                 if termination_reason in {
                     "aborted",
                     "cancelled",

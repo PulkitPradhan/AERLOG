@@ -475,7 +475,10 @@ async def test_standalone_sink_owns_until_worker_close_and_refuses_recording_reu
         pass
 
 
-async def test_competing_pipeline_cannot_close_the_first_pipelines_sink(tmp_path: Path) -> None:
+@pytest.mark.parametrize("entry_point", ["start", "finalize"])
+async def test_competing_pipeline_cannot_close_the_winning_sink(
+    tmp_path: Path, entry_point: str
+) -> None:
     eid = new_execution_id()
     sink = PersistentCaptureSink(tmp_path)
     first = CapturePipeline(sink, command=("first",), execution_id=eid)
@@ -483,7 +486,10 @@ async def test_competing_pipeline_cannot_close_the_first_pipelines_sink(tmp_path
     try:
         await first.start()
         with pytest.raises(ExecutionBusyError):
-            await second.start()
+            if entry_point == "start":
+                await second.start()
+            else:
+                await second.finalize(termination_reason="clean_exit", exit_code=0)
         assert not sink.closed
         with pytest.raises(ExecutionBusyError):
             ExecutionOwnership.acquire(tmp_path, eid)
