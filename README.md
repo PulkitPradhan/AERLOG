@@ -969,6 +969,10 @@ In cassette mode:
 
 Cassette replay must not connect to the original MCP server.
 
+Cassette creation, offline replay (including `--serve`), and regression export and verification require complete source evidence by default. AERLOG checks the recording's per-record checksums, finalized manifest, file digest and counters, capture gaps, and request/response pairing. Supported exchanges include client requests such as `server/discover`, the client `notifications/initialized` handshake, and server progress notifications linked to a request.
+
+Use `--allow-lossy` on each operation to accept an incomplete recording, unknown evidence in a legacy cassette, or omitted behavior such as standalone server notifications, server-initiated requests, or cancellation timing. The CLI identifies the findings on stderr. Cassette summaries and replay reports expose them in `fidelity_findings`. A lossy replay cannot report a clean match. Artifact digest verification and the separate unsafe-tool and unredacted-export controls still apply. With `--serve`, stdout carries only protocol frames.
+
 ### Live Replay
 
 Live replay is a separate, higher-risk capability.

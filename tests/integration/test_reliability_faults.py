@@ -294,18 +294,22 @@ def test_aerlog_run_spill_dir_isolation_and_full_spool_recovery_chain(
         diag = diagnose_execution(repo, exec_id, strict_integrity=True)
         assert diag.execution_id == exec_id
 
-        cassette = build_cassette_from_execution(repo, exec_id, strict_integrity=True)
-        rep = replay_cassette(cassette)
-        assert rep.overall_status == "clean_match"
+        cassette = build_cassette_from_execution(
+            repo, exec_id, strict_integrity=True, allow_lossy=True
+        )
+        rep = replay_cassette(cassette, allow_lossy=True)
+        assert rep.overall_status == "matched_with_warnings"
+        assert rep.fidelity_findings["incomplete_capture"] == 1
 
         bundle = export_execution_regression_test(
             repo,
             exec_id,
             output_dir=tmp_path / "exported_spill",
             slug="spill_recovered",
+            allow_lossy=True,
         )
         loaded = load_regression_fixture(bundle.fixture_path)
-        assert run_regression_fixture(loaded).passed is True
+        assert run_regression_fixture(loaded, allow_lossy=True).passed is True
     finally:
         repo.close()
 
@@ -416,6 +420,7 @@ def test_live_aerlog_run_signal_termination_orphan_cleanup_and_recovery(
     exp_res = _run_aerlog_cli(
         "export",
         "test",
+        "--allow-lossy",
         exec_id,
         "--allow-mutating",
         "--missing-policy",
@@ -433,6 +438,7 @@ def test_live_aerlog_run_signal_termination_orphan_cleanup_and_recovery(
     ver_res = _run_aerlog_cli(
         "export",
         "verify",
+        "--allow-lossy",
         json.loads(exp_res.stdout)["fixture_path"],
         "--json",
         env=env,
@@ -489,7 +495,7 @@ def test_server_crash_and_corrupted_jsonl_tail_across_all_subsystems(
     with events_path.open("ab") as fh:
         fh.write(b'{"partial_corrupt_tail": \xff\xfe')
 
-    # Default tolerant CLI inspection/timeline/diagnostics/export warn cleanly and preserve prefix.
+    # Read-only inspection, timeline, and diagnostics report the damaged recording.
     for cmd in (
         ("inspect", exec_id),
         ("timeline", exec_id),
@@ -507,10 +513,11 @@ def test_server_crash_and_corrupted_jsonl_tail_across_all_subsystems(
     assert "REQUEST_WITHOUT_RESPONSE" in diag_codes
     assert "UNEXPECTED_PROCESS_EXIT" in diag_codes
 
-    # Export & verify succeed cleanly over the verified prefix, while --strict rejects corruption.
+    # Explicit lossy export and verification use the surviving evidence.
     exp_ok = _run_aerlog_cli(
         "export",
         "test",
+        "--allow-lossy",
         exec_id,
         "--output",
         str(tmp_path / "crash_exp"),
@@ -527,6 +534,7 @@ def test_server_crash_and_corrupted_jsonl_tail_across_all_subsystems(
     ver_ok = _run_aerlog_cli(
         "export",
         "verify",
+        "--allow-lossy",
         json.loads(exp_ok.stdout)["fixture_path"],
         "--json",
         env=env,

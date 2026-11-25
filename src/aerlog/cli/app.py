@@ -70,7 +70,6 @@ from aerlog.export import (
 )
 from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES
 from aerlog.proxy.stdio_proxy import ProxyConfig, ProxyResult, run_stdio_proxy
-from aerlog.replay.cassette import fidelity_findings, require_replay_evidence
 from aerlog.replay import (
     Cassette,
     CassetteValidationError,
@@ -87,6 +86,7 @@ from aerlog.replay import (
     save_replay_report,
     serve_cassette_stdio,
 )
+from aerlog.replay.cassette import ReplayEvidenceError, fidelity_findings, require_replay_evidence
 from aerlog.storage.database import DB_FILE_NAME, IndexedExecutionRow
 from aerlog.storage.event_log import (
     FsyncPolicy,
@@ -196,6 +196,8 @@ def _storage_error_hint(exc: BaseException) -> str | None:
         return "Verify '--data-dir' permissions, path, and free disk space."
     if isinstance(exc, (ExportError, RegressionFixtureValidationError)):
         return "Verify the output directory is writable and check '--name' and source files."
+    if isinstance(exc, ReplayEvidenceError):
+        return "Use a complete recording or explicitly accept the reported omissions."
     if isinstance(exc, CassetteValidationError):
         return "Ensure the cassette file was not modified after creation."
     return None
@@ -1228,7 +1230,13 @@ def cassette_create(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option(
+            "--allow-lossy",
+            help="Accept reported replay evidence gaps and omitted protocol behavior.",
+        ),
+    ] = False,
 ) -> None:
     """Create a hashed offline replay cassette from an existing execution recording."""
     _, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
@@ -1416,7 +1424,13 @@ def replay_recorded_execution(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option(
+            "--allow-lossy",
+            help="Accept reported replay evidence gaps and omitted protocol behavior.",
+        ),
+    ] = False,
 ) -> None:
     """Replay recorded MCP interactions safely offline from a cassette without real tools."""
     try:
@@ -1479,7 +1493,7 @@ def replay_recorded_execution(
                     execution_id,
                     strict_integrity=strict,
                     allow_unredacted_cassette=allow_unredacted_cassette,
-            allow_lossy=allow_lossy,
+                    allow_lossy=allow_lossy,
                 )
             finally:
                 repo.close()
@@ -1515,7 +1529,7 @@ def replay_recorded_execution(
                     unsafe_tool_policy=unsafe_policy,
                     missing_response_policy=effective_missing,
                     require_exact_id=exact_id,
-            allow_lossy=allow_lossy,
+                    allow_lossy=allow_lossy,
                 )
             )
         except ReplayInterruptedError as exc:
@@ -1690,7 +1704,13 @@ def export_test(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option(
+            "--allow-lossy",
+            help="Accept reported replay evidence gaps and omitted protocol behavior.",
+        ),
+    ] = False,
 ) -> None:
     """Export an offline SHA-256-sealed regression fixture and pytest module."""
     cfg, resolved_dir = _resolve_runtime(config_path=config, data_dir=data_dir)
@@ -1830,7 +1850,13 @@ def export_verify(
         Path | None,
         typer.Option("--config", help="Path to AERLOG configuration TOML file."),
     ] = None,
-    allow_lossy: Annotated[bool, typer.Option("--allow-lossy", help="Accept reported replay evidence gaps and omitted protocol behavior.")] = False,
+    allow_lossy: Annotated[
+        bool,
+        typer.Option(
+            "--allow-lossy",
+            help="Accept reported replay evidence gaps and omitted protocol behavior.",
+        ),
+    ] = False,
 ) -> None:
     """Verify an exported regression fixture offline cleanly or against a replacement cassette."""
     resolved_dir: Path | None = None
@@ -1845,7 +1871,9 @@ def export_verify(
             candidate = Path(cassette).expanduser()
             target: str | Path = candidate if candidate.is_file() else cassette
             override_cassette, override_path = load_cassette(target, data_dir=resolved_dir)
-        result = run_regression_fixture(fixture, override_cassette=override_cassette, allow_lossy=allow_lossy)
+        result = run_regression_fixture(
+            fixture, override_cassette=override_cassette, allow_lossy=allow_lossy
+        )
         _warn_lossy(result.fidelity_findings)
     except (
         RegressionFixtureValidationError,

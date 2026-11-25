@@ -44,6 +44,7 @@ from aerlog.replay import ERR_CASSETTE_MISSING_RESPONSE, build_cassette_from_rea
 from aerlog.storage.event_log import IndexedLogEvent, JsonlReadResult
 from aerlog.storage.repositories import RecordingRepository
 from aerlog.storage.sink import PersistentCaptureSink
+from tests.replay_recording import read_recording
 
 
 def _wire_bytes(obj: dict[str, Any]) -> bytes:
@@ -75,6 +76,8 @@ def _make_read_result(
     summary: Any,
     exec_id: str,
 ) -> JsonlReadResult:
+    if norm is not None:
+        return read_recording(events, norm, summary)
     indexed = tuple(
         IndexedLogEvent(event=ev, line_number=idx + 1, byte_offset=idx * 100, byte_length=90)
         for idx, ev in enumerate(events)
@@ -403,7 +406,7 @@ def test_export_missing_response_policies_and_timestamp_anchors() -> None:
 
     unclean_res = _make_read_result(events, norm=norm, summary=None, exec_id=exec_id)
     err_fixture, _ = build_regression_fixture_from_read_result(
-        unclean_res, unsafe_tool_policy="warn", missing_response_policy="error"
+        unclean_res, allow_lossy=True, unsafe_tool_policy="warn", missing_response_policy="error"
     )
     assert err_fixture.timestamp_anchor_basis == "started_at"
     assert err_fixture.anchored_at == t0
@@ -411,18 +414,18 @@ def test_export_missing_response_policies_and_timestamp_anchors() -> None:
     assert err_fixture.steps[0].expected.expected_outcome_kind == "missing_recorded_response"
     assert err_fixture.steps[0].expected.expected_response_kind == "jsonrpc_error"
     assert err_fixture.steps[0].expected.expected_error_code == ERR_CASSETTE_MISSING_RESPONSE
-    assert run_regression_fixture(err_fixture).passed is True
+    assert run_regression_fixture(err_fixture, allow_lossy=True).passed is True
 
     omit_fixture, _ = build_regression_fixture_from_read_result(
-        unclean_res, unsafe_tool_policy="warn", missing_response_policy="omit"
+        unclean_res, allow_lossy=True, unsafe_tool_policy="warn", missing_response_policy="omit"
     )
     assert omit_fixture.steps[0].expected.expected_outcome_kind == "missing_recorded_response"
     assert omit_fixture.steps[0].expected.expected_response_kind is None
     assert omit_fixture.steps[0].expected.expected_error_code is None
-    assert run_regression_fixture(omit_fixture).passed is True
+    assert run_regression_fixture(omit_fixture, allow_lossy=True).passed is True
 
     empty_res = _make_read_result([], norm=None, summary=None, exec_id=exec_id)
-    epoch_fixture, _ = build_regression_fixture_from_read_result(empty_res)
+    epoch_fixture, _ = build_regression_fixture_from_read_result(empty_res, allow_lossy=True)
     assert epoch_fixture.timestamp_anchor_basis == "epoch_fallback"
     assert epoch_fixture.anchored_at == EPOCH_ANCHOR_TIMESTAMP
 
@@ -817,7 +820,7 @@ def test_fixture_integrity_schema_extra_fields_and_slug_validation(tmp_path: Pat
     """Tampered digests, unknown schema versions, extra keys, and unsafe slugs fail closed."""
     exec_id = new_execution_id()
     empty_res = _make_read_result([], norm=None, summary=None, exec_id=exec_id)
-    fixture, _ = build_regression_fixture_from_read_result(empty_res)
+    fixture, _ = build_regression_fixture_from_read_result(empty_res, allow_lossy=True)
 
     payload = json.loads(fixture.model_dump_json())
     tampered = dict(payload)

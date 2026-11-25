@@ -408,3 +408,59 @@ async def test_cli_replay_serve_with_real_mcp_sdk_client(tmp_path: Path) -> None
         assert rep_call.content[0].text == "echo:offline-replay"
 
     assert replayed_progress == orig_progress
+
+
+async def test_damaged_recording_refusal_and_lossy_serve_channels(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    exec_id = await _record_mixed_safety_execution(data_dir)
+    events_file = data_dir / EXECUTIONS_DIR_NAME / exec_id / EVENTS_FILE_NAME
+    with events_file.open("ab") as handle:
+        handle.write(b"partial record")
+    cassette = tmp_path / "damaged.cassette.json"
+    create = ("cassette", "create", exec_id, "--data-dir", str(data_dir), "-o", str(cassette))
+    refused = _run_aerlog_cli(*create)
+    assert refused.returncode == 1 and not cassette.exists()
+    assert not refused.stdout and "manifest_mismatch" in refused.stderr
+    created = _run_aerlog_cli(*create, "--allow-lossy", "--json")
+    assert created.returncode == 0, created.stderr
+    assert json.loads(created.stdout)["fidelity_findings"]["missing_newline"] == 1
+    assert "missing_newline" in created.stderr
+    serve = (
+        "replay",
+        "--cassette",
+        str(cassette),
+        "--serve",
+        "--no-save-report",
+        "--data-dir",
+        str(data_dir),
+    )
+    refused = _run_aerlog_cli(*serve)
+    assert refused.returncode == 1 and not refused.stdout
+    assert "--allow-lossy" in refused.stderr
+    allowed = subprocess.run(
+        [_PYTHON, "-m", "aerlog", *serve, "--allow-lossy"],
+        input='{"jsonrpc":"2.0","id":4,"method":"missing"}\n',
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert [json.loads(line)["id"] for line in allowed.stdout.splitlines()] == [4]
+    assert "manifest_mismatch" in allowed.stderr
+
+
+async def test_intact_line_truncation_detected_by_finalized_manifest(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    exec_id = await _record_mixed_safety_execution(data_dir)
+    events_file = data_dir / EXECUTIONS_DIR_NAME / exec_id / EVENTS_FILE_NAME
+    records = events_file.read_bytes().splitlines(keepends=True)
+    events_file.write_bytes(b"".join(records[:-1]))
+    args = ("replay", exec_id, "--json", "--data-dir", str(data_dir))
+    refused = _run_aerlog_cli(*args)
+    assert refused.returncode == 1 and not refused.stdout
+    assert "manifest_mismatch" in refused.stderr and "finish_missing" in refused.stderr
+    opted_in = _run_aerlog_cli(*args, "--allow-lossy")
+    assert opted_in.returncode == 0
+    assert json.loads(opted_in.stdout)["fidelity_findings"]["manifest_mismatch"] == 1
+    strict = _run_aerlog_cli(*args, "--strict", "--allow-lossy")
+    assert strict.returncode == 1 and not strict.stdout

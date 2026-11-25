@@ -5,16 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from aerlog.analysis.timeline import reconstruct_timeline
+from aerlog.analysis.timeline import ExecutionTimeline, reconstruct_timeline
 from aerlog.events.models import (
     ExecutionEvent,
+    ExecutionFinishedPayload,
     JsonRpcErrorPayload,
     JsonRpcIdValue,
     JsonRpcNotificationPayload,
@@ -131,6 +133,48 @@ class CassetteInteraction(BaseModel):
     non_replayable_reason: str | None = None
 
 
+SourceFinding = Literal[
+    "record_checksums_unverified",
+    "manifest_missing",
+    "manifest_not_clean",
+    "manifest_mismatch",
+    "summary_missing",
+    "summary_mismatch",
+    "summary_records_loss",
+    "incomplete_summary",
+    "capture_gap",
+    "finish_records_loss",
+    "wire_payload_unavailable",
+    "ambiguous_correlation",
+    "finish_missing",
+    "orphan_response",
+    "wire_anomaly",
+    "duplicate_response",
+    "invalid_wire_message",
+    "missing_newline",
+    "invalid_utf8",
+    "invalid_json",
+    "invalid_record_envelope",
+    "checksum_mismatch",
+    "unsupported_schema_version",
+    "event_validation_failed",
+    "sequence_gap",
+]
+
+
+class ReplayEvidenceError(CassetteValidationError):
+    """Default replay refused because source or protocol evidence is insufficient."""
+
+
+class ReplayEvidence(BaseModel):
+    """Versioned source findings that cannot be reconstructed from a cassette's slots."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Literal[1]
+    findings: dict[SourceFinding, Annotated[int, Field(gt=0)]]
+
+
 class Cassette(BaseModel):
     """Self-contained, hashed, immutable offline replay cassette artifact."""
 
@@ -143,6 +187,9 @@ class Cassette(BaseModel):
     source_timeline_version: str
     source_capture_completeness: str
     source_redaction_mode: str
+    replay_evidence: ReplayEvidence | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     source_unclean_shutdown: bool = False
     source_has_corruptions: bool = False
     contains_raw_secrets: bool = False
@@ -252,10 +299,144 @@ def _contains_redacted_placeholders(events: Sequence[ExecutionEvent]) -> bool:
     return False
 
 
+def _source_evidence(result: JsonlReadResult, timeline: ExecutionTimeline) -> ReplayEvidence:
+    findings: Counter[SourceFinding] = Counter()
+    if not result.checksums_verified:
+        findings["record_checksums_unverified"] += 1
+    manifest = result.manifest
+    if manifest is None:
+        findings["manifest_missing"] += 1
+    else:
+        if manifest.status != "finalized" or manifest.corruption_count:
+            findings["manifest_not_clean"] += 1
+        if (
+            manifest.execution_id,
+            manifest.events_file_sha256,
+            manifest.byte_size,
+            manifest.line_count,
+            manifest.last_sequence,
+        ) != (
+            result.execution_id,
+            result.events_file_sha256,
+            result.byte_size,
+            result.line_count,
+            result.last_valid_sequence,
+        ):
+            findings["manifest_mismatch"] += 1
+    summary = result.summary
+    if summary is None:
+        findings["summary_missing"] += 1
+    else:
+        if summary.execution_id != result.execution_id or summary.total_events != len(
+            result.events
+        ):
+            findings["summary_mismatch"] += 1
+        if summary.capture_completeness != "complete":
+            findings["incomplete_summary"] += 1
+        if summary.dropped_events or summary.gap_count or summary.degraded_events:
+            findings["summary_records_loss"] += 1
+    for issue in result.corruptions:
+        findings[issue.issue_kind] += 1
+    for row in result.events:
+        event = row.event
+        if (
+            isinstance(event.payload, (JsonRpcNotificationPayload, JsonRpcRequestPayload))
+            and not event.payload.method
+        ):
+            findings["invalid_wire_message"] += 1
+        if event.kind == "capture_gap":
+            findings["capture_gap"] += 1
+        if isinstance(event.payload, ExecutionFinishedPayload) and (
+            event.payload.completeness != "complete"
+            or event.payload.dropped_events
+            or event.payload.degraded_events
+        ):
+            findings["finish_records_loss"] += 1
+        if event.kind.startswith("jsonrpc_") and event.redaction.payload_mode in {
+            "strict_hash_only",
+            "metadata_only",
+            "redaction_failed",
+        }:
+            findings["wire_payload_unavailable"] += 1
+        if event.correlation and event.correlation.status == "ambiguous_duplicate_id":
+            findings["ambiguous_correlation"] += 1
+    if not result.events or result.events[-1].event.kind != "execution_finished":
+        findings["finish_missing"] += 1
+    for span in timeline.spans:
+        if span.duplicate_response_count:
+            findings["duplicate_response"] += span.duplicate_response_count
+        if span.span_kind == "orphan_response":
+            findings["orphan_response"] += 1
+        if span.span_kind == "wire_anomaly":
+            findings["wire_anomaly"] += 1
+    return ReplayEvidence(version=1, findings=dict(findings))
+
+
+def fidelity_findings(cassette: Cassette) -> dict[str, int]:
+    """Describe evidence gaps and behaviors omitted by request/response replay."""
+    findings: Counter[str] = Counter()
+    if cassette.replay_evidence is None:
+        findings["legacy_evidence_unknown"] += 1
+    else:
+        findings.update(cassette.replay_evidence.findings)
+    if cassette.source_capture_completeness != "complete":
+        findings["incomplete_capture"] += 1
+    if cassette.source_unclean_shutdown:
+        findings["unclean_shutdown"] += 1
+    if cassette.source_has_corruptions:
+        findings["source_corruptions"] += 1
+    if cassette.cancellations:
+        findings["cancellation_timing_omitted"] += len(cassette.cancellations)
+    for notif in cassette.standalone_notifications:
+        if (notif.direction, notif.method) != ("client_to_server", "notifications/initialized"):
+            findings["standalone_notification_omitted"] += 1
+    for slot in cassette.interactions:
+        if slot.origin_direction == "server_to_client":
+            findings["server_request_omitted"] += 1
+        if slot.cancel_notified and not cassette.cancellations:
+            findings["cancellation_timing_omitted"] += 1
+        if (
+            slot.response_kind is None
+            or not slot.replayable
+            or slot.outcome
+            not in {
+                "ok",
+                "jsonrpc_error",
+                "tool_error",
+            }
+        ):
+            findings["exchange_without_reliable_response"] += 1
+        for notif in slot.emitted_notifications:
+            if not (
+                notif.direction == "server_to_client"
+                and notif.method == "notifications/progress"
+                and slot.origin_direction == "client_to_server"
+                and slot.response_sequence is not None
+                and slot.request_sequence < notif.sequence < slot.response_sequence
+                and notif.target_interaction_index == slot.interaction_index
+            ):
+                findings["unsupported_linked_notification"] += 1
+    return dict(sorted(findings.items()))
+
+
+def require_replay_evidence(cassette: Cassette, *, allow_lossy: bool) -> dict[str, int]:
+    """Verify the artifact and enforce the shared offline fidelity policy."""
+    verify_cassette_integrity(cassette)
+    findings = fidelity_findings(cassette)
+    if findings and not allow_lossy:
+        detail = ", ".join(f"{issue}={count}" for issue, count in findings.items())
+        raise ReplayEvidenceError(
+            f"Replay evidence is insufficient: {detail}. "
+            "Pass --allow-lossy to accept these omissions."
+        )
+    return findings
+
+
 def build_cassette_from_read_result(
     read_result: JsonlReadResult,
     *,
     strict_integrity: bool = False,
+    allow_lossy: bool = False,
     allow_unredacted_cassette: bool = False,
     cassette_id: str | None = None,
 ) -> Cassette:
@@ -456,11 +637,15 @@ def build_cassette_from_read_result(
     resolved_id = (
         validate_execution_id(cassette_id) if cassette_id is not None else str(uuid.uuid4())
     )
+    evidence = _source_evidence(read_result, timeline)
+    if strict_integrity and "manifest_mismatch" in evidence.findings:
+        raise StorageCorruptionError("Scanned recording does not match its finalized manifest")
     unsigned = Cassette(
         cassette_id=resolved_id,
         created_at=datetime.now(UTC),
         source_execution_id=read_result.execution_id,
         source_timeline_version=timeline.timeline_version,
+        replay_evidence=evidence,
         source_capture_completeness=timeline.capture_completeness,
         source_redaction_mode=redaction_mode,
         source_unclean_shutdown=timeline.unclean_shutdown,
@@ -473,7 +658,9 @@ def build_cassette_from_read_result(
         standalone_notifications=tuple(standalone_notifs),
         cancellations=tuple(cancellations),
     )
-    return seal_cassette_digest(unsigned)
+    cassette = seal_cassette_digest(unsigned)
+    require_replay_evidence(cassette, allow_lossy=allow_lossy)
+    return cassette
 
 
 def build_cassette_from_execution(
@@ -481,6 +668,7 @@ def build_cassette_from_execution(
     execution_id: str,
     *,
     strict_integrity: bool = False,
+    allow_lossy: bool = False,
     verify_checksums: bool = True,
     allow_unredacted_cassette: bool = False,
     cassette_id: str | None = None,
@@ -497,6 +685,7 @@ def build_cassette_from_execution(
         read_result,
         strict_integrity=strict_integrity,
         allow_unredacted_cassette=allow_unredacted_cassette,
+        allow_lossy=allow_lossy,
         cassette_id=cassette_id,
     )
 

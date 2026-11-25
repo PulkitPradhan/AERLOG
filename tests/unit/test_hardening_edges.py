@@ -49,11 +49,10 @@ from aerlog.replay import (
 from aerlog.storage.event_log import (
     EVENTS_FILE_NAME,
     EXECUTIONS_DIR_NAME,
-    IndexedLogEvent,
-    JsonlReadResult,
 )
 from aerlog.storage.exceptions import StorageCorruptionError
 from aerlog.storage.repositories import RecordingRepository
+from tests.replay_recording import read_recording
 
 
 def _wire_bytes(obj: dict[str, Any]) -> bytes:
@@ -224,22 +223,7 @@ def test_annotation_spoofing_and_untrusted_cassette_class_forgery_blocked() -> N
         ended_at=t0, monotonic_end_ns=3_000, termination_reason="completed", exit_code=0
     )
     events.append(fin)
-    read_res = JsonlReadResult(
-        execution_id=exec_id,
-        header=norm.build_header(),
-        summary=summary,
-        manifest=None,
-        events=tuple(
-            IndexedLogEvent(event=ev, line_number=i + 1, byte_offset=i * 100, byte_length=90)
-            for i, ev in enumerate(events)
-        ),
-        corruptions=(),
-        byte_size=1000,
-        line_count=len(events),
-        last_valid_sequence=len(events),
-        events_file_sha256="ab" * 32,
-        unclean_shutdown=False,
-    )
+    read_res = read_recording(events, norm, summary)
     cassette = build_cassette_from_read_result(read_res)
     sneaky_slot = cassette.interactions[1]
     assert sneaky_slot.side_effect_class == "unknown_unsafe"
@@ -325,22 +309,7 @@ def test_safety_classification_discover_roots_and_acronym_mutating_verbs() -> No
         ended_at=t0, monotonic_end_ns=10_000, termination_reason="completed", exit_code=0
     )
     evs.append(fin)
-    read_res = JsonlReadResult(
-        execution_id=exec_id,
-        header=norm.build_header(),
-        summary=summary,
-        manifest=None,
-        events=tuple(
-            IndexedLogEvent(event=ev, line_number=i + 1, byte_offset=i * 100, byte_length=90)
-            for i, ev in enumerate(evs)
-        ),
-        corruptions=(),
-        byte_size=1000,
-        line_count=len(evs),
-        last_valid_sequence=len(evs),
-        events_file_sha256="cd" * 32,
-        unclean_shutdown=False,
-    )
+    read_res = read_recording(evs, norm, summary)
     cassette = build_cassette_from_read_result(read_res)
     rep = replay_cassette(cassette, unsafe_tool_policy="block")
     assert rep.steps[0].method == "server/discover"

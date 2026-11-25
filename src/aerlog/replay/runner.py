@@ -18,7 +18,7 @@ from aerlog.events.models import classify_jsonrpc_id
 from aerlog.protocol.framing import DEFAULT_MAX_FRAME_BYTES, FrameAccumulator, FrameTooLargeError
 from aerlog.proxy.forwarding import WritableByteStream
 from aerlog.proxy.stdio_proxy import _OwnedStdinStream, open_stdin_stream, open_stdout_stream
-from aerlog.replay.cassette import Cassette, verify_cassette_integrity
+from aerlog.replay.cassette import Cassette
 from aerlog.replay.matcher import (
     CassetteMatcher,
     MatchOutcomeKind,
@@ -105,6 +105,7 @@ class ReplayReport(BaseModel):
     unsafe_tool_policy: UnsafeToolPolicy
     missing_response_policy: MissingResponsePolicy
     overall_status: ReplayOverallStatus
+    fidelity_findings: dict[str, int] = Field(default_factory=dict)
     total_steps: int = Field(ge=0)
     matched_count: int = Field(ge=0)
     diverged_count: int = Field(ge=0)
@@ -164,9 +165,9 @@ class CassetteReplaySession:
         unsafe_tool_policy: UnsafeToolPolicy = "block",
         missing_response_policy: MissingResponsePolicy = "error",
         require_exact_id: bool = False,
+        allow_lossy: bool = False,
         replay_id: str | None = None,
     ) -> None:
-        verify_cassette_integrity(cassette)
         self._cassette = cassette
         self._driver_mode: ReplayDriverMode = driver_mode
         self._match_mode: ReplayMatchMode = match_mode
@@ -181,6 +182,7 @@ class CassetteReplaySession:
             unsafe_tool_policy=unsafe_tool_policy,
             missing_response_policy=missing_response_policy,
             require_exact_id=require_exact_id,
+            allow_lossy=allow_lossy,
         )
         self._steps: list[ReplayStepOutcome] = []
         self._divergences: list[ReplayDivergence] = []
@@ -293,7 +295,7 @@ class CassetteReplaySession:
         overall_status: ReplayOverallStatus
         if self._diverged_count > 0 or self._blocked_count > 0 or self._unmatched_count > 0:
             overall_status = "diverged"
-        elif safety_warning_count > 0:
+        elif safety_warning_count > 0 or self._matcher.fidelity_findings:
             overall_status = "matched_with_warnings"
         else:
             overall_status = "clean_match"
@@ -311,6 +313,7 @@ class CassetteReplaySession:
             unsafe_tool_policy=self._unsafe_tool_policy,
             missing_response_policy=self._missing_response_policy,
             overall_status=overall_status,
+            fidelity_findings=self._matcher.fidelity_findings,
             total_steps=len(self._steps),
             matched_count=self._matched_count,
             diverged_count=self._diverged_count,
@@ -362,6 +365,7 @@ def replay_cassette(
     unsafe_tool_policy: UnsafeToolPolicy = "block",
     missing_response_policy: MissingResponsePolicy = "error",
     require_exact_id: bool = False,
+    allow_lossy: bool = False,
     incoming_messages: Sequence[Mapping[str, Any]] | None = None,
     replay_id: str | None = None,
 ) -> ReplayReport:
@@ -380,6 +384,7 @@ def replay_cassette(
         unsafe_tool_policy=unsafe_tool_policy,
         missing_response_policy=missing_response_policy,
         require_exact_id=require_exact_id,
+        allow_lossy=allow_lossy,
         replay_id=replay_id,
     )
     messages = _self_replay_messages(cassette) if incoming_messages is None else incoming_messages
@@ -400,6 +405,7 @@ async def serve_cassette_stdio(
     unsafe_tool_policy: UnsafeToolPolicy = "block",
     missing_response_policy: MissingResponsePolicy = "error",
     require_exact_id: bool = False,
+    allow_lossy: bool = False,
     read_chunk: Callable[[], bytes] | None = None,
     write_frame: Callable[[bytes], None] | None = None,
     replay_id: str | None = None,
@@ -422,6 +428,7 @@ async def serve_cassette_stdio(
         unsafe_tool_policy=unsafe_tool_policy,
         missing_response_policy=missing_response_policy,
         require_exact_id=require_exact_id,
+        allow_lossy=allow_lossy,
         replay_id=replay_id,
     )
 

@@ -34,7 +34,8 @@ from aerlog.replay import (
     save_replay_report,
     serve_cassette_stdio,
 )
-from aerlog.storage.event_log import IndexedLogEvent, JsonlReadResult
+from aerlog.storage.event_log import JsonlReadResult
+from tests.replay_recording import read_recording
 
 
 def _wire_bytes(obj: dict[str, Any]) -> bytes:
@@ -48,23 +49,7 @@ def _build_read_result(
     summary: Any,
     exec_id: str,
 ) -> JsonlReadResult:
-    indexed = tuple(
-        IndexedLogEvent(event=ev, line_number=idx + 1, byte_offset=idx * 100, byte_length=90)
-        for idx, ev in enumerate(events)
-    )
-    return JsonlReadResult(
-        execution_id=exec_id,
-        header=norm.build_header(),
-        summary=summary,
-        manifest=None,
-        events=indexed,
-        corruptions=(),
-        byte_size=len(events) * 100,
-        line_count=len(events),
-        last_valid_sequence=events[-1].sequence if events else 0,
-        events_file_sha256="ab" * 32,
-        unclean_shutdown=summary is None,
-    )
+    return read_recording(events, norm, summary)
 
 
 def _wire(
@@ -548,10 +533,10 @@ def test_replay_missing_recorded_responses_and_cancellations() -> None:
     )
     events.append(fin)
     cassette = build_cassette_from_read_result(
-        _build_read_result(events, norm=norm, summary=summary, exec_id=exec_id)
+        _build_read_result(events, norm=norm, summary=summary, exec_id=exec_id), allow_lossy=True
     )
 
-    err_report = replay_cassette(cassette, missing_response_policy="error")
+    err_report = replay_cassette(cassette, allow_lossy=True, missing_response_policy="error")
     assert err_report.missing_response_count == 2
     assert err_report.diverged_count == 2
     assert any(
@@ -559,7 +544,7 @@ def test_replay_missing_recorded_responses_and_cancellations() -> None:
         for s in err_report.steps
     )
 
-    matcher_err = CassetteMatcher(cassette, missing_response_policy="error")
+    matcher_err = CassetteMatcher(cassette, allow_lossy=True, missing_response_policy="error")
     d1 = matcher_err.match_request(
         method="ping", params=None, has_params=False, request_id=1, id_type="int"
     )
@@ -567,7 +552,7 @@ def test_replay_missing_recorded_responses_and_cancellations() -> None:
     assert d1.response_frame_obj is not None
     assert d1.response_frame_obj["error"]["code"] == ERR_CASSETTE_MISSING_RESPONSE
 
-    matcher_omit = CassetteMatcher(cassette, missing_response_policy="omit")
+    matcher_omit = CassetteMatcher(cassette, allow_lossy=True, missing_response_policy="omit")
     d2 = matcher_omit.match_request(
         method="ping", params=None, has_params=False, request_id=1, id_type="int"
     )
@@ -681,3 +666,154 @@ async def test_serve_cassette_stdio_offline_roundtrip_and_report_permissions(
     assert not (data_dir / "executions" / exec_id).exists()
     assert ERR_CASSETTE_UNSAFE_BLOCKED == -32010
     assert (t0 + timedelta(seconds=1)) > t0
+
+
+@pytest.mark.parametrize(
+    ("messages", "finding"),
+    [
+        ([("client_to_server", {"id": 1, "method": "ping"})], "exchange_without_reliable_response"),
+        (
+            [("server_to_client", {"method": "notifications/message"})],
+            "standalone_notification_omitted",
+        ),
+        ([("client_to_server", {"method": "vendor/notify"})], "standalone_notification_omitted"),
+        (
+            [
+                (
+                    "client_to_server",
+                    {"method": "notifications/cancelled", "params": {"requestId": 1}},
+                )
+            ],
+            "cancellation_timing_omitted",
+        ),
+        (
+            [
+                ("server_to_client", {"id": 5, "method": "roots/list"}),
+                ("client_to_server", {"id": 5, "result": {"roots": []}}),
+            ],
+            "server_request_omitted",
+        ),
+        ([("server_to_client", {"id": 99, "result": {}})], "orphan_response"),
+        (
+            [
+                ("client_to_server", {"id": 1, "method": "ping"}),
+                ("client_to_server", {"id": 1, "method": "tools/list"}),
+                ("server_to_client", {"id": 1, "result": {}}),
+            ],
+            "ambiguous_correlation",
+        ),
+        (
+            [
+                ("client_to_server", {"id": 1, "method": "ping"}),
+                ("server_to_client", {"id": 1, "result": {}}),
+                ("server_to_client", {"id": 1, "result": {}}),
+            ],
+            "duplicate_response",
+        ),
+    ],
+)
+def test_unsupported_recorded_behavior_needs_consent_at_build_and_run(
+    messages: list[tuple[WireDirection, dict[str, Any]]], finding: str
+) -> None:
+    now = datetime.now(UTC)
+    norm = EventNormalizer(
+        execution_id=new_execution_id(), started_at=now, monotonic_start_ns=0, command=("server",)
+    )
+    events = list(norm.start_execution())
+    for n, (direction, message) in enumerate(messages, start=1):
+        events.extend(
+            _wire(norm, ts=now, mono_ns=n, direction=direction, obj={"jsonrpc": "2.0", **message})
+        )
+    finish, summary = norm.finalize_execution(
+        ended_at=now, monotonic_end_ns=100, termination_reason="completed", exit_code=0
+    )
+    events.append(finish)
+    result = read_recording(events, norm, summary)
+    with pytest.raises(CassetteValidationError, match=finding):
+        build_cassette_from_read_result(result)
+    cassette = build_cassette_from_read_result(result, allow_lossy=True)
+    with pytest.raises(CassetteValidationError, match=finding):
+        replay_cassette(cassette)
+    report = replay_cassette(cassette, allow_lossy=True)
+    assert report.fidelity_findings[finding] >= 1
+    assert report.overall_status != "clean_match"
+
+
+def test_source_integrity_provenance_and_legacy_digest() -> None:
+    from dataclasses import replace
+
+    from aerlog.storage.event_log import canonical_event_sha256
+
+    now = datetime.now(UTC)
+    norm = EventNormalizer(
+        execution_id=new_execution_id(), started_at=now, monotonic_start_ns=0, command=("server",)
+    )
+    events = list(norm.start_execution())
+    finish, summary = norm.finalize_execution(
+        ended_at=now, monotonic_end_ns=1, termination_reason="completed", exit_code=0
+    )
+    events.append(finish)
+    result = read_recording(events, norm, summary)
+    for changed, reason in (
+        (replace(result, checksums_verified=False), "record_checksums_unverified"),
+        (replace(result, manifest=None), "manifest_missing"),
+        (
+            replace(result, summary=summary.model_copy(update={"gap_count": 2})),
+            "summary_records_loss",
+        ),
+        (
+            replace(
+                result, summary=summary.model_copy(update={"capture_completeness": "incomplete"})
+            ),
+            "incomplete_summary",
+        ),
+    ):
+        with pytest.raises(CassetteValidationError, match=reason):
+            build_cassette_from_read_result(changed)
+        assert replay_cassette(
+            build_cassette_from_read_result(changed, allow_lossy=True), allow_lossy=True
+        ).fidelity_findings[reason]
+
+    legacy = build_cassette_from_read_result(result).model_dump(
+        mode="json", exclude={"replay_evidence", "cassette_sha256"}
+    )
+    legacy["cassette_sha256"] = canonical_event_sha256(legacy)
+    cassette = parse_untrusted_cassette_dict(legacy)
+    with pytest.raises(CassetteValidationError, match="legacy_evidence_unknown"):
+        replay_cassette(cassette)
+    assert replay_cassette(cassette, allow_lossy=True).fidelity_findings == {
+        "legacy_evidence_unknown": 1
+    }
+    tampered = cassette.model_copy(update={"source_unclean_shutdown": True})
+    for consent in [False, True]:
+        with pytest.raises(CassetteIntegrityError):
+            replay_cassette(tampered, allow_lossy=consent)
+
+
+def test_verified_gap_marker_overrides_clean_metadata() -> None:
+    now = datetime.now(UTC)
+    norm = EventNormalizer(
+        execution_id=new_execution_id(), started_at=now, monotonic_start_ns=0, command=("server",)
+    )
+    events = list(norm.start_execution())
+    events.append(
+        norm.build_gap_event(
+            timestamp=now,
+            monotonic_time_ns=1,
+            dropped_count=1,
+            reason="queue overflow",
+            first_gap_monotonic_ns=1,
+            last_gap_monotonic_ns=1,
+            account_loss=False,
+        )
+    )
+    finish, summary = norm.finalize_execution(
+        ended_at=now, monotonic_end_ns=2, termination_reason="completed", exit_code=0
+    )
+    events.append(finish)
+    result = read_recording(events, norm, summary)
+    assert summary.capture_completeness == "complete" and summary.gap_count == 0
+    with pytest.raises(CassetteValidationError, match="capture_gap"):
+        build_cassette_from_read_result(result)
+    cassette = build_cassette_from_read_result(result, allow_lossy=True)
+    assert replay_cassette(cassette, allow_lossy=True).fidelity_findings["capture_gap"] == 1

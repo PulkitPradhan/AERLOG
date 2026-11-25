@@ -27,7 +27,7 @@ from aerlog.replay import (
     save_cassette,
     serve_cassette_stdio,
 )
-from aerlog.storage.event_log import IndexedLogEvent, JsonlReadResult
+from tests.replay_recording import read_recording
 
 PYTHON = sys.executable
 
@@ -70,23 +70,7 @@ def _make_ping_cassette() -> Cassette:
         returncode=0,
     )
     events.append(fin)
-    indexed = tuple(
-        IndexedLogEvent(event=ev, line_number=i, byte_offset=i * 10, byte_length=10)
-        for i, ev in enumerate(events, start=1)
-    )
-    read_res = JsonlReadResult(
-        execution_id=exec_id,
-        header=norm.build_header(),
-        summary=summary,
-        manifest=None,
-        events=indexed,
-        corruptions=(),
-        byte_size=len(indexed) * 10,
-        line_count=len(indexed),
-        last_valid_sequence=indexed[-1].event.sequence,
-        events_file_sha256="0" * 64,
-        unclean_shutdown=False,
-    )
+    read_res = read_recording(events, norm, summary)
     return build_cassette_from_read_result(read_res)
 
 

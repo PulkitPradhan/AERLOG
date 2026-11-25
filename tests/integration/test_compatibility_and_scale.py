@@ -213,8 +213,11 @@ async def test_adverse_wire_crlf_utf8_malformed_typed_ids_and_unknown_methods_e2
         diag_codes = {d.code for d in diag.diagnostics}
         assert "MALFORMED_WIRE_FRAME" in diag_codes
 
-        cassette = build_cassette_from_execution(repo, exec_id, strict_integrity=True)
-        rep = replay_cassette(cassette)
+        cassette = build_cassette_from_execution(
+            repo, exec_id, strict_integrity=True, allow_lossy=True
+        )
+        rep = replay_cassette(cassette, allow_lossy=True)
+        assert rep.fidelity_findings["wire_anomaly"] > 0
         assert rep.total_steps >= 4
 
         bundle = export_execution_regression_test(
@@ -222,9 +225,10 @@ async def test_adverse_wire_crlf_utf8_malformed_typed_ids_and_unknown_methods_e2
             exec_id,
             output_dir=tmp_path / "adverse_exp",
             slug="adverse_wire_case",
+            allow_lossy=True,
         )
         loaded = load_regression_fixture(bundle.fixture_path)
-        assert run_regression_fixture(loaded).passed is True
+        assert run_regression_fixture(loaded, allow_lossy=True).passed is True
     finally:
         repo.close()
 

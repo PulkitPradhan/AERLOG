@@ -28,7 +28,7 @@ from aerlog.export.regression import (
     RegressionFixture,
     RegressionRunResult,
 )
-from aerlog.replay.cassette import Cassette
+from aerlog.replay.cassette import Cassette, fidelity_findings
 from aerlog.replay.runner import ReplayReport
 from aerlog.storage.database import IndexedExecutionRow
 
@@ -495,6 +495,8 @@ def render_cassette_summary_text(cassette: Cassette, *, path: Path | None = None
         console.print(f"Source Execution:   {cassette.source_execution_id}")
         console.print(f"Created At (UTC):   {cassette.created_at.isoformat()}")
         console.print(f"Source Status:      {cassette.source_capture_completeness}")
+        for issue, count in fidelity_findings(cassette).items():
+            console.print(f"Replay evidence:    {issue}={count}")
         console.print(f"Source Redaction:   {cassette.source_redaction_mode}")
         console.print(f"Contains Raw Secs:  {cassette.contains_raw_secrets}")
         console.print(f"Redacted Markers:   {cassette.contains_redacted_placeholders}")
@@ -537,6 +539,7 @@ def cassette_summary_to_json(cassette: Cassette, *, path: Path | None = None) ->
     """Serialize structural cassette metadata safely to JSON without exposing raw payloads."""
     payload = {
         "cassette_schema_version": cassette.cassette_schema_version,
+        "fidelity_findings": fidelity_findings(cassette),
         "cassette_id": cassette.cassette_id,
         "created_at": cassette.created_at.isoformat(),
         "source_execution_id": cassette.source_execution_id,
@@ -593,6 +596,8 @@ def render_replay_report_text(
         console.print(f"Unsafe Policy:      {report.unsafe_tool_policy}")
         console.print(f"Missing Policy:     {report.missing_response_policy}")
         console.print(f"Overall Status:     {report.overall_status}")
+        for issue, count in report.fidelity_findings.items():
+            console.print(f"Replay evidence:    {issue}={count}")
         if report_path is not None:
             console.print(f"Report File:        {report_path}")
         console.print(

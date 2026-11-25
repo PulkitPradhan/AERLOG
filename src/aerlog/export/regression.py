@@ -25,6 +25,7 @@ from aerlog.export.sanitizer import (
 from aerlog.replay.cassette import (
     Cassette,
     build_cassette_from_read_result,
+    require_replay_evidence,
     verify_cassette_integrity,
 )
 from aerlog.replay.matcher import (
@@ -204,6 +205,7 @@ class RegressionRunResult(BaseModel):
 
     fixture_id: str
     source_execution_id: str
+    fidelity_findings: dict[str, int] = Field(default_factory=dict)
     replay_cassette_id: str
     passed: bool
     total_steps: int = Field(ge=0)
@@ -424,6 +426,7 @@ def build_regression_fixture_from_read_result(
     raw: bool = False,
     allow_unredacted_export: bool = False,
     strict_integrity: bool = False,
+    allow_lossy: bool = False,
 ) -> tuple[RegressionFixture, bool]:
     """Deterministically build a sealed :class:`RegressionFixture` from one recording.
 
@@ -451,6 +454,7 @@ def build_regression_fixture_from_read_result(
         read_result,
         strict_integrity=strict_integrity,
         allow_unredacted_cassette=True,
+        allow_lossy=allow_lossy,
         cassette_id=det_cassette_id,
     )
     sanitized_from_unredacted = (
@@ -496,6 +500,7 @@ def build_regression_fixture_from_read_result(
 
     matcher = CassetteMatcher(
         cassette,
+        allow_lossy=allow_lossy,
         match_mode=match_mode,
         unsafe_tool_policy=unsafe_tool_policy,
         missing_response_policy=missing_response_policy,
@@ -642,10 +647,13 @@ def build_regression_fixture_from_read_result(
     overall_status: ReplayOverallStatus
     if diverged_count > 0 or blocked_count > 0 or unmatched_count > 0:
         overall_status = "diverged"
-    elif unsafe_tool_policy == "warn" and any(
-        s.side_effect_class in ("potentially_mutating", "unknown_unsafe")
-        for s in steps
-        if s.kind == "request"
+    elif matcher.fidelity_findings or (
+        unsafe_tool_policy == "warn"
+        and any(
+            s.side_effect_class in ("potentially_mutating", "unknown_unsafe")
+            for s in steps
+            if s.kind == "request"
+        )
     ):
         overall_status = "matched_with_warnings"
     else:
@@ -686,12 +694,15 @@ def build_regression_fixture_from_read_result(
     return seal_regression_fixture(unsigned), sanitized_from_unredacted
 
 
-def generate_pytest_source(*, slug: str, fixture_filename: str, source_execution_id: str) -> str:
+def generate_pytest_source(
+    *, slug: str, fixture_filename: str, source_execution_id: str, allow_lossy: bool = False
+) -> str:
     """Render deterministic, non-eval pytest module code loading ``fixture_filename``."""
     clean_slug = validate_export_slug(slug)
     validate_export_slug(fixture_filename.removesuffix(".fixture.json"))
     clean_exec_id = validate_execution_id(source_execution_id)
 
+    consent_arg = ", allow_lossy=True" if allow_lossy else ""
     lines = [
         '"""Offline MCP regression test exported deterministically by AERLOG."""',
         "",
@@ -713,7 +724,7 @@ def generate_pytest_source(*, slug: str, fixture_filename: str, source_execution
         '    """Replay exported MCP cassette strictly offline without contacting live servers."""',
         "    fixture = load_regression_fixture(_FIXTURE_PATH)",
         "    assert fixture.source_execution_id == _SOURCE_EXECUTION_ID",
-        "    result = run_regression_fixture(fixture)",
+        f"    result = run_regression_fixture(fixture{consent_arg})",
         "    assert result.passed, format_regression_failure(result)",
         "",
     ]
@@ -764,6 +775,7 @@ def export_execution_regression_test(
     raw: bool = False,
     allow_unredacted_export: bool = False,
     strict_integrity: bool = False,
+    allow_lossy: bool = False,
 ) -> RegressionExportBundleResult:
     """Export a deterministic ``.fixture.json`` (+ optional ``test_*.py``) from ``repo``."""
     if raw and not allow_unredacted_export:
@@ -796,6 +808,7 @@ def export_execution_regression_test(
         normalize_volatile=normalize_volatile,
         raw=raw,
         allow_unredacted_export=allow_unredacted_export,
+        allow_lossy=allow_lossy,
         strict_integrity=strict_integrity,
     )
 
@@ -814,6 +827,7 @@ def export_execution_regression_test(
             slug=resolved_slug,
             fixture_filename=fixture_path.name,
             source_execution_id=fixture.source_execution_id,
+            allow_lossy=allow_lossy,
         )
         _write_atomic_bytes(pytest_path, pytest_src.encode("utf-8"), mode=0o644)
 
@@ -833,16 +847,22 @@ def run_regression_fixture(
     fixture: RegressionFixture,
     *,
     override_cassette: Cassette | None = None,
+    allow_lossy: bool = False,
 ) -> RegressionRunResult:
     """Verify ``fixture`` offline against its embedded cassette or ``override_cassette``."""
     verify_regression_fixture_integrity(fixture)
     ensure_replay_mode_allowed("cassette")
 
     target_cassette = fixture.cassette if override_cassette is None else override_cassette
-    verify_cassette_integrity(target_cassette)
+    fixture_findings = (
+        require_replay_evidence(fixture.cassette, allow_lossy=allow_lossy)
+        if override_cassette is not None
+        else {}
+    )
 
     matcher = CassetteMatcher(
         target_cassette,
+        allow_lossy=allow_lossy,
         match_mode=fixture.match_mode,
         unsafe_tool_policy=fixture.unsafe_tool_policy,
         missing_response_policy=fixture.missing_response_policy,
@@ -1071,6 +1091,7 @@ def run_regression_fixture(
         fixture_id=fixture.fixture_id,
         source_execution_id=fixture.source_execution_id,
         replay_cassette_id=target_cassette.cassette_id,
+        fidelity_findings={**fixture_findings, **matcher.fidelity_findings},
         passed=passed,
         total_steps=total,
         passed_steps=passed_steps,

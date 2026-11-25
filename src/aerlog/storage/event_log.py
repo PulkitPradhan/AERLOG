@@ -280,6 +280,7 @@ class JsonlReadResult:
     last_valid_sequence: int
     events_file_sha256: str
     unclean_shutdown: bool
+    checksums_verified: bool = False
 
     @property
     def has_corruptions(self) -> bool:
@@ -1035,6 +1036,7 @@ class JsonlEventLogReader:
             last_valid_sequence=last_seq,
             events_file_sha256=file_digest.hexdigest(),
             unclean_shutdown=unclean_shutdown,
+            checksums_verified=verify_checksums,
         )
 
     def discover_execution_ids(self) -> tuple[str, ...]:

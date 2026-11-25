@@ -15,6 +15,7 @@ from aerlog.replay.cassette import (
     CassetteInteraction,
     CassetteNotification,
     compute_params_hashes,
+    require_replay_evidence,
 )
 from aerlog.replay.safety import (
     SafetyAuditNotice,
@@ -41,6 +42,7 @@ MatchOutcomeKind = Literal[
     "cancellation_matched",
     "cancellation_target_missing",
     "notification_ignored",
+    "unsupported_notification",
 ]
 
 ERR_CASSETTE_UNMATCHED = -32004
@@ -62,6 +64,7 @@ class ReplayDivergence(BaseModel):
         "cancellation_target_missing",
         "id_mismatch",
         "unconsumed_recorded_interactions",
+        "unsupported_notification",
     ]
     severity: Literal["info", "warning", "error"]
     step_index: int | None = Field(default=None, ge=0)
@@ -149,6 +152,8 @@ def _build_emitted_notifications(
 
     frames: list[dict[str, Any]] = []
     for notif in slot.emitted_notifications:
+        if notif.direction != "server_to_client":
+            continue
         obj: dict[str, Any] = dict(notif.extra_fields)
         obj["jsonrpc"] = "2.0"
         obj["method"] = notif.method
@@ -178,7 +183,9 @@ class CassetteMatcher:
         unsafe_tool_policy: UnsafeToolPolicy = "block",
         missing_response_policy: MissingResponsePolicy = "error",
         require_exact_id: bool = False,
+        allow_lossy: bool = False,
     ) -> None:
+        self.fidelity_findings = require_replay_evidence(cassette, allow_lossy=allow_lossy)
         self._cassette = cassette
         self._match_mode: ReplayMatchMode = match_mode
         self._unsafe_tool_policy: UnsafeToolPolicy = unsafe_tool_policy
@@ -750,6 +757,22 @@ class CassetteMatcher:
         """Process an incoming client notification (especially ``notifications/cancelled``)."""
         step_index = self._step_counter
         self._step_counter += 1
+
+        if method != "notifications/initialized" and (
+            method != "notifications/cancelled" or not self._cassette.cancellations
+        ):
+            return MatchDecision(
+                matched=False,
+                outcome_kind="unsupported_notification",
+                diverged=True,
+                divergence=ReplayDivergence(
+                    kind="unsupported_notification",
+                    severity="warning",
+                    method=self._safe_text(method),
+                    step_index=step_index,
+                    message="Incoming notification has no supported recorded behavior.",
+                ),
+            )
 
         if method == "notifications/cancelled":
             raw_target = params.get("requestId") if isinstance(params, Mapping) else None
