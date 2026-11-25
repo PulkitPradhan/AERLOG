@@ -499,3 +499,53 @@ async def test_competing_pipeline_cannot_close_the_winning_sink(
     finally:
         await first.finalize(termination_reason="clean_exit", exit_code=0)
         await sink.close()
+
+
+@pytest.mark.parametrize("directory_name", ["shared", "spool"])
+async def test_spill_pipelines_with_different_data_roots_reserve_the_shared_spool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory_name: str
+) -> None:
+    eid = new_execution_id()
+    shared = tmp_path / "fallback" / directory_name
+    alias = tmp_path / "alias"
+    alias.symlink_to(shared)
+    first_sink = PersistentCaptureSink(tmp_path / "first")
+    second_sink = PersistentCaptureSink(tmp_path / "second")
+    first = CapturePipeline(
+        first_sink,
+        command=("first",),
+        execution_id=eid,
+        config=CaptureConfig(backpressure_policy="spill", spill_dir=shared),
+    )
+    second = CapturePipeline(
+        second_sink,
+        command=("second",),
+        execution_id=eid,
+        config=CaptureConfig(backpressure_policy="spill", spill_dir=alias),
+    )
+    try:
+        await first.start()
+        with pytest.raises(ExecutionBusyError):
+            await second.start()
+        assert not (tmp_path / "second" / "executions").exists()
+        assert not (shared / f"{eid}.ndjson.spool").exists()
+        summary = await first.finalize(termination_reason="clean_exit", exit_code=0)
+        assert summary.capture_completeness == "complete"
+
+        # A fresh attempt in the other root can now use the same spool after a primary failure.
+        def fail_primary(header: ExecutionHeader) -> None:
+            raise OSError("primary unavailable")
+
+        monkeypatch.setattr(second_sink, "_on_start_sync", fail_primary)
+        retry = CapturePipeline(
+            second_sink, command=("retry",), execution_id=eid, config=second.config
+        )
+        await retry.start()
+        assert retry.spilled
+        summary = await retry.finalize(termination_reason="clean_exit", exit_code=0)
+        assert summary.capture_completeness == "spilled"
+        assert retry.spool_path == shared / f"{eid}.ndjson.spool"
+        assert retry.spool_path.is_file()
+    finally:
+        await first.finalize(termination_reason="clean_exit", exit_code=0)
+        await second_sink.close()

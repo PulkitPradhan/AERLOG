@@ -125,6 +125,14 @@ class PersistentCaptureSink:
         loop = asyncio.get_running_loop()
         return asyncio.wrap_future(cf_future, loop=loop)
 
+    def reserve_external_spool(
+        self, spool_root: Path, execution_id: str
+    ) -> ExecutionOwnership | None:
+        """Reserve a shared fallback directory when its lock differs from the primary's."""
+        if spool_root == self._data_dir.resolve():
+            return None
+        return ExecutionOwnership.acquire(spool_root, execution_id)
+
     def reserve_capture(self, execution_id: str, spool_path: Path) -> ExecutionOwnership:
         """Reserve before primary startup can fail or time out and activate fallback."""
         with self._state_lock:

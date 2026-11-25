@@ -17,6 +17,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,7 +41,6 @@ from aerlog.events.types import CaptureBackpressurePolicy, RedactionMode
 
 if TYPE_CHECKING:
     from aerlog.storage.event_log import AppendFailureOutcome
-    from aerlog.storage.ownership import ExecutionOwnership
 
 _DEFAULT_MAX_QUEUE_EVENTS = 2048
 _DEFAULT_MAX_QUEUE_BYTES = 64 * 1024 * 1024  # 64 MiB
@@ -150,7 +150,7 @@ class CapturePipeline:
             redaction_config=redaction_cfg,
             backpressure_policy=self._config.backpressure_policy,
         )
-        self._ownership: ExecutionOwnership | None = None
+        self._ownership = ExitStack()
         self._spool = RecoverySpool(
             default_spool_path(self._execution_id, self._config.spill_dir),
             redaction_config=redaction_cfg,
@@ -438,17 +438,27 @@ class CapturePipeline:
 
     def _reserve_capture(self) -> None:
         reserve = getattr(self._sink, "reserve_capture", None)
-        if reserve is not None:
-            self._ownership = reserve(self._execution_id, self._spool.path)
-        elif self._config.backpressure_policy == "spill":
-            # A custom sink has no storage root. The standard spool directory identifies
-            # its data root; a custom spill directory is its own coordination namespace.
-            from aerlog.storage.ownership import ExecutionOwnership
-
+        if self._config.backpressure_policy == "spill":
+            # The standard spool directory shares its data root's execution lock;
+            # a custom directory is its own namespace, including through root aliases.
             directory = self._spool.path.parent
-            root = directory.parent if directory.name == "spool" else directory
-            self._ownership = ExecutionOwnership.acquire(root, self._execution_id)
-            self._ownership.check_new_capture(self._spool.path)
+            spool_root = directory.parent if directory.name == "spool" else directory
+            if reserve is None:
+                from aerlog.storage.ownership import ExecutionOwnership
+
+                lease = self._ownership.enter_context(
+                    ExecutionOwnership.acquire(spool_root, self._execution_id)
+                )
+                lease.check_new_capture(self._spool.path)
+            else:
+                reserve_spool = getattr(self._sink, "reserve_external_spool", None)
+                if reserve_spool is not None:
+                    lease = reserve_spool(spool_root, self._execution_id)
+                    if lease is not None:
+                        self._ownership.callback(lease.close)
+        if reserve is not None:
+            lease = reserve(self._execution_id, self._spool.path)
+            self._ownership.callback(lease.close)
 
     async def start(self) -> None:
         """Deliver header + startup events and launch the background consumer task."""
@@ -465,9 +475,7 @@ class CapturePipeline:
             except BaseException as exc:
                 # A contender has no claim on the sink already serving another pipeline.
                 self._capture_error = exc
-                if self._ownership is not None:
-                    self._ownership.close()
-                    self._ownership = None
+                self._ownership.close()
                 raise
             try:
                 header = self._normalizer.build_header()
@@ -710,9 +718,7 @@ class CapturePipeline:
             except Exception as exc:
                 _LOGGER.warning("Failed to close capture sink %r: %s", self._sink, exc)
             finally:
-                if self._ownership is not None:
-                    self._ownership.close()
-                    self._ownership = None
+                self._ownership.close()
 
     async def _wait_for_close(self) -> None:
         if self._close_task is None:
