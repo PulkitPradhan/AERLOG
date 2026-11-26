@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 from aerlog import __version__
@@ -26,7 +27,7 @@ def test_cli_help_shows_description_and_version_option(
 
     assert result.exit_code == 0
     assert "AERLOG" in result.output
-    assert "--version" in result.output
+    assert "--version" in Text.from_ansi(result.output).plain
     assert not (isolated_xdg.config_home / "aerlog").exists()
     assert not (isolated_xdg.data_home / "aerlog").exists()
 
@@ -47,7 +48,7 @@ def test_cli_bare_invocation_shows_help() -> None:
     result = runner.invoke(app, [])
 
     assert result.exit_code == 0
-    assert "--version" in result.output
+    assert "--version" in Text.from_ansi(result.output).plain
 
 
 def test_python_module_entrypoint_help_and_version(
@@ -140,8 +141,8 @@ def test_cli_shell_completion_and_help_trees_without_xdg_side_effects(
 
     root_help = runner.invoke(app, ["--help"])
     assert root_help.exit_code == 0
-    assert "--install-completion" in root_help.output
-    assert "--show-completion" in root_help.output
+    assert "--install-completion" in Text.from_ansi(root_help.output).plain
+    assert "--show-completion" in Text.from_ansi(root_help.output).plain
     assert "Workflow examples:" in root_help.output
 
     for sub_args in (
@@ -151,7 +152,7 @@ def test_cli_shell_completion_and_help_trees_without_xdg_side_effects(
     ):
         bare_sub = runner.invoke(app, sub_args)
         assert bare_sub.exit_code == 0
-        assert "--install-completion" not in bare_sub.output
+        assert "--install-completion" not in Text.from_ansi(bare_sub.output).plain
 
     for help_args in (
         ["run", "--help"],
